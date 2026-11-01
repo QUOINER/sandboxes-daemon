@@ -810,3 +810,11 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 	}
 	return nil
 }
+
+// DeleteSetting removes a daemon setting. Missing keys are not an error.
+func (s *Store) DeleteSetting(ctx context.Context, key string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM settings WHERE key=?`, key); err != nil {
+		return fmt.Errorf("delete setting: %w", err)
+	}
+	return nil
+}

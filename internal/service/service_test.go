@@ -203,16 +203,20 @@ func TestReconcileInterruptedState(t *testing.T) {
 }
 
 type fakeRuntime struct {
-	created      int
-	lastConfig   runtime.Config
-	lastHandle   runtime.Handle
-	started      int
-	stopped      int
-	deleted      int
-	deleteErr    error
-	afterCreate  func()
-	deleteCtxErr error
-	stopGrace    time.Duration
+	created          int
+	lastConfig       runtime.Config
+	proxyHelperPath  string
+	proxyGuestPort   uint16
+	proxyServiceHost string
+	lastHandle       runtime.Handle
+	lastExec         runtime.ExecRequest
+	started          int
+	stopped          int
+	deleted          int
+	deleteErr        error
+	afterCreate      func()
+	deleteCtxErr     error
+	stopGrace        time.Duration
 }
 
 type blockingStopRuntime struct {
@@ -248,7 +252,14 @@ func (f *fakeRuntime) Create(_ context.Context, cfg runtime.Config) (runtime.Han
 	}
 	return runtime.Handle{ID: "klorq-" + cfg.Name}, nil
 }
-func (f *fakeRuntime) Exec(context.Context, runtime.Handle, runtime.ExecRequest) (int, error) {
+func (f *fakeRuntime) CreateWithProxy(ctx context.Context, cfg *runtime.Config, helperPath string, guestPort uint16, serviceHost string) (runtime.Handle, error) {
+	f.proxyHelperPath = helperPath
+	f.proxyGuestPort = guestPort
+	f.proxyServiceHost = serviceHost
+	return f.Create(ctx, *cfg)
+}
+func (f *fakeRuntime) Exec(_ context.Context, _ runtime.Handle, req runtime.ExecRequest) (int, error) {
+	f.lastExec = req
 	return 0, nil
 }
 
@@ -1378,7 +1389,7 @@ func TestResolveSecretEnvFailsClosedAndScopes(t *testing.T) {
 	}
 }
 
-func TestResolveProxyEnvFailsClosedUntilTransportExists(t *testing.T) {
+func TestResolveProxyEnvRequiresConfiguredCredentialVariable(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -1395,7 +1406,7 @@ func TestResolveProxyEnvFailsClosedUntilTransportExists(t *testing.T) {
 		t.Fatal(err)
 	}
 	env, err := svc.resolveSecretEnv(ctx, sandbox.Sandbox{Name: "dev"}, []string{"OPENAI_BASE_URL=${proxy:openai}"})
-	if err == nil || !strings.Contains(err.Error(), "transport is not available") || len(env) != 0 {
+	if err == nil || !strings.Contains(err.Error(), "proxy reference is not supported") || len(env) != 0 {
 		t.Fatalf("env=%q err=%v", env, err)
 	}
 }
