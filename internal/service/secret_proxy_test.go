@@ -97,6 +97,9 @@ func TestProxyEnvironmentUsesHostBrokerAndSurvivesRestart(t *testing.T) {
 	if _, err := svc.Exec(ctx, op.SandboxID, runtimeExecRequest("OPENAI_API_KEY=${proxy:openai}")); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := svc.Exec(ctx, op.SandboxID, runtimeExecRequest("OPENAI_API_KEY=${proxy:openai}")); err != nil {
+		t.Fatal(err)
+	}
 	if strings.Contains(strings.Join(backend.lastExec.Env, "\n"), "sk-synthetic-proxy-secret") {
 		t.Fatalf("secret value entered guest environment: %v", backend.lastExec.Env)
 	}

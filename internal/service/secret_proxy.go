@@ -127,6 +127,13 @@ func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, se
 		return proxyRuntimeConfig{}, fmt.Errorf("%w: guest service proxy helper is unavailable", core.ErrConflict)
 	}
 	dir := proxySocketDirectory(s.proxyTempDir, sb.ID)
+	socketPath := filepath.Join(dir, "p.sock")
+	if s.secretProxies.Has(sb.Name, serviceName) {
+		return proxyRuntimeConfig{
+			port: proxySocketPort, socketPath: socketPath,
+			helperPath: s.proxyHelperPath, guestPort: proxyGuestListenPort, serviceHost: contract.upstreamHost,
+		}, nil
+	}
 	if err := secretproxy.EnsurePrivateDir(dir); err != nil {
 		return proxyRuntimeConfig{}, fmt.Errorf("prepare proxy socket directory: %w", err)
 	}
@@ -152,7 +159,6 @@ func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, se
 	}
 	token := hex.EncodeToString(randomToken[:])
 	clear(randomToken[:])
-	socketPath := filepath.Join(dir, "p.sock")
 	brokerService := contractService(serviceName)
 	brokerService.CredentialScope = string(scope)
 	brokerService.Authorize = func(ctx context.Context) error {
