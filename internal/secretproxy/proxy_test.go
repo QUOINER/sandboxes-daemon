@@ -190,6 +190,7 @@ func TestUnixProxySecretRefreshRotatesTokenAndRevokesChannel(t *testing.T) {
 	if _, err := manager.StartUnix(context.Background(), "refresh-test", "openai", cfg, []byte("new-secret"), socket, secondToken); err != nil {
 		t.Fatal(err)
 	}
+	manager.RefreshSecret("openai", "refresh-test", "sandbox", []byte("sandbox-secret"))
 	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, "unix", socket)
@@ -211,7 +212,7 @@ func TestUnixProxySecretRefreshRotatesTokenAndRevokesChannel(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = response.Body.Close()
-	if response.StatusCode != http.StatusOK || gotAuth != "Bearer new-secret" {
+	if response.StatusCode != http.StatusOK || gotAuth != "Bearer sandbox-secret" {
 		t.Fatalf("refreshed request status=%d auth=%q", response.StatusCode, gotAuth)
 	}
 	if err := manager.RevokeSecret("openai", "", "global"); err != nil {

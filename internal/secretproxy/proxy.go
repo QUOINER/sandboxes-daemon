@@ -217,15 +217,14 @@ func (m *Manager) RefreshSecret(service, sandboxName, scope string, secret []byt
 	m.mu.Lock()
 	selected := make([]*proxy, 0)
 	for key, current := range m.proxies {
-		name, ok := strings.CutPrefix(key, sandboxName+"/")
-		if sandboxName != "" && (!ok || name != service) {
+		if sandboxName != "" && key != sandboxName+"/"+service {
 			continue
 		}
 		if sandboxName == "" && !strings.HasSuffix(key, "/"+service) {
 			continue
 		}
 		cfg, _, _ := current.snapshot()
-		if cfg.CredentialScope == scope {
+		if sandboxName != "" || cfg.CredentialScope == scope {
 			selected = append(selected, current)
 		}
 	}
