@@ -42,6 +42,22 @@ func TestStripProxyCreateEnv(t *testing.T) {
 	}
 }
 
+func TestProxyContractsUseProviderAPIBasePaths(t *testing.T) {
+	for service, want := range map[string]string{
+		"openai":     "http://127.0.0.1:3128/v1",
+		"mistral":    "http://127.0.0.1:3128/v1",
+		"groq":       "http://127.0.0.1:3128/openai/v1",
+		"openrouter": "http://127.0.0.1:3128/api/v1",
+		"xai":        "http://127.0.0.1:3128/v1",
+		"anthropic":  "http://127.0.0.1:3128",
+	} {
+		contract, ok := proxyContract(service)
+		if !ok || contract.baseURL != want {
+			t.Errorf("proxy contract %q = %+v, want base URL %q", service, contract, want)
+		}
+	}
+}
+
 func TestProxyEnvironmentUsesHostBrokerAndSurvivesRestart(t *testing.T) {
 	ctx := context.Background()
 	stateDir := t.TempDir()
