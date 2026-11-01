@@ -353,6 +353,7 @@ func (s *Service) SetSecretProxyRuntime(helperPath, tempDir string) {
 
 // SetServiceSecret stores one service secret and a non-secret index entry.
 func (s *Service) SetServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string, value []byte) (servicesecrets.Summary, error) {
+	defer clear(value)
 	if s.serviceSecrets == nil {
 		return servicesecrets.Summary{}, errors.New("service secret store is unavailable")
 	}
@@ -372,7 +373,7 @@ func (s *Service) SetServiceSecret(ctx context.Context, service string, scope se
 		return servicesecrets.Summary{}, err
 	}
 	if s.secretProxies != nil {
-		s.secretProxies.RefreshSecret(summary.Service, summary.SandboxName, string(summary.Scope), string(value))
+		s.secretProxies.RefreshSecret(summary.Service, summary.SandboxName, string(summary.Scope), value)
 	}
 	return summary, nil
 }

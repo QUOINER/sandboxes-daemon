@@ -31,7 +31,7 @@ func TestHelperForwardsWithTokenAndBrokerInjectsSecret(t *testing.T) {
 	token := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	broker := secretproxy.New()
 	t.Cleanup(func() { _ = broker.Close() })
-	if _, err := broker.StartUnix(context.Background(), "dev", "openai", secretproxy.Service{Upstream: upstream.URL, Header: "Authorization", Prefix: "Bearer "}, "s3cret", socket, token); err != nil {
+	if _, err := broker.StartUnix(context.Background(), "dev", "openai", secretproxy.Service{Upstream: upstream.URL, Header: "Authorization", Prefix: "Bearer "}, []byte("s3cret"), socket, token); err != nil {
 		t.Fatal(err)
 	}
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {

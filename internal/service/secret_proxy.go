@@ -165,7 +165,7 @@ func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, se
 		}
 		return nil
 	}
-	if _, err := s.secretProxies.StartUnix(ctx, sb.Name, serviceName, brokerService, string(secret), socketPath, token); err != nil {
+	if _, err := s.secretProxies.StartUnix(ctx, sb.Name, serviceName, brokerService, secret, socketPath, token); err != nil {
 		return proxyRuntimeConfig{}, fmt.Errorf("start host service proxy: %w", err)
 	}
 	prepared = true
