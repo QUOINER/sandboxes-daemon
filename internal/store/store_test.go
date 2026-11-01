@@ -192,3 +192,24 @@ func TestRegistryCredentialIndexLifecycle(t *testing.T) {
 		t.Fatalf("items after delete=%+v err=%v", items, err)
 	}
 }
+
+func TestDeleteSetting(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, filepath.Join(t.TempDir(), "settings.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.SetSetting(ctx, "sandbox.proxy-service.sb-test", "openai"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteSetting(ctx, "sandbox.proxy-service.sb-test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetSetting(ctx, "sandbox.proxy-service.sb-test"); !errors.Is(err, core.ErrNotFound) {
+		t.Fatalf("setting after delete error = %v", err)
+	}
+	if err := st.DeleteSetting(ctx, "sandbox.proxy-service.missing"); err != nil {
+		t.Fatalf("delete missing setting: %v", err)
+	}
+}

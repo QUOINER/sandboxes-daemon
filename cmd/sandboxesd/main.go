@@ -35,6 +35,7 @@ type options struct {
 	fifoDir              string
 	gvproxyPath          string
 	runDir               string
+	proxyHelperPath      string
 	dnsUpstream          string
 	settingsPath         string
 	defaultPolicyProfile string
@@ -62,7 +63,7 @@ func run() int {
 		return 0
 	}
 	lost := make(chan string, 8)
-	backend, cleanup, err := buildBackend(opts, lost)
+	backend, cleanup, err := buildBackend(&opts, lost)
 	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -82,6 +83,7 @@ func run() int {
 		DefaultMemoryMiB:     opts.defaultMemoryMiB,
 		DockerVolumeSize:     opts.dockerVolumeSize,
 		GatewayLost:          lost,
+		ProxyHelperPath:      opts.proxyHelperPath,
 	})
 	if err != nil {
 		slog.Error("daemon stopped", "error", err)
@@ -107,6 +109,7 @@ func parseOptions() options {
 	flag.StringVar(&opts.fifoDir, "fifo-dir", "", "runtime FIFO directory")
 	flag.StringVar(&opts.gvproxyPath, "gvproxy", "", "patched gvproxy binary; empty disables networking")
 	flag.StringVar(&opts.runDir, "run-dir", "", "gateway runtime directory")
+	flag.StringVar(&opts.proxyHelperPath, "proxy-helper", "", "static Linux guest proxy helper; empty disables service proxy")
 	flag.StringVar(&opts.dnsUpstream, "dns-upstream", "", "optional DNS upstream")
 	flag.StringVar(&opts.settingsPath, "settings", settings.DefaultPath(), "user settings file")
 	flag.BoolVar(&opts.showVersion, "version", false, "print version")
@@ -141,7 +144,7 @@ func dockerOAuthProviders() map[string]service.OAuthProvider {
 	}}
 }
 
-func buildBackend(opts options, gatewayLost chan<- string) (runtime.Backend, func() error, error) {
+func buildBackend(opts *options, gatewayLost chan<- string) (runtime.Backend, func() error, error) {
 	if opts.containerdPath == "" {
 		return nil, nil, nil
 	}
@@ -178,7 +181,7 @@ func buildBackend(opts options, gatewayLost chan<- string) (runtime.Backend, fun
 	return backend, cleanup, nil
 }
 
-func buildNetwork(opts options, gatewayLost chan<- string) (runtime.Network, *gateway.Manager, error) {
+func buildNetwork(opts *options, gatewayLost chan<- string) (runtime.Network, *gateway.Manager, error) {
 	if opts.gvproxyPath == "" {
 		return nil, nil, nil
 	}

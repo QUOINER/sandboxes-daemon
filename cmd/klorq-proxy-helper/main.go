@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -38,16 +39,11 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:0", "guest loopback listen address")
 	cid := flag.Int("cid", 2, "host vsock context id")
 	port := flag.Int("port", 1027, "host vsock port")
-	tokenFile := flag.String("token-file", "", "file with the per-VM proxy token")
 	unixSocket := flag.String("unix-socket", "", "host unix socket (test/preview transport)")
 	serviceHost := flag.String("service-host", "", "upstream host the broker authorizes")
 	flag.Parse()
 	if *serviceHost == "" {
 		log.Fatal("service-host is required")
-	}
-	token, err := os.ReadFile(*tokenFile)
-	if err != nil {
-		log.Fatalf("read proxy token: %v", err)
 	}
 	dial := func(ctx context.Context) (net.Conn, error) {
 		if *unixSocket != "" {
@@ -59,7 +55,7 @@ func main() {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
 	}
-	handler := newHandler(*serviceHost, strings.TrimSpace(string(token)), transport)
+	handler := newHandler(*serviceHost, transport)
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("proxy helper listening on %s for %s", *listen, *serviceHost)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -67,7 +63,31 @@ func main() {
 	}
 }
 
-func newHandler(serviceHost, token string, transport http.RoundTripper) http.Handler {
+func fetchToken(ctx context.Context, transport http.RoundTripper) (string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://broker/__klorq/proxy/token", http.NoBody)
+	if err != nil {
+		return "", err
+	}
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK || response.Header.Get("Cache-Control") != "no-store" {
+		return "", errors.New("proxy bootstrap was denied")
+	}
+	token, err := io.ReadAll(io.LimitReader(response.Body, 65))
+	if err != nil || len(token) != 64 {
+		return "", errors.New("proxy bootstrap returned an invalid token")
+	}
+	decoded := make([]byte, hex.DecodedLen(len(token)))
+	if _, err := hex.Decode(decoded, token); err != nil {
+		return "", errors.New("proxy bootstrap returned an invalid token")
+	}
+	return string(token), nil
+}
+
+func newHandler(serviceHost string, transport http.RoundTripper) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
 			http.Error(w, "connect tunnels are not supported", http.StatusMethodNotAllowed)
@@ -78,6 +98,11 @@ func newHandler(serviceHost, token string, transport http.RoundTripper) http.Han
 		out.URL.Scheme = "http"
 		out.URL.Host = serviceHost
 		out.Host = serviceHost
+		token, err := fetchToken(r.Context(), transport)
+		if err != nil {
+			http.Error(w, "proxy channel unavailable", http.StatusBadGateway)
+			return
+		}
 		out.Header.Set(tokenHeader, token)
 		out.Header.Del("Proxy-Connection")
 		out.Header.Del("Proxy-Authorization")

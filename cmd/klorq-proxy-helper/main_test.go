@@ -28,7 +28,7 @@ func TestHelperForwardsWithTokenAndBrokerInjectsSecret(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	socket := filepath.Join(dir, "broker.sock")
-	token := "0123456789abcdef0123456789abcdef"
+	token := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	broker := secretproxy.New()
 	t.Cleanup(func() { _ = broker.Close() })
 	if _, err := broker.StartUnix(context.Background(), "dev", "openai", secretproxy.Service{Upstream: upstream.URL, Header: "Authorization", Prefix: "Bearer "}, "s3cret", socket, token); err != nil {
@@ -38,7 +38,11 @@ func TestHelperForwardsWithTokenAndBrokerInjectsSecret(t *testing.T) {
 		var d net.Dialer
 		return d.DialContext(ctx, "unix", socket)
 	}}
-	helper := httptest.NewServer(newHandler("api.example.test", token, transport))
+	bootstrapped, err := fetchToken(context.Background(), transport)
+	if err != nil || bootstrapped != token {
+		t.Fatalf("fetchToken() = matching:%t, err=%v", bootstrapped == token, err)
+	}
+	helper := httptest.NewServer(newHandler("api.example.test", transport))
 	defer helper.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, helper.URL+"/v1/answer", nil)
@@ -50,16 +54,5 @@ func TestHelperForwardsWithTokenAndBrokerInjectsSecret(t *testing.T) {
 	_ = resp.Body.Close()
 	if string(body) != "answer" || gotAuth != "Bearer s3cret" || gotPath != "/v1/answer" {
 		t.Fatalf("body=%q auth=%q path=%q", body, gotAuth, gotPath)
-	}
-
-	denied := httptest.NewServer(newHandler("api.example.test", "ffffffffffffffffffffffffffffffff", transport))
-	defer denied.Close()
-	resp, err = http.Get(denied.URL + "/v1/answer")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("wrong token status = %d", resp.StatusCode)
 	}
 }

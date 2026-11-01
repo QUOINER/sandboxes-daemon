@@ -133,6 +133,9 @@ func (s *Service) readyForExec(ctx context.Context, sb sandbox.Sandbox) (sandbox
 }
 
 func (s *Service) startForExec(ctx context.Context, sb sandbox.Sandbox) error {
+	if err := s.prepareStoredProxy(ctx, sb); err != nil {
+		return err
+	}
 	handle := s.backend.Handle(sb.Name)
 	handle.Ports = runtimePorts(sb.Ports)
 	handle.Allow = runtimeRules(policyAllow(sb.Policy))
@@ -173,38 +176,93 @@ const (
 // host vault at exec time. Only the selected process receives the value; it is
 // never written to SQLite or sandbox metadata. Sandbox scope wins over global.
 func (s *Service) resolveSecretEnv(ctx context.Context, sb sandbox.Sandbox, env []string) ([]string, error) {
-	if len(env) == 0 || s.serviceSecrets == nil {
-		return env, nil
-	}
-	out := make([]string, 0, len(env))
+	out := make([]string, 0, len(env)+1)
+	proxyService := ""
 	for _, entry := range env {
 		key, value, found := strings.Cut(entry, "=")
-		if !found || !strings.HasSuffix(value, "}") {
+		if !found {
 			out = append(out, entry)
 			continue
 		}
-		if strings.HasPrefix(value, proxyRefPrefix) {
-			return nil, fmt.Errorf("%w: host secret proxy transport is not available; use ${secret:service}", core.ErrConflict)
-		}
-		if !strings.HasPrefix(value, secretRefPrefix) {
-			out = append(out, entry)
-			continue
-		}
-		service := strings.TrimSuffix(strings.TrimPrefix(value, secretRefPrefix), "}")
-		if service == "" || strings.ContainsAny(service, "/\\\x00\r\n") {
-			return nil, fmt.Errorf("%w: invalid secret reference for %s", core.ErrConflict, key)
-		}
-		secret, err := s.serviceSecrets.Load(ctx, service, servicesecrets.ScopeSandbox, sb.Name)
-		if errors.Is(err, servicesecrets.ErrNotFound) {
-			secret, err = s.serviceSecrets.Load(ctx, service, servicesecrets.ScopeGlobal, "")
-		}
+		resolved, serviceName, err := s.resolveEnvEntry(ctx, sb, key, value, proxyService)
 		if err != nil {
-			return nil, fmt.Errorf("%w: secret %q is unavailable", core.ErrConflict, service)
+			return nil, err
 		}
-		out = append(out, key+"="+string(secret))
-		clear(secret)
+		if serviceName != "" {
+			proxyService = serviceName
+		}
+		out = append(out, resolved)
 	}
-	return out, nil
+	if proxyService == "" {
+		return out, nil
+	}
+	return s.finishProxyEnv(ctx, sb, env, out, proxyService)
+}
+
+func (s *Service) resolveEnvEntry(ctx context.Context, sb sandbox.Sandbox, key, value, currentProxy string) (string, string, error) {
+	if strings.Contains(value, proxyRefPrefix) {
+		return s.resolveProxyEnvEntry(ctx, sb, key, value, currentProxy)
+	}
+	if strings.HasPrefix(value, secretRefPrefix) {
+		resolved, err := s.resolveSecretReference(ctx, sb, key, value)
+		return resolved, "", err
+	}
+	return key + "=" + value, "", nil
+}
+
+func (s *Service) resolveProxyEnvEntry(ctx context.Context, sb sandbox.Sandbox, key, value, current string) (string, string, error) {
+	if !strings.HasPrefix(value, proxyRefPrefix) || !strings.HasSuffix(value, "}") || strings.Count(value, proxyRefPrefix) != 1 {
+		return "", current, fmt.Errorf("%w: invalid proxy reference for %s", core.ErrConflict, key)
+	}
+	name := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(value, proxyRefPrefix), "}"))
+	contract, ok := proxyContract(name)
+	if !ok || key != contract.credentialEnv {
+		return "", current, fmt.Errorf("%w: proxy reference is not supported for %s", core.ErrConflict, key)
+	}
+	if current != "" && current != name {
+		return "", current, fmt.Errorf("%w: one proxy service may be used per exec", core.ErrConflict)
+	}
+	configured, err := s.store.GetSetting(ctx, proxyServiceSettingKey(sb.ID))
+	if err != nil || configured != name {
+		return "", current, fmt.Errorf("%w: sandbox was not created with the %s proxy channel", core.ErrConflict, name)
+	}
+	return key + "=klorq-proxy-placeholder", name, nil
+}
+
+func (s *Service) resolveSecretReference(ctx context.Context, sb sandbox.Sandbox, key, value string) (string, error) {
+	if !strings.HasSuffix(value, "}") || strings.Count(value, secretRefPrefix) != 1 {
+		return "", fmt.Errorf("%w: invalid secret reference for %s", core.ErrConflict, key)
+	}
+	if s.serviceSecrets == nil {
+		return "", fmt.Errorf("%w: service secret store is unavailable", core.ErrConflict)
+	}
+	service := strings.TrimSuffix(strings.TrimPrefix(value, secretRefPrefix), "}")
+	if service == "" || strings.ContainsAny(service, "/\\\x00\r\n") {
+		return "", fmt.Errorf("%w: invalid secret reference for %s", core.ErrConflict, key)
+	}
+	secret, err := s.serviceSecrets.Load(ctx, service, servicesecrets.ScopeSandbox, sb.Name)
+	if errors.Is(err, servicesecrets.ErrNotFound) {
+		secret, err = s.serviceSecrets.Load(ctx, service, servicesecrets.ScopeGlobal, "")
+	}
+	if err != nil {
+		return "", fmt.Errorf("%w: secret %q is unavailable", core.ErrConflict, service)
+	}
+	defer clear(secret)
+	return key + "=" + string(secret), nil
+}
+
+func (s *Service) finishProxyEnv(ctx context.Context, sb sandbox.Sandbox, env, out []string, proxyService string) ([]string, error) {
+	contract, _ := proxyContract(proxyService)
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		if key == contract.baseURLEnv {
+			return nil, fmt.Errorf("%w: %s is managed by the service proxy", core.ErrConflict, contract.baseURLEnv)
+		}
+	}
+	if err := s.prepareStoredProxy(ctx, sb); err != nil {
+		return nil, err
+	}
+	return append(out, contract.baseURLEnv+"="+contract.baseURL), nil
 }
 
 // cancelExecSessions is called with the sandbox lifecycle gate held.
