@@ -33,7 +33,7 @@ func TestUnixProxyChannelInjectsSecretAndRequiresToken(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	socket := filepath.Join(dir, "proxy.sock")
 	token := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	if _, err := m.StartUnix(context.Background(), "dev", "openai", Service{Upstream: upstream.URL, Header: "Authorization", Prefix: "Bearer "}, "s3cret", socket, token); err != nil {
+	if _, err := m.StartUnix(context.Background(), "dev", "openai", Service{Upstream: upstream.URL, Header: "Authorization", Prefix: "Bearer "}, []byte("s3cret"), socket, token); err != nil {
 		t.Fatal(err)
 	}
 	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -148,7 +148,7 @@ func TestUnixProxyPolicyDenialDoesNotReachUpstream(t *testing.T) {
 			return errors.New("default deny")
 		},
 	}
-	if _, err := manager.StartUnix(context.Background(), "policy-test", "openai", service, "synthetic-secret", socket, token); err != nil {
+	if _, err := manager.StartUnix(context.Background(), "policy-test", "openai", service, []byte("synthetic-secret"), socket, token); err != nil {
 		t.Fatal(err)
 	}
 	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -184,10 +184,10 @@ func TestUnixProxySecretRefreshRotatesTokenAndRevokesChannel(t *testing.T) {
 	manager := New()
 	defer func() { _ = manager.Close() }()
 	cfg := Service{Upstream: upstream.URL, Header: "Authorization", Prefix: "Bearer ", CredentialScope: "global"}
-	if _, err := manager.StartUnix(context.Background(), "refresh-test", "openai", cfg, "old-secret", socket, firstToken); err != nil {
+	if _, err := manager.StartUnix(context.Background(), "refresh-test", "openai", cfg, []byte("old-secret"), socket, firstToken); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.StartUnix(context.Background(), "refresh-test", "openai", cfg, "new-secret", socket, secondToken); err != nil {
+	if _, err := manager.StartUnix(context.Background(), "refresh-test", "openai", cfg, []byte("new-secret"), socket, secondToken); err != nil {
 		t.Fatal(err)
 	}
 	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -232,7 +232,7 @@ func TestStopSandboxRemovesOwnedSocketForRestart(t *testing.T) {
 	socket := filepath.Join(dir, "proxy.sock")
 	manager := New()
 	cfg := Service{Upstream: "https://api.openai.com", Header: "Authorization", Prefix: "Bearer "}
-	if _, err := manager.StartUnix(context.Background(), "restart-test", "openai", cfg, "synthetic-secret", socket, strings.Repeat("a", 64)); err != nil {
+	if _, err := manager.StartUnix(context.Background(), "restart-test", "openai", cfg, []byte("synthetic-secret"), socket, strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.StopSandbox("restart-test"); err != nil {
@@ -241,7 +241,7 @@ func TestStopSandboxRemovesOwnedSocketForRestart(t *testing.T) {
 	if _, err := os.Lstat(socket); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("socket remains after stop: %v", err)
 	}
-	if _, err := manager.StartUnix(context.Background(), "restart-test", "openai", cfg, "synthetic-secret", socket, strings.Repeat("b", 64)); err != nil {
+	if _, err := manager.StartUnix(context.Background(), "restart-test", "openai", cfg, []byte("synthetic-secret"), socket, strings.Repeat("b", 64)); err != nil {
 		t.Fatalf("restarting proxy on same owned path: %v", err)
 	}
 	if err := manager.Close(); err != nil {

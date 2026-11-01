@@ -87,7 +87,7 @@ func (m *Manager) Has(sandbox, service string) bool {
 // StartUnix starts a per-sandbox proxy on a unix socket. Every request must
 // carry the per-VM token; the socket is private (0600) and owned by the run
 // directory, so the token is defense in depth rather than the only control.
-func (m *Manager) StartUnix(ctx context.Context, sandbox, service string, cfg Service, secret, socketPath, token string) (string, error) {
+func (m *Manager) StartUnix(ctx context.Context, sandbox, service string, cfg Service, secret []byte, socketPath, token string) (string, error) {
 	if err := validUnixStart(ctx, sandbox, service, secret, socketPath, token); err != nil {
 		return "", err
 	}
@@ -117,7 +117,7 @@ func (m *Manager) StartUnix(ctx context.Context, sandbox, service string, cfg Se
 	reverse.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 		http.Error(w, "proxy upstream unavailable", http.StatusBadGateway)
 	}
-	p := &proxy{path: socketPath, upstream: upstream.String(), service: cfg, secret: []byte(secret), token: []byte(token), url: "unix:" + socketPath}
+	p := &proxy{path: socketPath, upstream: upstream.String(), service: cfg, secret: append([]byte(nil), secret...), token: []byte(token), url: "unix:" + socketPath}
 	srv := &http.Server{Handler: proxyHandler(service, p, reverse), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 64 << 10}
 	p.server, p.listener = srv, listener
 	m.mu.Lock()
@@ -183,7 +183,7 @@ func (p *proxy) snapshot() (Service, []byte, []byte) {
 	return p.service, append([]byte(nil), p.secret...), append([]byte(nil), p.token...)
 }
 
-func (p *proxy) update(socketPath, upstream string, cfg Service, secret, token string) (string, error) {
+func (p *proxy) update(socketPath, upstream string, cfg Service, secret []byte, token string) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.path != socketPath || p.upstream != upstream {
@@ -191,14 +191,14 @@ func (p *proxy) update(socketPath, upstream string, cfg Service, secret, token s
 	}
 	clear(p.secret)
 	clear(p.token)
-	p.service, p.secret, p.token = cfg, []byte(secret), []byte(token)
+	p.service, p.secret, p.token = cfg, append([]byte(nil), secret...), []byte(token)
 	return p.url, nil
 }
 
-func (p *proxy) refreshSecret(secret string) {
+func (p *proxy) refreshSecret(secret []byte) {
 	p.mu.Lock()
 	clear(p.secret)
-	p.secret = []byte(secret)
+	p.secret = append([]byte(nil), secret...)
 	p.mu.Unlock()
 }
 
@@ -213,7 +213,7 @@ func (p *proxy) clearCredentials() {
 
 // RefreshSecret replaces the in-memory secret for active channels whose
 // service/scope matches. It never persists the value.
-func (m *Manager) RefreshSecret(service, sandboxName, scope, secret string) {
+func (m *Manager) RefreshSecret(service, sandboxName, scope string, secret []byte) {
 	m.mu.Lock()
 	selected := make([]*proxy, 0)
 	for key, current := range m.proxies {
@@ -316,11 +316,11 @@ func isPublicUnicast(ip net.IP) bool {
 	return true
 }
 
-func validUnixStart(ctx context.Context, sandbox, service, secret, socketPath, token string) error {
+func validUnixStart(ctx context.Context, sandbox, service string, secret []byte, socketPath, token string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if sandbox == "" || service == "" || secret == "" || socketPath == "" || len(token) != 64 {
+	if sandbox == "" || service == "" || len(secret) == 0 || socketPath == "" || len(token) != 64 {
 		return errors.New("sandbox, service, secret, socket path and a 32-byte hex token are required")
 	}
 	decoded := make([]byte, hex.DecodedLen(len(token)))
