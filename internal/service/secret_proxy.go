@@ -26,6 +26,7 @@ const (
 	proxyGuestListenPort = uint16(3128)
 	proxySettingPrefix   = "sandbox.proxy-service."
 	proxyGuestHelperPath = "/tmp/klorq-proxy-helper"
+	proxyLocalV1BaseURL  = "http://127.0.0.1:3128/v1"
 )
 
 type proxyRuntimeConfig struct {
@@ -60,17 +61,17 @@ func proxyContract(name string) (proxyEnvContract, bool) {
 	contract := proxyEnvContract{serviceName: strings.ToLower(name), upstreamHost: upstream.Host}
 	switch contract.serviceName {
 	case "openai":
-		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "OPENAI_API_KEY", "OPENAI_BASE_URL", "http://127.0.0.1:3128/v1"
+		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "OPENAI_API_KEY", "OPENAI_BASE_URL", proxyLocalV1BaseURL
 	case "anthropic":
 		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "http://127.0.0.1:3128"
 	case "groq":
 		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "GROQ_API_KEY", "GROQ_BASE_URL", "http://127.0.0.1:3128/openai/v1"
 	case "mistral":
-		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "MISTRAL_API_KEY", "MISTRAL_BASE_URL", "http://127.0.0.1:3128"
+		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "MISTRAL_API_KEY", "MISTRAL_BASE_URL", proxyLocalV1BaseURL
 	case "openrouter":
 		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "http://127.0.0.1:3128/api/v1"
 	case "xai":
-		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "XAI_API_KEY", "XAI_BASE_URL", "http://127.0.0.1:3128/v1"
+		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "XAI_API_KEY", "XAI_BASE_URL", proxyLocalV1BaseURL
 	default:
 		return proxyEnvContract{}, false
 	}
