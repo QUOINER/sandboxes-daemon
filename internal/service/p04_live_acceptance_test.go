@@ -46,6 +46,33 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 			t.Errorf("remove owned service acceptance directory: %v", err)
 		}
 	})
+	defer func() {
+		evidenceDir := os.Getenv("KLORQ_P04_EVIDENCE_DIR")
+		if !t.Failed() || evidenceDir == "" {
+			return
+		}
+		if data, readErr := os.ReadFile(filepath.Join(root, "containerd.log")); readErr == nil {
+			if writeErr := os.WriteFile(filepath.Join(evidenceDir, "service-containerd-failure.log"), data, 0o600); writeErr != nil {
+				t.Errorf("preserve owned containerd diagnostic: %v", writeErr)
+			}
+		}
+		gatewayDir := filepath.Join(root, "run", "gateway")
+		_ = filepath.WalkDir(gatewayDir, func(path string, entry os.DirEntry, err error) error {
+			if err != nil || entry.IsDir() || !strings.HasSuffix(entry.Name(), ".gateway.log") {
+				return err
+			}
+			data, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Errorf("read owned gateway diagnostic: %v", readErr)
+				return nil
+			}
+			destination := filepath.Join(evidenceDir, "service-"+entry.Name())
+			if writeErr := os.WriteFile(destination, data, 0o600); writeErr != nil {
+				t.Errorf("preserve owned gateway diagnostic: %v", writeErr)
+			}
+			return nil
+		})
+	}()
 
 	binDir := filepath.Join(root, "bin")
 	if err := os.Mkdir(binDir, 0o700); err != nil {
@@ -73,7 +100,11 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		t.Fatal(err)
 	}
 	containerd := exec.Command(inputs.containerd, "--config", containerdConfig)
-	containerd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+"/opt/homebrew/bin:/opt/homebrew/opt/e2fsprogs/sbin:/usr/bin:/bin", "LIBKRUN_PATH="+inputs.libkrun)
+	containerd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+"/opt/homebrew/bin:/opt/homebrew/opt/e2fsprogs/sbin:/usr/bin:/bin",
+		"LIBKRUN_PATH="+inputs.libkrun,
+		"SAILOR_PATH="+filepath.Join(filepath.Dir(inputs.shim), "lib"),
+	)
 	containerd.Stdout, containerd.Stderr = containerdLog, containerdLog
 	if err := containerd.Start(); err != nil {
 		_ = containerdLog.Close()
@@ -327,8 +358,11 @@ func execP04Service(ctx context.Context, svc *Service, sandboxID, command string
 
 func waitP04ServiceHelper(ctx context.Context, svc *Service, sandboxID string) error {
 	command := `/bin/sh -c 'i=0; while [ "$i" -lt 50 ]; do busybox nc -z -w 1 127.0.0.1 3128 2>/dev/null && exit 0; i=$((i + 1)); sleep 0.1; done; exit 1'`
-	_, err := execP04Service(ctx, svc, sandboxID, command, nil)
-	return err
+	if _, err := execP04Service(ctx, svc, sandboxID, command, nil); err != nil {
+		diagnostics, diagnosticErr := execP04Service(ctx, svc, sandboxID, `/bin/sh -c 'echo processes; busybox ps; echo helper; ls -l /tmp/klorq-proxy-helper; echo tcp; cat /proc/net/tcp; echo tcp6; cat /proc/net/tcp6; echo fds; ls -l /proc/2/fd; echo nc; busybox nc --help 2>&1'`, nil)
+		return fmt.Errorf("wait for guest proxy listener: %w; diagnostics=%q (diagnostic error: %v)", err, diagnostics, diagnosticErr)
+	}
+	return nil
 }
 
 func scanP04ServiceState(root string, needle []byte) error {
