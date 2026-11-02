@@ -7,6 +7,7 @@ require (
 	github.com/quoiner/sandboxes-core v0.0.8
 	github.com/quoiner/sandboxes-gateway v0.0.10
 	github.com/quoiner/sandboxes-runtime v0.0.19
+	github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29
 	github.com/zalando/go-keyring v0.2.6
 	golang.org/x/sys v0.49.0
 	google.golang.org/grpc v1.85.0
@@ -15,7 +16,6 @@ require (
 
 require (
 	al.essio.dev/pkg/shellescape v1.5.1 // indirect
-	github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29 // indirect
 	github.com/Microsoft/hcsshim v0.15.0-rc.4 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/containerd/cgroups/v3 v3.1.3 // indirect

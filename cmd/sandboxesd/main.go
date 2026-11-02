@@ -100,7 +100,7 @@ func parseOptions() options {
 	}
 	defaultState := filepath.Join(home, ".sandboxes")
 	flag.StringVar(&opts.stateDir, "state", defaultState, "state directory")
-	flag.StringVar(&opts.socketPath, "socket", filepath.Join(defaultState, "sandboxesd.sock"), "unix socket path")
+	flag.StringVar(&opts.socketPath, "socket", filepath.Join(defaultState, "sandboxesd.sock"), "local daemon endpoint")
 	flag.StringVar(&opts.containerdPath, "containerd", "", "containerd socket; empty keeps state-only mode")
 	flag.StringVar(&opts.ctrPath, "ctr", "ctr", "ctr binary path")
 	flag.StringVar(&opts.runtimeName, "runtime", "io.containerd.nerdbox.v1", "containerd runtime name")

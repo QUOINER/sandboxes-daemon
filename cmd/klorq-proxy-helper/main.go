@@ -1,6 +1,10 @@
 // Command klorq-proxy-helper runs inside a sandbox and forwards HTTP requests
 // over the per-VM vsock channel to the host broker. The broker owns the real
 // service credential; the helper only carries the per-VM token.
+//go:build linux
+
+// klorq-proxy-helper runs inside the Linux guest and uses AF_VSOCK and Linux
+// device/syscall interfaces. It is deliberately not a Windows host executable.
 package main
 
 import (
