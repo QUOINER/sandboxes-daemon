@@ -27,6 +27,14 @@ type outputBackend struct {
 }
 
 func (b *outputBackend) Exec(_ context.Context, _ runtime.Handle, req runtime.ExecRequest) (int, error) {
+	return b.exec(req)
+}
+
+func (b *outputBackend) ExecNative(_ context.Context, _ runtime.Handle, req runtime.ExecRequest) (int, error) {
+	return b.exec(req)
+}
+
+func (b *outputBackend) exec(req runtime.ExecRequest) (int, error) {
 	b.env = req.Env
 	b.user = req.User
 	if _, err := io.WriteString(req.Stdout, "out"); err != nil {

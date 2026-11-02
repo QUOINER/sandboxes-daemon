@@ -95,7 +95,9 @@ func TestStopCancelsActiveExecBeforeStoppingVM(t *testing.T) {
 
 type selectionExecRuntime struct {
 	fakeRuntime
-	native bool
+	native       bool
+	nativeCalled bool
+	nativeErr    error
 }
 
 func (e *selectionExecRuntime) Exec(_ context.Context, _ runtime.Handle, _ runtime.ExecRequest) (int, error) {
@@ -105,6 +107,12 @@ func (e *selectionExecRuntime) Exec(_ context.Context, _ runtime.Handle, _ runti
 func (e *selectionExecRuntime) ExecCancelable(_ context.Context, _ runtime.Handle, _ runtime.ExecRequest) (int, error) {
 	e.native = true
 	return 7, nil
+}
+
+func (e *selectionExecRuntime) ExecNative(_ context.Context, _ runtime.Handle, req runtime.ExecRequest) (int, error) {
+	e.nativeCalled = true
+	e.lastExec = req
+	return 9, e.nativeErr
 }
 
 func TestExecSelectsCancelableExecutor(t *testing.T) {
@@ -128,5 +136,27 @@ func TestExecSelectsCancelableExecutor(t *testing.T) {
 	code, err = svc.Exec(ctx, op.SandboxID, runtime.ExecRequest{Argv: []string{"true"}, Stdout: io.Discard})
 	if err != nil || code != 42 || backend.native {
 		t.Fatalf("fallback: code=%d err=%v native=%t", code, err, backend.native)
+	}
+}
+
+func TestExecUsesNativeExecutorForEnvironmentOverridesWithoutFallback(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	backend := &selectionExecRuntime{nativeErr: errors.New("native execution failed")}
+	svc := New(st, backend)
+	op, err := svc.Create(ctx, CreateRequest{Name: "owned"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := svc.Exec(ctx, op.SandboxID, runtime.ExecRequest{Argv: []string{"true"}, Env: []string{"A=1"}})
+	if err == nil || code != 9 || !backend.nativeCalled || backend.native {
+		t.Fatalf("code=%d err=%v native_called=%t cancelable=%t", code, err, backend.nativeCalled, backend.native)
+	}
+	if len(backend.lastExec.Env) != 1 || backend.lastExec.Env[0] != "A=1" {
+		t.Fatalf("native exec environment=%v", backend.lastExec.Env)
 	}
 }
