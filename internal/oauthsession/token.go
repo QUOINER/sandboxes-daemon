@@ -11,6 +11,10 @@ import (
 	"time"
 )
 
+// ErrOAuthReauthRequired means the provider rejected the stored refresh token
+// permanently (OAuth invalid_grant); local credentials must be removed.
+var ErrOAuthReauthRequired = errors.New("OAuth credentials require sign-in")
+
 // Tokens contain sensitive material; never log or expose them to guests.
 type Tokens struct {
 	AccessToken  string `json:"access_token"`
@@ -112,10 +116,10 @@ func tokenRequest(ctx context.Context, transport http.RoundTripper, endpoint str
 		return Tokens{}, errors.New("OAuth token request failed")
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return Tokens{}, errors.New("OAuth token endpoint rejected request")
-	}
 	const maxTokenResponse = 64 << 10
+	if resp.StatusCode != http.StatusOK {
+		return Tokens{}, classifyTokenError(resp.Body)
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenResponse+1))
 	if err != nil || len(body) > maxTokenResponse {
 		return Tokens{}, errors.New("invalid OAuth token response")
@@ -126,6 +130,23 @@ func tokenRequest(ctx context.Context, transport http.RoundTripper, endpoint str
 		return Tokens{}, errors.New("invalid OAuth token response")
 	}
 	return tokens, nil
+}
+
+func classifyTokenError(body io.Reader) error {
+	const maxTokenErrorResponse = 64 << 10
+	data, err := io.ReadAll(io.LimitReader(body, maxTokenErrorResponse+1))
+	if err != nil || len(data) > maxTokenErrorResponse {
+		clear(data)
+		return errors.New("OAuth token endpoint rejected request")
+	}
+	defer clear(data)
+	var providerError struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(data, &providerError) == nil && providerError.Error == "invalid_grant" {
+		return ErrOAuthReauthRequired
+	}
+	return errors.New("OAuth token endpoint rejected request")
 }
 
 func validEndpointString(endpoint string) bool {
