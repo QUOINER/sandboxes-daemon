@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -35,6 +37,31 @@ type sockaddrVM struct {
 	Zero      [3]byte
 }
 
+type vsockAddr struct {
+	cid  uint32
+	port uint32
+}
+
+func (a vsockAddr) Network() string { return "vsock" }
+func (a vsockAddr) String() string  { return fmt.Sprintf("%d:%d", a.cid, a.port) }
+
+type vsockConn struct {
+	file   *os.File
+	local  net.Addr
+	remote net.Addr
+}
+
+func (c *vsockConn) Read(p []byte) (int, error)         { return c.file.Read(p) }
+func (c *vsockConn) Write(p []byte) (int, error)        { return c.file.Write(p) }
+func (c *vsockConn) Close() error                       { return c.file.Close() }
+func (c *vsockConn) LocalAddr() net.Addr                { return c.local }
+func (c *vsockConn) RemoteAddr() net.Addr               { return c.remote }
+func (c *vsockConn) SetDeadline(t time.Time) error      { return c.file.SetDeadline(t) }
+func (c *vsockConn) SetReadDeadline(t time.Time) error  { return c.file.SetReadDeadline(t) }
+func (c *vsockConn) SetWriteDeadline(t time.Time) error { return c.file.SetWriteDeadline(t) }
+
+var _ net.Conn = (*vsockConn)(nil)
+
 func main() {
 	listen := flag.String("listen", "127.0.0.1:0", "guest loopback listen address")
 	cid := flag.Int("cid", 2, "host vsock context id")
@@ -50,17 +77,21 @@ func main() {
 			var d net.Dialer
 			return d.DialContext(ctx, "unix", *unixSocket)
 		}
-		return dialVsock(*cid, *port)
+		return dialVsock(ctx, *cid, *port)
 	}
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
 	}
 	handler := newHandler(*serviceHost, transport)
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	server := newHTTPServer(*listen, handler)
 	log.Printf("proxy helper listening on %s for %s", *listen, *serviceHost)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+func newHTTPServer(listen string, handler http.Handler) *http.Server {
+	return &http.Server{Addr: listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 }
 
 func fetchToken(ctx context.Context, transport http.RoundTripper) (string, error) {
@@ -100,7 +131,7 @@ func newHandler(serviceHost string, transport http.RoundTripper) http.Handler {
 		out.Host = serviceHost
 		token, err := fetchToken(r.Context(), transport)
 		if err != nil {
-			http.Error(w, "proxy channel unavailable", http.StatusBadGateway)
+			http.Error(w, "proxy bootstrap unavailable", http.StatusBadGateway)
 			return
 		}
 		out.Header.Set(tokenHeader, token)
@@ -108,7 +139,7 @@ func newHandler(serviceHost string, transport http.RoundTripper) http.Handler {
 		out.Header.Del("Proxy-Authorization")
 		resp, err := transport.RoundTrip(out)
 		if err != nil {
-			http.Error(w, "proxy channel unavailable", http.StatusBadGateway)
+			http.Error(w, "proxy upstream request unavailable", http.StatusBadGateway)
 			return
 		}
 		defer func() { _ = resp.Body.Close() }()
@@ -122,7 +153,13 @@ func newHandler(serviceHost string, transport http.RoundTripper) http.Handler {
 	})
 }
 
-func dialVsock(cid, port int) (net.Conn, error) {
+func dialVsock(ctx context.Context, cid, port int) (net.Conn, error) {
+	if cid < 0 || uint64(cid) > uint64(^uint32(0)) || port < 1 || port > 65535 {
+		return nil, errors.New("vsock address out of range")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := ensureVsockDevice(); err != nil {
 		return nil, err
 	}
@@ -130,25 +167,69 @@ func dialVsock(cid, port int) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if port < 1 || port > 65535 {
-		_ = syscall.Close(fd)
-		return nil, errors.New("vsock port out of range")
-	}
-	sa := sockaddrVM{Family: afVsock, Port: uint32(port), CID: uint32(cid)} //nolint:gosec // port range validated above.
-	//nolint:gosec // syscall connect requires the sockaddr pointer.
-	_, _, errno := syscall.Syscall(syscall.SYS_CONNECT, uintptr(fd), uintptr(unsafe.Pointer(&sa)), unsafe.Sizeof(sa))
-	if errno != 0 {
-		_ = syscall.Close(fd)
-		return nil, fmt.Errorf("vsock connect: %w", errno)
-	}
-	file := os.NewFile(uintptr(fd), "vsock")
-	conn, err := net.FileConn(file)
-	_ = file.Close()
-	if err != nil {
+	if err := syscall.SetNonblock(fd, true); err != nil {
 		_ = syscall.Close(fd)
 		return nil, err
 	}
-	return conn, nil
+	sa := sockaddrVM{Family: afVsock, Port: uint32(port), CID: uint32(cid)}
+	if err := connectVSock(ctx, fd, sa); err != nil {
+		_ = syscall.Close(fd)
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), "vsock")
+	if file == nil {
+		_ = syscall.Close(fd)
+		return nil, errors.New("wrap vsock socket")
+	}
+	return &vsockConn{
+		file:   file,
+		local:  vsockAddr{},
+		remote: vsockAddr{cid: uint32(cid), port: uint32(port)}, // values were range-checked above.
+	}, nil
+}
+
+func connectVSock(ctx context.Context, fd int, sa sockaddrVM) error {
+	//nolint:gosec // syscall connect requires the sockaddr pointer.
+	_, _, errno := syscall.Syscall(syscall.SYS_CONNECT, uintptr(fd), uintptr(unsafe.Pointer(&sa)), unsafe.Sizeof(sa))
+	if errno != 0 && errno != syscall.EINPROGRESS && errno != syscall.EALREADY && errno != syscall.EAGAIN && errno != syscall.EINTR {
+		return fmt.Errorf("vsock connect: %w", errno)
+	}
+	if errno != 0 {
+		if err := waitForVSockConnect(ctx, fd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func waitForVSockConnect(ctx context.Context, fd int) error {
+	if fd < 0 || uint64(fd) > uint64(^uint32(0)>>1) {
+		return errors.New("vsock file descriptor out of range")
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		pollFD := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+		n, err := unix.Poll(pollFD, 100)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("wait for vsock connection: %w", err)
+		}
+		if n == 0 {
+			continue
+		}
+		socketErr, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_ERROR)
+		if err != nil {
+			return fmt.Errorf("check vsock connection: %w", err)
+		}
+		if socketErr != 0 {
+			return fmt.Errorf("vsock connect: %w", syscall.Errno(socketErr))
+		}
+		return nil
+	}
 }
 
 // ensureVsockDevice creates /dev/vsock from the dynamic misc minor.
