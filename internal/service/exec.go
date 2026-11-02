@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	core "github.com/QUOINER/sandboxes-core"
-	"github.com/QUOINER/sandboxes-core/operation"
-	"github.com/QUOINER/sandboxes-core/sandbox"
-	runtime "github.com/QUOINER/sandboxes-runtime"
+	core "github.com/quoiner/sandboxes-core"
+	"github.com/quoiner/sandboxes-core/operation"
+	"github.com/quoiner/sandboxes-core/sandbox"
+	runtime "github.com/quoiner/sandboxes-runtime"
 
-	"github.com/QUOINER/sandboxes-daemon/internal/servicesecrets"
+	"github.com/quoiner/sandboxes-daemon/internal/servicesecrets"
 )
 
 type execSession struct {

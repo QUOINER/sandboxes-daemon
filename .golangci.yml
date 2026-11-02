@@ -123,4 +123,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/QUOINER/sandboxes-daemon
+        - github.com/quoiner/sandboxes-daemon
