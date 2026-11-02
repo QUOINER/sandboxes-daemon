@@ -1,6 +1,7 @@
 package oauthsession
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,21 @@ import (
 	"testing"
 	"time"
 )
+
+func FuzzClassifyTokenError(f *testing.F) {
+	f.Add([]byte(`{"error":"invalid_grant"}`))
+	f.Add([]byte(`{"error":"temporarily_unavailable","error_description":"synthetic-secret"}`))
+	f.Add([]byte{0, 0xff, '{'})
+	f.Fuzz(func(t *testing.T, body []byte) {
+		err := classifyTokenError(bytes.NewReader(body))
+		if err == nil {
+			t.Fatal("token endpoint error classifier returned nil")
+		}
+		if !errors.Is(err, ErrOAuthReauthRequired) && err.Error() != "OAuth token endpoint rejected request" {
+			t.Fatalf("provider details escaped error redaction: %q", err.Error())
+		}
+	})
+}
 
 func TestTokenManagerConcurrentRefresh(t *testing.T) {
 	var calls atomic.Int32
