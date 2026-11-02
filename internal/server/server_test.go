@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -180,6 +181,18 @@ func (emptyOAuthVault) Get(context.Context, string, string) (string, error) {
 }
 func (emptyOAuthVault) Delete(context.Context, string, string) error { return nil }
 
+type failingOAuthVault struct{}
+
+func (failingOAuthVault) Set(context.Context, string, string, string) error {
+	return errors.New("synthetic vault failure")
+}
+func (failingOAuthVault) Get(context.Context, string, string) (string, error) {
+	return "", errors.New("synthetic vault failure")
+}
+func (failingOAuthVault) Delete(context.Context, string, string) error {
+	return errors.New("synthetic vault failure")
+}
+
 func TestAccountRPCFailsClosedWithoutTrustedProvider(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "account.db"))
@@ -224,6 +237,10 @@ func TestAccountRPCFailsClosedWithoutTrustedProvider(t *testing.T) {
 	}
 	if response, err := client.Logout(ctx, &localv1.AccountServiceLogoutRequest{Provider: "docker"}); err != nil || response.GetRemoved() {
 		t.Fatalf("logout without any local account state should be idempotent, response=%#v err=%v", response, err)
+	}
+	svc.SetOAuthVault(failingOAuthVault{})
+	if _, err := client.Status(ctx, &localv1.AccountServiceStatusRequest{Provider: "docker"}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("status must fail closed when host vault is unavailable, got %v", err)
 	}
 }
 
