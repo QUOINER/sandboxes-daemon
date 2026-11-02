@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	core "github.com/KLORQ/sandboxes-core"
-	"github.com/KLORQ/sandboxes-core/operation"
-	"github.com/KLORQ/sandboxes-core/sandbox"
-	runtime "github.com/KLORQ/sandboxes-runtime"
+	core "github.com/QUOINER/sandboxes-core"
+	"github.com/QUOINER/sandboxes-core/operation"
+	"github.com/QUOINER/sandboxes-core/sandbox"
+	runtime "github.com/QUOINER/sandboxes-runtime"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
+	"github.com/QUOINER/sandboxes-daemon/internal/servicesecrets"
 )
 
 type execSession struct {

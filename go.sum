@@ -2,14 +2,6 @@ al.essio.dev/pkg/shellescape v1.5.1 h1:86HrALUujYS/h+GtqoB26SBEdkWfmMI6FubjXlsXy
 al.essio.dev/pkg/shellescape v1.5.1/go.mod h1:6sIqp7X2P6mThCQ7twERpZTuigpr6KbZWtls1U8I890=
 github.com/AdaLogics/go-fuzz-headers v0.0.0-20240806141605-e8a1dd7889d6 h1:He8afgbRMd7mFxO99hRNu+6tazq8nFF9lIwo9JFroBk=
 github.com/AdaLogics/go-fuzz-headers v0.0.0-20240806141605-e8a1dd7889d6/go.mod h1:8o94RPi1/7XTJvwPpRSzSUedZrtlirdB3r9Z20bi2f8=
-github.com/KLORQ/sandboxes-api v0.0.11 h1:FuJFnT/Wc2y7KmjYNTvdviXodj+46pSghuINTvWL5yE=
-github.com/KLORQ/sandboxes-api v0.0.11/go.mod h1:D4UcPhDDsc1XGskCIMaRrZWVblXF3mrgZC6uw4z2zC4=
-github.com/KLORQ/sandboxes-core v0.0.8 h1:7k1EVOz697VRJIVCQh6tUTL0KALECpCE2q3+Oa9PXxE=
-github.com/KLORQ/sandboxes-core v0.0.8/go.mod h1:VQ7kkoe9DxKVmrElQYUjuIBNY8t69KlVnGJeSBuP7Q4=
-github.com/KLORQ/sandboxes-gateway v0.0.10 h1:PLq2yjHNCNnBFLKtX3QeXe21i9I4UTtofmFXGtuctRg=
-github.com/KLORQ/sandboxes-gateway v0.0.10/go.mod h1:ZxAcLkkHJk+ref+mjb7pzEkhjTWejxnMP56IVjMWjic=
-github.com/KLORQ/sandboxes-runtime v0.0.19 h1:r8OjEZAOSVS6UMHe/c9917nOswaDZ978mCujD/A8uoE=
-github.com/KLORQ/sandboxes-runtime v0.0.19/go.mod h1:FL+nWfR3fL02gwL33KlspE5xPizgqlrSveZNv1bQPx4=
 github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29 h1:0kQAzHq8vLs7Pptv+7TxjdETLf/nIqJpIB4oC6Ba4vY=
 github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29/go.mod h1:ZWa7ssZJT30CCDGJ7fk/2SBTq9BIQrrVjrcss0UW2s0=
 github.com/Microsoft/hcsshim v0.15.0-rc.4 h1:aZFX4LH0S20Lgjq0wG61StIClj7im4yzrxIClkaR8Z8=

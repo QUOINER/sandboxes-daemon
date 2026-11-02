@@ -3,12 +3,12 @@ package server
 import (
 	"context"
 
-	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
+	localv1 "github.com/QUOINER/sandboxes-api/gen/go/sandboxes/local/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/service"
-	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
+	"github.com/QUOINER/sandboxes-daemon/internal/service"
+	"github.com/QUOINER/sandboxes-daemon/internal/servicesecrets"
 )
 
 // SecretServer implements the local service-secret RPCs.
