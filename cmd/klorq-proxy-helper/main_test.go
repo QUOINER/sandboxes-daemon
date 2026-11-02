@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -9,9 +10,73 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/KLORQ/sandboxes-daemon/internal/secretproxy"
 )
+
+func TestVsockConnWrapsPollableFile(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+	defer func() { _ = writer.Close() }()
+	conn := &vsockConn{file: reader, local: vsockAddr{}, remote: vsockAddr{cid: 2, port: 1027}}
+	if conn.RemoteAddr().Network() != "vsock" || conn.RemoteAddr().String() != "2:1027" {
+		t.Fatalf("remote address = %v", conn.RemoteAddr())
+	}
+	if _, err := io.WriteString(writer, "connected"); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, len("connected"))
+	if _, err := io.ReadFull(conn, buffer); err != nil {
+		t.Fatal(err)
+	}
+	if string(buffer) != "connected" {
+		t.Fatalf("read %q", buffer)
+	}
+}
+
+func TestVsockConnectWaitHonorsCancellation(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+	defer func() { _ = writer.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := waitForVSockConnect(ctx, int(reader.Fd())); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForVSockConnect() error = %v, want deadline exceeded", err)
+	}
+}
+
+func TestDialVsockRejectsOutOfRangeAddress(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cid  int
+		port int
+	}{
+		{name: "negative cid", cid: -1, port: 1027},
+		{name: "cid overflow", cid: 1 << 32, port: 1027},
+		{name: "zero port", cid: 2, port: 0},
+		{name: "port overflow", cid: 2, port: 65536},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := dialVsock(context.Background(), tc.cid, tc.port); err == nil {
+				t.Fatal("dialVsock() accepted an out-of-range address")
+			}
+		})
+	}
+}
+
+func TestHelperServerBindsConfiguredLoopbackAddress(t *testing.T) {
+	server := newHTTPServer("127.0.0.1:3128", http.NotFoundHandler())
+	if server.Addr != "127.0.0.1:3128" {
+		t.Fatalf("server listen address = %q", server.Addr)
+	}
+}
 
 func TestHelperForwardsWithTokenAndBrokerInjectsSecret(t *testing.T) {
 	var gotAuth, gotPath string

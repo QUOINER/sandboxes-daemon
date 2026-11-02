@@ -70,8 +70,9 @@ const TokenHeader = "X-Klorq-Proxy-Token" //nolint:gosec // HTTP header name, no
 
 // Manager owns proxies keyed by sandbox and service.
 type Manager struct {
-	mu      sync.Mutex
-	proxies map[string]*proxy
+	mu          sync.Mutex
+	proxies     map[string]*proxy
+	dialContext func(context.Context, string, string) (net.Conn, error)
 }
 
 // New creates a manager.
@@ -113,7 +114,7 @@ func (m *Manager) StartUnix(ctx context.Context, sandbox, service string, cfg Se
 		return "", err
 	}
 	reverse := httputil.NewSingleHostReverseProxy(upstream)
-	reverse.Transport = outboundTransport(upstream.Scheme == "https")
+	reverse.Transport = outboundTransport(upstream.Scheme == "https", m.dialContext)
 	reverse.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 		http.Error(w, "proxy upstream unavailable", http.StatusBadGateway)
 	}
@@ -262,7 +263,7 @@ func (m *Manager) RevokeSecret(service, sandboxName, scope string) error {
 	return errors.Join(failures...)
 }
 
-func outboundTransport(requirePublicIP bool) *http.Transport {
+func outboundTransport(requirePublicIP bool, dialOverride func(context.Context, string, string) (net.Conn, error)) *http.Transport {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
 		Proxy:                 nil,
@@ -273,6 +274,9 @@ func outboundTransport(requirePublicIP bool) *http.Transport {
 		MaxIdleConnsPerHost:   4,
 		MaxConnsPerHost:       16,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if dialOverride != nil {
+				return dialOverride(ctx, network, address)
+			}
 			if !requirePublicIP {
 				return dialer.DialContext(ctx, network, address)
 			}
