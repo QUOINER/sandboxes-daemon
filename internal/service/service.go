@@ -24,17 +24,17 @@ import (
 	"time"
 	"unicode/utf8"
 
-	core "github.com/KLORQ/sandboxes-core"
-	"github.com/KLORQ/sandboxes-core/operation"
-	"github.com/KLORQ/sandboxes-core/sandbox"
-	gatewaypolicy "github.com/KLORQ/sandboxes-gateway/policy"
-	runtime "github.com/KLORQ/sandboxes-runtime"
+	core "github.com/QUOINER/sandboxes-core"
+	"github.com/QUOINER/sandboxes-core/operation"
+	"github.com/QUOINER/sandboxes-core/sandbox"
+	gatewaypolicy "github.com/QUOINER/sandboxes-gateway/policy"
+	runtime "github.com/QUOINER/sandboxes-runtime"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/oauthsession"
-	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
-	"github.com/KLORQ/sandboxes-daemon/internal/secretproxy"
-	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
-	"github.com/KLORQ/sandboxes-daemon/internal/store"
+	"github.com/QUOINER/sandboxes-daemon/internal/oauthsession"
+	"github.com/QUOINER/sandboxes-daemon/internal/registrycredentials"
+	"github.com/QUOINER/sandboxes-daemon/internal/secretproxy"
+	"github.com/QUOINER/sandboxes-daemon/internal/servicesecrets"
+	"github.com/QUOINER/sandboxes-daemon/internal/store"
 )
 
 const (

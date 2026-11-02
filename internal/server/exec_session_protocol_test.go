@@ -3,7 +3,7 @@ package server
 import (
 	"testing"
 
-	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
+	localv1 "github.com/QUOINER/sandboxes-api/gen/go/sandboxes/local/v1"
 )
 
 func TestExecSessionProtocol(t *testing.T) {

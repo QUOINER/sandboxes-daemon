@@ -7,18 +7,18 @@ import (
 	"fmt"
 	"time"
 
-	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
-	apiversion "github.com/KLORQ/sandboxes-api/version"
-	core "github.com/KLORQ/sandboxes-core"
-	"github.com/KLORQ/sandboxes-core/operation"
-	"github.com/KLORQ/sandboxes-core/sandbox"
+	localv1 "github.com/QUOINER/sandboxes-api/gen/go/sandboxes/local/v1"
+	apiversion "github.com/QUOINER/sandboxes-api/version"
+	core "github.com/QUOINER/sandboxes-core"
+	"github.com/QUOINER/sandboxes-core/operation"
+	"github.com/QUOINER/sandboxes-core/sandbox"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
-	"github.com/KLORQ/sandboxes-daemon/internal/service"
-	"github.com/KLORQ/sandboxes-daemon/internal/version"
+	"github.com/QUOINER/sandboxes-daemon/internal/registrycredentials"
+	"github.com/QUOINER/sandboxes-daemon/internal/service"
+	"github.com/QUOINER/sandboxes-daemon/internal/version"
 )
 
 // SandboxServer implements the sandbox gRPC service.

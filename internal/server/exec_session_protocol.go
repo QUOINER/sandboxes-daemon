@@ -5,9 +5,9 @@ import (
 	"errors"
 	"io"
 
-	runtime "github.com/KLORQ/sandboxes-runtime"
+	runtime "github.com/QUOINER/sandboxes-runtime"
 
-	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
+	localv1 "github.com/QUOINER/sandboxes-api/gen/go/sandboxes/local/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

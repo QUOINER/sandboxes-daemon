@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	core "github.com/KLORQ/sandboxes-core"
-	"github.com/KLORQ/sandboxes-core/operation"
-	"github.com/KLORQ/sandboxes-core/sandbox"
+	core "github.com/QUOINER/sandboxes-core"
+	"github.com/QUOINER/sandboxes-core/operation"
+	"github.com/QUOINER/sandboxes-core/sandbox"
 	_ "modernc.org/sqlite"
 )
 
