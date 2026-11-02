@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/secretproxy"
+	"github.com/QUOINER/sandboxes-daemon/internal/secretproxy"
 )
 
 func TestVsockConnWrapsPollableFile(t *testing.T) {

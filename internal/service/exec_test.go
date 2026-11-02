@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	runtime "github.com/KLORQ/sandboxes-runtime"
+	runtime "github.com/QUOINER/sandboxes-runtime"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/store"
+	"github.com/QUOINER/sandboxes-daemon/internal/store"
 )
 
 type execTestRuntime struct {

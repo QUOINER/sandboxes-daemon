@@ -11,14 +11,14 @@ import (
 	"testing"
 	"time"
 
-	core "github.com/KLORQ/sandboxes-core"
-	"github.com/KLORQ/sandboxes-core/operation"
-	"github.com/KLORQ/sandboxes-core/sandbox"
-	runtime "github.com/KLORQ/sandboxes-runtime"
+	core "github.com/QUOINER/sandboxes-core"
+	"github.com/QUOINER/sandboxes-core/operation"
+	"github.com/QUOINER/sandboxes-core/sandbox"
+	runtime "github.com/QUOINER/sandboxes-runtime"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
-	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
-	"github.com/KLORQ/sandboxes-daemon/internal/store"
+	"github.com/QUOINER/sandboxes-daemon/internal/registrycredentials"
+	"github.com/QUOINER/sandboxes-daemon/internal/servicesecrets"
+	"github.com/QUOINER/sandboxes-daemon/internal/store"
 )
 
 func TestLifecycle(t *testing.T) {

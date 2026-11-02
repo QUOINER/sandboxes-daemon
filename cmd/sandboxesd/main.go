@@ -12,16 +12,16 @@ import (
 	"syscall"
 	"time"
 
-	gateway "github.com/KLORQ/sandboxes-gateway"
-	runtime "github.com/KLORQ/sandboxes-runtime"
-	runtimectr "github.com/KLORQ/sandboxes-runtime/ctr"
+	gateway "github.com/QUOINER/sandboxes-gateway"
+	runtime "github.com/QUOINER/sandboxes-runtime"
+	runtimectr "github.com/QUOINER/sandboxes-runtime/ctr"
 
-	daemon "github.com/KLORQ/sandboxes-daemon"
-	daemonnetwork "github.com/KLORQ/sandboxes-daemon/internal/network"
-	"github.com/KLORQ/sandboxes-daemon/internal/oauthsession"
-	"github.com/KLORQ/sandboxes-daemon/internal/service"
-	"github.com/KLORQ/sandboxes-daemon/internal/settings"
-	"github.com/KLORQ/sandboxes-daemon/internal/version"
+	daemon "github.com/QUOINER/sandboxes-daemon"
+	daemonnetwork "github.com/QUOINER/sandboxes-daemon/internal/network"
+	"github.com/QUOINER/sandboxes-daemon/internal/oauthsession"
+	"github.com/QUOINER/sandboxes-daemon/internal/service"
+	"github.com/QUOINER/sandboxes-daemon/internal/settings"
+	"github.com/QUOINER/sandboxes-daemon/internal/version"
 )
 
 type options struct {
