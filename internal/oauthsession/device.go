@@ -138,10 +138,22 @@ type deviceAuthorizationResponse struct {
 
 func decodeDeviceAuthorizationResponse(body []byte) (deviceAuthorizationResponse, error) {
 	var response deviceAuthorizationResponse
-	if json.Unmarshal(body, &response) != nil || response.DeviceCode == "" || response.UserCode == "" || response.ExpiresIn < 30 || response.ExpiresIn > 1800 {
+	if json.Unmarshal(body, &response) != nil || response.DeviceCode == "" || !validUserCode(response.UserCode) || response.ExpiresIn < 30 || response.ExpiresIn > 1800 {
 		return deviceAuthorizationResponse{}, errors.New("invalid OAuth device authorization response")
 	}
 	return response, nil
+}
+
+func validUserCode(code string) bool {
+	if code == "" || len(code) > 64 {
+		return false
+	}
+	for _, char := range code {
+		if char < '!' || char > '~' {
+			return false
+		}
+	}
+	return true
 }
 
 func validateVerificationURI(response deviceAuthorizationResponse, deviceEndpoint string) (string, error) {
@@ -285,6 +297,16 @@ func AuthorizeDevice(ctx context.Context, provider DeviceProvider, handoff func(
 	authorization, err := BeginDeviceAuthorization(ctx, provider)
 	if err != nil {
 		return err
+	}
+	return CompleteDeviceAuthorization(ctx, provider, authorization, handoff, sink)
+}
+
+// CompleteDeviceAuthorization performs the interactive handoff, polls the
+// provider, and stores the resulting token. The authorization stays in host
+// memory; callers may display only its user code and verification URI.
+func CompleteDeviceAuthorization(ctx context.Context, provider DeviceProvider, authorization DeviceAuthorization, handoff func(context.Context, string, string) error, sink TokenSink) error {
+	if handoff == nil || sink == nil {
+		return errors.New("invalid OAuth device flow configuration")
 	}
 	if err := handoff(ctx, authorization.UserCode, authorization.VerificationURI); err != nil {
 		return errors.New("open OAuth verification page failed")

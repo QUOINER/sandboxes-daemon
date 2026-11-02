@@ -92,7 +92,17 @@ func TestDeviceAccountLoginStoresAndLogoutRevokesHostTokens(t *testing.T) {
 	}})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := svc.LoginAccount(ctx, "docker"); err != nil {
+	authorization, err := svc.BeginDeviceAccountLogin(ctx, "docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorization.UserCode != "ABCD" || authorization.VerificationURI != server.URL+"/activate?user_code=ABCD" {
+		t.Fatalf("unexpected user handoff data: code=%q uri=%q", authorization.UserCode, authorization.VerificationURI)
+	}
+	if approved.Load() || patCalls.Load() != 0 {
+		t.Fatal("device flow started before the caller continued after the handoff")
+	}
+	if err := svc.CompleteDeviceAccountLogin(ctx, "docker", authorization); err != nil {
 		t.Fatal(err)
 	}
 	sink, err := oauthsession.NewVaultSink(vault, "docker")

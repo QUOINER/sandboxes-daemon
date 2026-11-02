@@ -21,6 +21,8 @@ import (
 	"github.com/KLORQ/sandboxes-daemon/internal/version"
 )
 
+const defaultAccountProvider = "docker"
+
 // SandboxServer implements the sandbox gRPC service.
 type SandboxServer struct {
 	localv1.UnimplementedSandboxServiceServer
@@ -70,7 +72,7 @@ func NewAccount(svc *service.Service) *AccountServer { return &AccountServer{svc
 func (s *AccountServer) Login(ctx context.Context, req *localv1.AccountServiceLoginRequest) (*localv1.AccountServiceLoginResponse, error) {
 	provider := req.GetProvider()
 	if provider == "" {
-		provider = "docker"
+		provider = defaultAccountProvider
 	}
 	loginCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
@@ -87,6 +89,61 @@ func (s *AccountServer) Login(ctx context.Context, req *localv1.AccountServiceLo
 		return nil, status.Error(codes.FailedPrecondition, "OAuth login failed; no credentials were returned")
 	}
 	return &localv1.AccountServiceLoginResponse{Provider: provider, Authenticated: true}, nil
+}
+
+// LoginDevice streams a public user code to the CLI, waits for the CLI's
+// explicit continuation after the browser handoff, then completes the trusted
+// daemon-side device flow. The provider device code never crosses gRPC.
+func (s *AccountServer) LoginDevice(stream grpc.BidiStreamingServer[localv1.AccountServiceLoginDeviceRequest, localv1.AccountServiceLoginDeviceResponse]) error {
+	first, err := stream.Recv()
+	if err != nil {
+		return mapError(err)
+	}
+	if first.GetContinueAfterHandoff() {
+		return status.Error(codes.InvalidArgument, "OAuth login must start before handoff confirmation")
+	}
+	provider := first.GetProvider()
+	if provider == "" {
+		provider = defaultAccountProvider
+	}
+	ctx, cancel := context.WithTimeout(stream.Context(), 30*time.Minute)
+	defer cancel()
+	authorization, err := s.svc.BeginDeviceAccountLogin(ctx, provider)
+	if err != nil {
+		return accountLoginError(err)
+	}
+	if err := stream.Send(&localv1.AccountServiceLoginDeviceResponse{
+		UserCode: authorization.UserCode, VerificationUri: authorization.VerificationURI,
+	}); err != nil {
+		return mapError(err)
+	}
+	ack, err := stream.Recv()
+	if err != nil {
+		return mapError(err)
+	}
+	if ack.GetProvider() != "" {
+		return status.Error(codes.InvalidArgument, "unexpected OAuth provider in handoff confirmation")
+	}
+	if !ack.GetContinueAfterHandoff() {
+		return status.Error(codes.Canceled, "OAuth login canceled")
+	}
+	if err := s.svc.CompleteDeviceAccountLogin(ctx, provider, authorization); err != nil {
+		return accountLoginError(err)
+	}
+	return stream.Send(&localv1.AccountServiceLoginDeviceResponse{Authenticated: true})
+}
+
+func accountLoginError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return mapError(err)
+	}
+	if errors.Is(err, service.ErrOAuthProviderUnavailable) {
+		return status.Error(codes.FailedPrecondition, "OAuth provider is not configured on this daemon")
+	}
+	if errors.Is(err, service.ErrOAuthPartialLogin) {
+		return status.Error(codes.FailedPrecondition, "OAuth login may have partially completed; run ksbx logout before retrying")
+	}
+	return status.Error(codes.FailedPrecondition, "OAuth login failed; no credentials were returned")
 }
 
 func (s *AccountServer) LoginWithPAT(ctx context.Context, req *localv1.AccountServiceLoginWithPATRequest) (*localv1.AccountServiceLoginWithPATResponse, error) {
@@ -114,7 +171,7 @@ func (s *AccountServer) LoginWithPAT(ctx context.Context, req *localv1.AccountSe
 func (s *AccountServer) Logout(ctx context.Context, req *localv1.AccountServiceLogoutRequest) (*localv1.AccountServiceLogoutResponse, error) {
 	provider := req.GetProvider()
 	if provider == "" {
-		provider = "docker"
+		provider = defaultAccountProvider
 	}
 	removed, err := s.svc.LogoutAccount(ctx, provider)
 	if err != nil {
