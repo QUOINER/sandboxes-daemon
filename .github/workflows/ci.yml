@@ -59,3 +59,22 @@ jobs:
             ${{ runner.temp }}/klorq-proxy-helper-linux-arm64.sha256
           if-no-files-found: error
           retention-days: 90
+
+  attest:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: go
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sandboxes-daemon-assets-${{ github.sha }}
+          path: ${{ runner.temp }}/sandboxes-daemon-assets
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/sandboxes-daemon-assets/klorq-proxy-helper-linux-arm64
+          sbom-path: ${{ runner.temp }}/sandboxes-daemon-assets/sandboxes-daemon.cdx.json
