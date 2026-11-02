@@ -263,7 +263,8 @@ func (f *fakeRuntime) Exec(_ context.Context, _ runtime.Handle, req runtime.Exec
 	return 0, nil
 }
 
-func (f *fakeRuntime) ExecNative(context.Context, runtime.Handle, runtime.ExecRequest) (int, error) {
+func (f *fakeRuntime) ExecNative(_ context.Context, _ runtime.Handle, req runtime.ExecRequest) (int, error) {
+	f.lastExec = req
 	return 0, nil
 }
 
