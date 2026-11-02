@@ -34,7 +34,7 @@ func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 		t.Skip("P-04 owned-VM acceptance currently requires macOS ARM64")
 	}
 	inputs := getLiveInputs(t)
-	root, err := os.MkdirTemp("/private/tmp", "ksbx-p04-vsock-")
+	root, err := os.MkdirTemp("/private/tmp", "qsbx-p04-vsock-")
 	if err != nil {
 		t.Fatal(err)
 	}

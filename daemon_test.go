@@ -55,7 +55,7 @@ func TestRunStartsAndStops(t *testing.T) {
 }
 
 func TestRunShutdownClosesActiveWatch(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "ksbx-watch-test-")
+	dir, err := os.MkdirTemp("/tmp", "qsbx-watch-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestRunShutdownClosesActiveWatch(t *testing.T) {
 }
 
 func TestRunReportsCleanupErrorBeforeReleasingStateLock(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "ksbx-cleanup-test-")
+	dir, err := os.MkdirTemp("/tmp", "qsbx-cleanup-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestEnsureSocketAvailablePreservesExistingObjects(t *testing.T) {
 }
 
 func TestEnsureSocketAvailablePreservesSocketAndSymlink(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "ksbx-socket-test-")
+	dir, err := os.MkdirTemp("/tmp", "qsbx-socket-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
