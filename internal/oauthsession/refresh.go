@@ -3,6 +3,7 @@ package oauthsession
 import (
 	"context"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"net/http"
 	"time"
@@ -73,6 +74,11 @@ func (m *TokenManager) AccessToken(ctx context.Context) (string, error) {
 	}
 	updated, err := Refresh(ctx, m.transport, m.endpoint, m.clientID, tokens.RefreshToken)
 	if err != nil {
+		if errors.Is(err, ErrOAuthReauthRequired) {
+			if deleteErr := m.sink.Delete(ctx); deleteErr != nil {
+				return "", errors.Join(ErrOAuthReauthRequired, fmt.Errorf("remove rejected OAuth credentials: %w", deleteErr))
+			}
+		}
 		return "", err
 	}
 	if updated.ExpiresIn <= 0 {

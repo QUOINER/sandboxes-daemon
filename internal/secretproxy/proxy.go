@@ -280,23 +280,32 @@ func outboundTransport(requirePublicIP bool, dialOverride func(context.Context, 
 			if !requirePublicIP {
 				return dialer.DialContext(ctx, network, address)
 			}
-			host, port, err := net.SplitHostPort(address)
-			if err != nil {
-				return nil, errors.New("invalid proxy upstream address")
-			}
-			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-			if err != nil || len(ips) == 0 {
-				return nil, errors.New("proxy upstream DNS resolution failed")
-			}
-			for _, answer := range ips {
-				if !isPublicUnicast(answer.IP) {
-					return nil, errors.New("proxy upstream resolved to a non-public address")
-				}
-			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+			return dialPublicUnicast(ctx, network, address, net.DefaultResolver.LookupIPAddr, dialer.DialContext)
 		},
 	}
 	return transport
+}
+
+func dialPublicUnicast(
+	ctx context.Context,
+	network, address string,
+	lookup func(context.Context, string) ([]net.IPAddr, error),
+	dial func(context.Context, string, string) (net.Conn, error),
+) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, errors.New("invalid proxy upstream address")
+	}
+	ips, err := lookup(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return nil, errors.New("proxy upstream DNS resolution failed")
+	}
+	for _, answer := range ips {
+		if !isPublicUnicast(answer.IP) {
+			return nil, errors.New("proxy upstream resolved to a non-public address")
+		}
+	}
+	return dial(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
 }
 
 func isPublicUnicast(ip net.IP) bool {
