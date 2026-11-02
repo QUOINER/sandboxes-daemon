@@ -1,6 +1,6 @@
 package oauthsession
 
-import "github.com/QUOINER/sandboxes-daemon/internal/registrycredentials"
+import "github.com/quoiner/sandboxes-daemon/internal/registrycredentials"
 
 // NewNativeVaultSink binds OAuth storage to the OS credential vault. It does
 // not perform I/O until the returned sink is used and never falls back to a file.

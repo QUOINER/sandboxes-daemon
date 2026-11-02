@@ -12,16 +12,16 @@ import (
 	"syscall"
 	"time"
 
-	gateway "github.com/QUOINER/sandboxes-gateway"
-	runtime "github.com/QUOINER/sandboxes-runtime"
-	runtimectr "github.com/QUOINER/sandboxes-runtime/ctr"
+	gateway "github.com/quoiner/sandboxes-gateway"
+	runtime "github.com/quoiner/sandboxes-runtime"
+	runtimectr "github.com/quoiner/sandboxes-runtime/ctr"
 
-	daemon "github.com/QUOINER/sandboxes-daemon"
-	daemonnetwork "github.com/QUOINER/sandboxes-daemon/internal/network"
-	"github.com/QUOINER/sandboxes-daemon/internal/oauthsession"
-	"github.com/QUOINER/sandboxes-daemon/internal/service"
-	"github.com/QUOINER/sandboxes-daemon/internal/settings"
-	"github.com/QUOINER/sandboxes-daemon/internal/version"
+	daemon "github.com/quoiner/sandboxes-daemon"
+	daemonnetwork "github.com/quoiner/sandboxes-daemon/internal/network"
+	"github.com/quoiner/sandboxes-daemon/internal/oauthsession"
+	"github.com/quoiner/sandboxes-daemon/internal/service"
+	"github.com/quoiner/sandboxes-daemon/internal/settings"
+	"github.com/quoiner/sandboxes-daemon/internal/version"
 )
 
 type options struct {

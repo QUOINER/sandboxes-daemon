@@ -12,17 +12,17 @@ import (
 	"syscall"
 	"time"
 
-	localv1 "github.com/QUOINER/sandboxes-api/gen/go/sandboxes/local/v1"
-	runtime "github.com/QUOINER/sandboxes-runtime"
+	localv1 "github.com/quoiner/sandboxes-api/gen/go/sandboxes/local/v1"
+	runtime "github.com/quoiner/sandboxes-runtime"
 	"google.golang.org/grpc"
 
-	"github.com/QUOINER/sandboxes-daemon/internal/oauthsession"
-	"github.com/QUOINER/sandboxes-daemon/internal/registrycredentials"
-	"github.com/QUOINER/sandboxes-daemon/internal/secretproxy"
-	"github.com/QUOINER/sandboxes-daemon/internal/server"
-	"github.com/QUOINER/sandboxes-daemon/internal/service"
-	"github.com/QUOINER/sandboxes-daemon/internal/servicesecrets"
-	"github.com/QUOINER/sandboxes-daemon/internal/store"
+	"github.com/quoiner/sandboxes-daemon/internal/oauthsession"
+	"github.com/quoiner/sandboxes-daemon/internal/registrycredentials"
+	"github.com/quoiner/sandboxes-daemon/internal/secretproxy"
+	"github.com/quoiner/sandboxes-daemon/internal/server"
+	"github.com/quoiner/sandboxes-daemon/internal/service"
+	"github.com/quoiner/sandboxes-daemon/internal/servicesecrets"
+	"github.com/quoiner/sandboxes-daemon/internal/store"
 )
 
 // Config is the daemon configuration.

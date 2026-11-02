@@ -7,18 +7,18 @@ import (
 	"fmt"
 	"time"
 
-	localv1 "github.com/QUOINER/sandboxes-api/gen/go/sandboxes/local/v1"
-	apiversion "github.com/QUOINER/sandboxes-api/version"
-	core "github.com/QUOINER/sandboxes-core"
-	"github.com/QUOINER/sandboxes-core/operation"
-	"github.com/QUOINER/sandboxes-core/sandbox"
+	localv1 "github.com/quoiner/sandboxes-api/gen/go/sandboxes/local/v1"
+	apiversion "github.com/quoiner/sandboxes-api/version"
+	core "github.com/quoiner/sandboxes-core"
+	"github.com/quoiner/sandboxes-core/operation"
+	"github.com/quoiner/sandboxes-core/sandbox"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/QUOINER/sandboxes-daemon/internal/registrycredentials"
-	"github.com/QUOINER/sandboxes-daemon/internal/service"
-	"github.com/QUOINER/sandboxes-daemon/internal/version"
+	"github.com/quoiner/sandboxes-daemon/internal/registrycredentials"
+	"github.com/quoiner/sandboxes-daemon/internal/service"
+	"github.com/quoiner/sandboxes-daemon/internal/version"
 )
 
 const defaultAccountProvider = "docker"

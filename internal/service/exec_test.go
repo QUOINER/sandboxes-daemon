@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	runtime "github.com/QUOINER/sandboxes-runtime"
+	runtime "github.com/quoiner/sandboxes-runtime"
 
-	"github.com/QUOINER/sandboxes-daemon/internal/store"
+	"github.com/quoiner/sandboxes-daemon/internal/store"
 )
 
 type execTestRuntime struct {
