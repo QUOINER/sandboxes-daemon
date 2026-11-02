@@ -82,7 +82,7 @@ func (s *AccountServer) Login(ctx context.Context, req *localv1.AccountServiceLo
 			return nil, status.Error(codes.FailedPrecondition, "OAuth provider is not configured on this daemon")
 		}
 		if errors.Is(err, service.ErrOAuthPartialLogin) {
-			return nil, status.Error(codes.FailedPrecondition, "OAuth login may have partially completed; run ksbx logout before retrying")
+			return nil, status.Error(codes.FailedPrecondition, "OAuth login may have partially completed; run qsbx logout before retrying")
 		}
 		return nil, status.Error(codes.FailedPrecondition, "OAuth login failed; no credentials were returned")
 	}
@@ -103,7 +103,7 @@ func (s *AccountServer) LoginWithPAT(ctx context.Context, req *localv1.AccountSe
 		case errors.Is(err, service.ErrOAuthCredentialConflict):
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		case errors.Is(err, service.ErrOAuthPartialLogin):
-			return nil, status.Error(codes.FailedPrecondition, "Docker login may have partially completed; run ksbx logout before retrying")
+			return nil, status.Error(codes.FailedPrecondition, "Docker login may have partially completed; run qsbx logout before retrying")
 		default:
 			return nil, status.Error(codes.Unavailable, "Docker Hub login could not be completed")
 		}
