@@ -3,7 +3,7 @@ module github.com/quoiner/sandboxes-daemon
 go 1.27
 
 require (
-	github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29
+	github.com/Microsoft/go-winio v0.6.4
 	github.com/quoiner/sandboxes-api v0.0.11
 	github.com/quoiner/sandboxes-core v0.0.8
 	github.com/quoiner/sandboxes-gateway v0.0.10
