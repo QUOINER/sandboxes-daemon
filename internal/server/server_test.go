@@ -2,11 +2,17 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +24,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
+	"github.com/KLORQ/sandboxes-daemon/internal/oauthsession"
 	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
 	"github.com/KLORQ/sandboxes-daemon/internal/service"
 	"github.com/KLORQ/sandboxes-daemon/internal/store"
@@ -198,9 +205,158 @@ func TestAccountRPCFailsClosedWithoutTrustedProvider(t *testing.T) {
 	if _, err := client.Login(ctx, &localv1.AccountServiceLoginRequest{Provider: "docker"}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("login should fail closed without configured provider, got %v", err)
 	}
+	device, err := client.LoginDevice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := device.Send(&localv1.AccountServiceLoginDeviceRequest{Provider: "docker"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := device.Recv(); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("device login should fail closed without configured provider, got %v", err)
+	}
 	if response, err := client.Logout(ctx, &localv1.AccountServiceLogoutRequest{Provider: "docker"}); err != nil || response.GetRemoved() {
 		t.Fatalf("logout without any local account state should be idempotent, response=%#v err=%v", response, err)
 	}
+}
+
+func TestDeviceLoginStreamWaitsForHandoffAndKeepsDeviceCodeHostSide(t *testing.T) {
+	var handoff atomic.Bool
+	var tokenRequests atomic.Int32
+	var patRequests atomic.Int32
+	accessPayload := base64.RawURLEncoding.EncodeToString([]byte(`{"https://hub.docker.com":{"username":"fixture-user"}}`))
+	accessToken := "header." + accessPayload + ".signature"
+	var providerServer *httptest.Server
+	providerServer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/device":
+			_, _ = fmt.Fprintf(w, `{"device_code":"synthetic-device-secret","user_code":"ABCD-1234","verification_uri_complete":%q,"expires_in":60,"interval":1}`, providerServer.URL+"/activate?user_code=ABCD-1234")
+		case "/token":
+			tokenRequests.Add(1)
+			if !handoff.Load() {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(`{"error":"authorization_pending"}`))
+				return
+			}
+			_, _ = fmt.Fprintf(w, `{"access_token":%q,"refresh_token":"synthetic-refresh","token_type":"Bearer","expires_in":60}`, accessToken)
+		case "/pat":
+			patRequests.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"data":{"token":"synthetic-hub-pat"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer providerServer.Close()
+	transport := providerServer.Client().Transport.(*http.Transport).Clone()
+	defer transport.CloseIdleConnections()
+	vault := &serverTestVault{values: make(map[string]string)}
+	registryStore, err := registrycredentials.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "account-device-stream.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := service.New(st, nil)
+	svc.SetOAuthVault(vault)
+	svc.SetRegistryCredentialStore(registryStore)
+	svc.SetOAuthProviders(map[string]service.OAuthProvider{"docker": {
+		Device: oauthsession.DeviceProvider{
+			DeviceEndpoint: providerServer.URL + "/device", TokenEndpoint: providerServer.URL + "/token",
+			PATEndpoint: providerServer.URL + "/pat", ClientID: "synthetic-client",
+			Audience: providerServer.URL, Transport: transport,
+		},
+		DeviceHandoff: func(_ context.Context, code, uri string) error {
+			if code != "ABCD-1234" || uri != providerServer.URL+"/activate?user_code=ABCD-1234" {
+				t.Errorf("unexpected browser handoff code=%q uri=%q", code, uri)
+			}
+			handoff.Store(true)
+			return nil
+		},
+	}})
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	localv1.RegisterAccountServiceServer(grpcServer, NewAccount(svc))
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	stream, err := localv1.NewAccountServiceClient(conn).LoginDevice(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Send(&localv1.AccountServiceLoginDeviceRequest{Provider: "docker"}); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.GetUserCode() != "ABCD-1234" || initial.GetVerificationUri() != providerServer.URL+"/activate?user_code=ABCD-1234" || initial.GetAuthenticated() {
+		t.Fatalf("unexpected initial device login event: %+v", initial)
+	}
+	if strings.Contains(initial.String(), "synthetic-device-secret") || handoff.Load() || tokenRequests.Load() != 0 {
+		t.Fatal("device code escaped or browser/polling started before handoff confirmation")
+	}
+	if err := stream.Send(&localv1.AccountServiceLoginDeviceRequest{ContinueAfterHandoff: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatal(err)
+	}
+	complete, err := stream.Recv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !complete.GetAuthenticated() || complete.GetUserCode() != "" || complete.GetVerificationUri() != "" {
+		t.Fatalf("unexpected completion event: %+v", complete)
+	}
+	if !handoff.Load() || tokenRequests.Load() == 0 || patRequests.Load() != 1 {
+		t.Fatalf("device flow incomplete: handoff=%t token requests=%d PAT requests=%d", handoff.Load(), tokenRequests.Load(), patRequests.Load())
+	}
+}
+
+type serverTestVault struct {
+	mu     sync.Mutex
+	values map[string]string
+}
+
+func (v *serverTestVault) Set(_ context.Context, serviceName, account, value string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.values[serviceName+"/"+account] = value
+	return nil
+}
+
+func (v *serverTestVault) Get(_ context.Context, serviceName, account string) (string, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	value, ok := v.values[serviceName+"/"+account]
+	if !ok {
+		return "", registrycredentials.ErrNotFound
+	}
+	return value, nil
+}
+
+func (v *serverTestVault) Delete(_ context.Context, serviceName, account string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if _, ok := v.values[serviceName+"/"+account]; !ok {
+		return registrycredentials.ErrNotFound
+	}
+	delete(v.values, serviceName+"/"+account)
+	return nil
 }
 
 func TestGRPCWatch(t *testing.T) {

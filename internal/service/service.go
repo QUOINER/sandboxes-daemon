@@ -133,6 +133,69 @@ func (s *Service) LoginAccount(ctx context.Context, name string) error {
 	return oauthsession.Authorize(ctx, provider.Config, provider.OpenBrowser, sink)
 }
 
+// BeginDeviceAccountLogin validates account availability and obtains a
+// short-lived device authorization without opening the browser or polling.
+// The caller receives only user-facing verification data; deviceCode remains
+// private inside the returned host-memory value.
+func (s *Service) BeginDeviceAccountLogin(ctx context.Context, name string) (oauthsession.DeviceAuthorization, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		return oauthsession.DeviceAuthorization{}, errors.New("OAuth login requires a bounded context")
+	}
+	release, err := s.acquireCredentialGate(ctx, accountGateKey(name))
+	if err != nil {
+		return oauthsession.DeviceAuthorization{}, err
+	}
+	defer release()
+	provider, ok := s.oauthProviders[name]
+	if !ok || provider.Device.ClientID == "" || !deviceProviderReady(provider) || s.registryCredentials == nil {
+		return oauthsession.DeviceAuthorization{}, ErrOAuthProviderUnavailable
+	}
+	sink, err := oauthsession.NewVaultSink(s.oauthVault(), name)
+	if err != nil {
+		return oauthsession.DeviceAuthorization{}, errors.New("OAuth host keychain is unavailable")
+	}
+	if err := s.checkAccountLoginAvailable(ctx, name, sink); err != nil {
+		return oauthsession.DeviceAuthorization{}, err
+	}
+	return oauthsession.BeginDeviceAuthorization(ctx, provider.Device)
+}
+
+// CompleteDeviceAccountLogin repeats conflict checks under the credential
+// gate because local credentials could change while the user authorizes the
+// displayed device code.
+func (s *Service) CompleteDeviceAccountLogin(ctx context.Context, name string, authorization oauthsession.DeviceAuthorization) error {
+	if _, ok := ctx.Deadline(); !ok {
+		return errors.New("OAuth login requires a bounded context")
+	}
+	release, err := s.acquireCredentialGate(ctx, accountGateKey(name))
+	if err != nil {
+		return err
+	}
+	defer release()
+	provider, ok := s.oauthProviders[name]
+	if !ok || provider.Device.ClientID == "" || !deviceProviderReady(provider) {
+		return ErrOAuthProviderUnavailable
+	}
+	sink, err := oauthsession.NewVaultSink(s.oauthVault(), name)
+	if err != nil {
+		return errors.New("OAuth host keychain is unavailable")
+	}
+	if err := s.checkAccountLoginAvailable(ctx, name, sink); err != nil {
+		return err
+	}
+	return s.completeDeviceAccount(ctx, provider, sink, authorization)
+}
+
+func deviceProviderReady(provider OAuthProvider) bool {
+	return provider.DeviceHandoff != nil && provider.Device.PATEndpoint != "" &&
+		provider.Device.Transport != nil && sameIssuerDeviceProvider(provider.Device) &&
+		oauthsession.SameHTTPSOrigin(provider.Device.Audience, provider.Device.PATEndpoint)
+}
+
+func sameIssuerDeviceProvider(provider oauthsession.DeviceProvider) bool {
+	return oauthsession.SameHTTPSOrigin(provider.DeviceEndpoint, provider.TokenEndpoint)
+}
+
 func (s *Service) checkAccountLoginAvailable(ctx context.Context, name string, sink *oauthsession.VaultSink) error {
 	if name == "docker" {
 		return s.checkDockerHubLoginAvailable(ctx, sink)
@@ -146,11 +209,19 @@ func (s *Service) checkAccountLoginAvailable(ctx context.Context, name string, s
 }
 
 func (s *Service) authorizeDeviceAccount(ctx context.Context, provider OAuthProvider, sink *oauthsession.VaultSink) error {
-	if provider.DeviceHandoff == nil || provider.Device.PATEndpoint == "" || s.registryCredentials == nil || !oauthsession.SameHTTPSOrigin(provider.Device.Audience, provider.Device.PATEndpoint) {
+	if !deviceProviderReady(provider) || s.registryCredentials == nil {
 		return ErrOAuthProviderUnavailable
 	}
 	combined := dockerAccountSink{oauth: sink, registry: s.registryCredentials, provider: provider.Device}
 	return oauthsession.AuthorizeDevice(ctx, provider.Device, provider.DeviceHandoff, combined)
+}
+
+func (s *Service) completeDeviceAccount(ctx context.Context, provider OAuthProvider, sink *oauthsession.VaultSink, authorization oauthsession.DeviceAuthorization) error {
+	if !deviceProviderReady(provider) || s.registryCredentials == nil {
+		return ErrOAuthProviderUnavailable
+	}
+	combined := dockerAccountSink{oauth: sink, registry: s.registryCredentials, provider: provider.Device}
+	return oauthsession.CompleteDeviceAuthorization(ctx, provider.Device, authorization, provider.DeviceHandoff, combined)
 }
 
 // LogoutAccount deletes the local host token record and revokes the upstream

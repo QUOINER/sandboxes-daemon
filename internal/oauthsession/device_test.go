@@ -94,6 +94,15 @@ func TestDeviceAuthorizationCompletesURLWhenProviderOmitsCompleteURI(t *testing.
 	}
 }
 
+func TestDeviceAuthorizationRejectsTerminalControlInUserCode(t *testing.T) {
+	for _, code := range []string{"ABCD\x1b[31m", "ABCD\nEFGH", strings.Repeat("A", 65)} {
+		body := []byte(`{"device_code":"synthetic-device","user_code":"` + code + `","verification_uri":"https://login.example/device","expires_in":60}`)
+		if _, err := parseDeviceAuthorization(body, "https://login.example/oauth/device"); err == nil {
+			t.Fatalf("unsafe user code accepted: %q", code)
+		}
+	}
+}
+
 func TestDeviceAuthorizationRejectsRedirectAndLeaksNoDeviceCode(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "https://other.invalid/device", http.StatusFound)
