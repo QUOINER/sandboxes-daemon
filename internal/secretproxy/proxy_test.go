@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestUnixProxyChannelInjectsSecretAndRequiresToken(t *testing.T) {
@@ -221,6 +223,106 @@ func TestUnixProxySecretRefreshRotatesTokenAndRevokesChannel(t *testing.T) {
 	request, _ = http.NewRequest(http.MethodGet, "http://upstream.test/__klorq/proxy/token", nil)
 	if _, err := client.Do(request); err == nil {
 		t.Fatal("revoked broker still accepts requests")
+	}
+}
+
+func TestUnixProxyRevokeCancelsInflightRequestAndClosesChannel(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce, canceledOnce sync.Once
+	var callsMu sync.Mutex
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callsMu.Lock()
+		calls++
+		callsMu.Unlock()
+		startedOnce.Do(func() { close(started) })
+		select {
+		case <-r.Context().Done():
+			canceledOnce.Do(func() { close(canceled) })
+		case <-release:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer upstream.Close()
+	defer close(release)
+
+	dir, err := os.MkdirTemp("/tmp", "kqproxy-revoke-inflight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "proxy.sock")
+	token := strings.Repeat("c", 64)
+	manager := New()
+	if _, err := manager.StartUnix(context.Background(), "revoke-inflight", "openai", Service{
+		Upstream: upstream.URL, Header: "Authorization", Prefix: "Bearer ", CredentialScope: "sandbox",
+	}, []byte("synthetic-secret"), socket, token); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = manager.Close() }()
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", socket)
+	}}}
+
+	requestCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, "http://broker/v1/controlled", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(TokenHeader, token)
+	type requestResult struct {
+		status int
+		err    error
+	}
+	requestDone := make(chan requestResult, 1)
+	go func() {
+		response, err := client.Do(request)
+		result := requestResult{err: err}
+		if response != nil {
+			result.status = response.StatusCode
+			_ = response.Body.Close()
+		}
+		requestDone <- result
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("positive control did not reach controlled upstream")
+	}
+	if err := manager.RevokeSecret("openai", "revoke-inflight", "sandbox"); err != nil {
+		t.Fatalf("revoke scoped secret: %v", err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("secret revoke did not cancel the in-flight upstream request")
+	}
+	select {
+	case result := <-requestDone:
+		if result.err == nil && result.status == http.StatusOK {
+			t.Fatal("in-flight request unexpectedly succeeded after secret revoke")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guest-facing request did not finish after secret revoke")
+	}
+
+	request, err = http.NewRequest(http.MethodGet, "http://broker/v1/controlled", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(TokenHeader, token)
+	if response, err := client.Do(request); err == nil {
+		_ = response.Body.Close()
+		t.Fatal("request connected through the revoked broker")
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("revoked channel sent additional upstream requests (calls=%d)", calls)
 	}
 }
 
