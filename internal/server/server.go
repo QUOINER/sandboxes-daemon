@@ -141,7 +141,7 @@ func accountLoginError(err error) error {
 		return status.Error(codes.FailedPrecondition, "OAuth provider is not configured on this daemon")
 	}
 	if errors.Is(err, service.ErrOAuthPartialLogin) {
-		return status.Error(codes.FailedPrecondition, "OAuth login may have partially completed; run ksbx logout before retrying")
+		return status.Error(codes.FailedPrecondition, "OAuth login may have partially completed; run qsbx logout before retrying")
 	}
 	return status.Error(codes.FailedPrecondition, "OAuth login failed; no credentials were returned")
 }
