@@ -150,6 +150,16 @@ func (s *Service) startForExec(ctx context.Context, sb sandbox.Sandbox) error {
 }
 
 func (s *Service) runExec(ctx context.Context, fallback runtime.Executor, handle runtime.Handle, req runtime.ExecRequest) (int, error) {
+	// ctr exec cannot carry environment or user overrides. Use the runtime's
+	// explicit native capability for those requests; never retry through the
+	// fallback after a native execution error because the command may have run.
+	if len(req.Env) > 0 || req.User != "" {
+		native, ok := s.backend.(runtime.NativeExecutor)
+		if !ok {
+			return 0, fmt.Errorf("%w: runtime does not support exec environment or user overrides", core.ErrConflict)
+		}
+		return native.ExecNative(ctx, handle, req)
+	}
 	if native, ok := s.backend.(runtime.CancelableExecutor); ok && cancelableOutputs(req) {
 		return native.ExecCancelable(ctx, handle, req)
 	}
