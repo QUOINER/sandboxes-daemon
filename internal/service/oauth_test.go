@@ -157,6 +157,38 @@ func TestDeviceAccountLoginStoresAndLogoutRevokesHostTokens(t *testing.T) {
 	}
 }
 
+func TestAccountCredentialStatusReportsOAuthRecordPresence(t *testing.T) {
+	ctx := context.Background()
+	vault := &memoryOAuthVault{values: make(map[string]string)}
+	st, err := store.Open(ctx, t.TempDir()+"/oauth-status.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	svc.SetOAuthVault(vault)
+	svc.SetOAuthProviders(map[string]OAuthProvider{"fixture": {}})
+	sink, err := oauthsession.NewVaultSink(vault, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present, err := svc.AccountCredentialsPresent(ctx, "fixture"); err != nil || present {
+		t.Fatalf("empty OAuth status present=%t err=%v", present, err)
+	}
+	if err := sink.Save(ctx, oauthsession.Tokens{AccessToken: "synthetic-access", TokenType: "Bearer", RefreshToken: "synthetic-refresh"}); err != nil {
+		t.Fatal(err)
+	}
+	if present, err := svc.AccountCredentialsPresent(ctx, "fixture"); err != nil || !present {
+		t.Fatalf("stored OAuth status present=%t err=%v", present, err)
+	}
+	if err := sink.Delete(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if present, err := svc.AccountCredentialsPresent(ctx, "fixture"); err != nil || present {
+		t.Fatalf("deleted OAuth status present=%t err=%v", present, err)
+	}
+}
+
 type dockerPATRoundTripper func(*http.Request) (*http.Response, error)
 
 func (f dockerPATRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
