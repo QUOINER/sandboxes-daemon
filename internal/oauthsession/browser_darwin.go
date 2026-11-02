@@ -24,7 +24,7 @@ func OpenBrowser(ctx context.Context, raw string) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return errors.New("open OAuth browser failed")
+		return ErrBrowserUnavailable
 	}
 	return nil
 }
