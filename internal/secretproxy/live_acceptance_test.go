@@ -155,16 +155,38 @@ func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 
 	var mu sync.Mutex
 	fixtureCalls := 0
+	fixtureSlowCalls := 0
 	fixtureAuth := ""
+	slowStarted := make(chan struct{})
+	slowCanceled := make(chan struct{})
+	slowRelease := make(chan struct{})
+	var slowStartedOnce, slowCanceledOnce, slowReleaseOnce sync.Once
+	defer slowReleaseOnce.Do(func() { close(slowRelease) })
 	fixture := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "fixture route mismatch", http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == "/v1/slow" {
+			mu.Lock()
+			fixtureSlowCalls++
+			mu.Unlock()
+			slowStartedOnce.Do(func() { close(slowStarted) })
+			select {
+			case <-r.Context().Done():
+				slowCanceledOnce.Do(func() { close(slowCanceled) })
+			case <-slowRelease:
+			}
+			return
+		}
+		if r.URL.Path != "/v1/controlled" {
+			http.Error(w, "fixture route mismatch", http.StatusNotFound)
+			return
+		}
 		mu.Lock()
 		fixtureCalls++
 		fixtureAuth = r.Header.Get("Authorization")
 		mu.Unlock()
-		if r.URL.Path != "/v1/controlled" || r.Method != http.MethodGet {
-			http.Error(w, "fixture route mismatch", http.StatusNotFound)
-			return
-		}
 		_, _ = io.WriteString(w, "controlled-upstream-ok")
 	}))
 	defer fixture.Close()
@@ -316,16 +338,60 @@ func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 	if callsAfterRestart != 2 {
 		t.Fatalf("broker restart caused a missing or duplicate request (fixture calls=%d, want=2)", callsAfterRestart)
 	}
+	slowRequest := `/bin/sh -c 'wget -T 20 -q -O - --header="Authorization: Bearer $OPENAI_API_KEY" "$OPENAI_BASE_URL/slow"'`
+	type execResult struct {
+		output string
+		err    error
+	}
+	slowResult := make(chan execResult, 1)
+	go func() {
+		result, err := execInVM(ctx, backend, handleA, slowRequest)
+		slowResult <- execResult{output: result, err: err}
+	}()
+	select {
+	case <-slowStarted:
+	case <-time.After(8 * time.Second):
+		t.Fatal("controlled upstream did not receive the in-flight request")
+	}
+	mu.Lock()
+	slowCallsAtStart := fixtureSlowCalls
+	mu.Unlock()
+	if slowCallsAtStart != 1 {
+		t.Fatalf("in-flight request was duplicated before broker stop (calls=%d)", slowCallsAtStart)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatalf("stop broker during in-flight request: %v", err)
+	}
+	select {
+	case <-slowCanceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("broker shutdown did not cancel the in-flight upstream request")
+	}
+	select {
+	case result := <-slowResult:
+		if result.err == nil {
+			t.Fatalf("in-flight request unexpectedly succeeded after broker stop (output=%q)", result.output)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("guest request did not finish after broker stopped")
+	}
+	if _, err := manager.StartUnix(ctx, nameA, "openai", Service{Upstream: serviceURL, Header: "Authorization", Prefix: "Bearer "}, []byte(liveSecret), socketA, strings.Repeat("c", 64)); err != nil {
+		t.Fatalf("restart broker after in-flight cancellation: %v", err)
+	}
+	output, err = execInVM(ctx, backend, handleA, request)
+	if err != nil || output != "controlled-upstream-ok" {
+		t.Fatalf("VM A did not recover after in-flight broker loss (output=%q): %v", output, err)
+	}
+	mu.Lock()
+	callsAfterBrokerStop := fixtureCalls
+	mu.Unlock()
+	if callsAfterBrokerStop != 3 {
+		t.Fatalf("broker recovery caused a missing or duplicate request (fixture calls=%d, want=3)", callsAfterBrokerStop)
+	}
 	if err := manager.Close(); err != nil {
 		t.Fatal(err)
 	}
 	expectPromptProxyFailure(t, ctx, backend, handleA, request, "VM A after final broker shutdown")
-	mu.Lock()
-	callsAfterBrokerStop := fixtureCalls
-	mu.Unlock()
-	if callsAfterBrokerStop != 2 {
-		t.Fatalf("request escaped after final broker shutdown; fixture calls=%d", callsAfterBrokerStop)
-	}
 
 	if err := scanForBytes(root, []byte(liveSecret)); err != nil {
 		t.Fatalf("synthetic credential persisted in owned host state: %v", err)
