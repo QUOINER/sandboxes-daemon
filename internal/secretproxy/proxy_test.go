@@ -2,6 +2,8 @@ package secretproxy
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -565,6 +567,99 @@ func TestPublicUnicastAddressFilter(t *testing.T) {
 		if got := isPublicUnicast(ip); got != tc.allowed {
 			t.Errorf("isPublicUnicast(%s)=%t, want %t", tc.address, got, tc.allowed)
 		}
+	}
+}
+
+func TestDialPublicUnicastPinsCheckedDNSAnswers(t *testing.T) {
+	ctx := context.Background()
+	var dialCalls int
+	var dialAddress string
+	lookup := func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host != "api.example.test" {
+			t.Fatalf("lookup host = %q", host)
+		}
+		return []net.IPAddr{{IP: net.ParseIP("8.8.8.8")}}, nil
+	}
+	dial := func(_ context.Context, network, address string) (net.Conn, error) {
+		dialCalls++
+		if network != "tcp" {
+			t.Fatalf("network = %q", network)
+		}
+		dialAddress = address
+		conn, peer := net.Pipe()
+		_ = peer.Close()
+		return conn, nil
+	}
+	conn, err := dialPublicUnicast(ctx, "tcp", "api.example.test:443", lookup, dial)
+	if err != nil {
+		t.Fatalf("public DNS positive control failed: %v", err)
+	}
+	_ = conn.Close()
+	if dialCalls != 1 || dialAddress != "8.8.8.8:443" {
+		t.Fatalf("public answer was not pinned for dialing: calls=%d address=%q", dialCalls, dialAddress)
+	}
+
+	for _, tc := range []struct {
+		name string
+		ips  []net.IPAddr
+	}{
+		{name: "private answer", ips: []net.IPAddr{{IP: net.ParseIP("10.0.0.1")}}},
+		{name: "mixed public and private answers", ips: []net.IPAddr{{IP: net.ParseIP("8.8.8.8")}, {IP: net.ParseIP("10.0.0.1")}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := dialCalls
+			resolve := func(context.Context, string) ([]net.IPAddr, error) { return tc.ips, nil }
+			if _, err := dialPublicUnicast(ctx, "tcp", "api.example.test:443", resolve, dial); err == nil {
+				t.Fatal("non-public DNS answer was accepted")
+			}
+			if dialCalls != before {
+				t.Fatal("dial ran after a non-public DNS answer")
+			}
+		})
+	}
+	if _, err := dialPublicUnicast(ctx, "tcp", "api.example.test:443", func(context.Context, string) ([]net.IPAddr, error) {
+		return nil, errors.New("synthetic resolver failure")
+	}, dial); err == nil || dialCalls != 1 {
+		t.Fatalf("resolver failure was not denied before dial: calls=%d err=%v", dialCalls, err)
+	}
+}
+
+func TestOutboundTransportVerifiesTLSHostname(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	certificate := upstream.Certificate()
+	roots := x509.NewCertPool()
+	roots.AddCert(certificate)
+	transport := outboundTransport(true, func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", upstream.Listener.Addr().String())
+	})
+	defer transport.CloseIdleConnections()
+	transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+	client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
+
+	if len(certificate.DNSNames) == 0 {
+		t.Fatal("TLS fixture certificate has no DNS SAN for positive control")
+	}
+	_, port, err := net.SplitHostPort(upstream.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("parse TLS fixture listener address: %v", err)
+	}
+	positiveURL := "https://" + net.JoinHostPort(certificate.DNSNames[0], port)
+	response, err := client.Get(positiveURL)
+	if err != nil {
+		t.Fatalf("trusted matching-host positive control failed: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("positive control status = %d", response.StatusCode)
+	}
+
+	negativeURL := "https://wrong-host.example:" + port
+	if response, err := client.Get(negativeURL); err == nil {
+		_ = response.Body.Close()
+		t.Fatal("TLS certificate for a different host was accepted")
 	}
 }
 
