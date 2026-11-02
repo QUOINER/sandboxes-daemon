@@ -309,7 +309,15 @@ func CompleteDeviceAuthorization(ctx context.Context, provider DeviceProvider, a
 		return errors.New("invalid OAuth device flow configuration")
 	}
 	if err := handoff(ctx, authorization.UserCode, authorization.VerificationURI); err != nil {
-		return errors.New("open OAuth verification page failed")
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		if !errors.Is(err, ErrBrowserUnavailable) {
+			return errors.New("open OAuth verification page failed")
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	tokens, err := WaitForDeviceToken(ctx, provider, authorization)
 	if err != nil {
