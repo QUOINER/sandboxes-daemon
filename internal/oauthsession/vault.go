@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/QUOINER/sandboxes-daemon/internal/registrycredentials"
+	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
 )
 
 const oauthVaultService = "com.klorq.oauth.v1"

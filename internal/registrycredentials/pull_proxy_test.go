@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/QUOINER/sandboxes-gateway/registryauth"
+	"github.com/KLORQ/sandboxes-gateway/registryauth"
 )
 
 func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {

@@ -8,14 +8,14 @@ import (
 	"testing"
 	"time"
 
-	localv1 "github.com/QUOINER/sandboxes-api/gen/go/sandboxes/local/v1"
-	runtime "github.com/QUOINER/sandboxes-runtime"
+	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
+	runtime "github.com/KLORQ/sandboxes-runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/QUOINER/sandboxes-daemon/internal/service"
-	"github.com/QUOINER/sandboxes-daemon/internal/store"
+	"github.com/KLORQ/sandboxes-daemon/internal/service"
+	"github.com/KLORQ/sandboxes-daemon/internal/store"
 )
 
 type interactiveBackend struct{ outputBackend }
