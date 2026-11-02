@@ -3,11 +3,13 @@ package secretproxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -326,6 +328,163 @@ func TestUnixProxyRevokeCancelsInflightRequestAndClosesChannel(t *testing.T) {
 	defer callsMu.Unlock()
 	if calls != 1 {
 		t.Fatalf("revoked channel sent additional upstream requests (calls=%d)", calls)
+	}
+}
+
+func TestUnixProxyBrokerProcessDeathCancelsAndRecovers(t *testing.T) {
+	const (
+		childFlag = "KLORQ_P04_BROKER_CHILD"
+		childURL  = "KLORQ_P04_BROKER_UPSTREAM"
+	)
+	if os.Getenv(childFlag) == "1" {
+		dir := filepath.Join(os.TempDir(), fmt.Sprintf("kqproxy-process-death-%d", os.Getppid()))
+		manager := New()
+		if _, err := manager.StartUnix(context.Background(), "process-death", "openai", Service{
+			Upstream: os.Getenv(childURL), Header: "Authorization", Prefix: "Bearer ",
+		}, []byte("synthetic-process-death-secret"), filepath.Join(dir, "proxy.sock"), strings.Repeat("d", 64)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "ready"), []byte("ready"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		select {}
+	}
+
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce, canceledOnce sync.Once
+	var callsMu sync.Mutex
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callsMu.Lock()
+		calls++
+		callsMu.Unlock()
+		if r.URL.Path == "/slow" {
+			startedOnce.Do(func() { close(started) })
+			select {
+			case <-r.Context().Done():
+				canceledOnce.Do(func() { close(canceled) })
+			case <-release:
+			}
+			return
+		}
+		_, _ = io.WriteString(w, "recovered")
+	}))
+	defer upstream.Close()
+	defer close(release)
+
+	dir := filepath.Join(os.TempDir(), fmt.Sprintf("kqproxy-process-death-%d", os.Getpid()))
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("create uniquely owned broker directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove owned broker directory: %v", err)
+		}
+	})
+	socket := filepath.Join(dir, "proxy.sock")
+	ready := filepath.Join(dir, "ready")
+	command := exec.Command(os.Args[0], "-test.run=^TestUnixProxyBrokerProcessDeathCancelsAndRecovers$", "-test.count=1")
+	command.Env = append(os.Environ(), childFlag+"=1", childURL+"="+upstream.URL)
+	output := new(strings.Builder)
+	command.Stdout, command.Stderr = output, output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if command.ProcessState == nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("broker subprocess did not become ready: %s", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	clientFor := func(token string) *http.Client {
+		return &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", socket)
+		}}}
+	}
+	client := clientFor(strings.Repeat("d", 64))
+	requestCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, "http://broker/slow", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(TokenHeader, strings.Repeat("d", 64))
+	requestDone := make(chan error, 1)
+	go func() {
+		response, err := client.Do(request)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		requestDone <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("positive control did not reach the controlled upstream: %s", output.String())
+	}
+	if err := command.Process.Kill(); err != nil {
+		t.Fatalf("kill owned broker subprocess: %v", err)
+	}
+	if err := command.Wait(); err == nil {
+		t.Fatal("broker subprocess exited successfully despite an explicit kill")
+	}
+	if _, err := os.Lstat(socket); err != nil {
+		t.Fatalf("expected stale owned socket after process death: %v", err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("broker process death did not cancel the in-flight upstream request")
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("guest-facing request did not finish after broker process death")
+	}
+	if err := RemoveStaleSocket(socket); err != nil {
+		t.Fatalf("remove owned stale socket after broker death: %v", err)
+	}
+
+	manager := New()
+	if _, err := manager.StartUnix(context.Background(), "process-death", "openai", Service{
+		Upstream: upstream.URL, Header: "Authorization", Prefix: "Bearer ",
+	}, []byte("synthetic-process-death-secret"), socket, strings.Repeat("e", 64)); err != nil {
+		t.Fatalf("restart broker on recovered socket: %v", err)
+	}
+	defer func() { _ = manager.Close() }()
+	client = clientFor(strings.Repeat("e", 64))
+	request, err = http.NewRequest(http.MethodGet, "http://broker/recovered", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(TokenHeader, strings.Repeat("e", 64))
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("request after broker recovery: %v", err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if readErr != nil || response.StatusCode != http.StatusOK || string(body) != "recovered" {
+		t.Fatalf("recovered response status=%d body=%q read error=%v", response.StatusCode, body, readErr)
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls != 2 {
+		t.Fatalf("unexpected controlled upstream call count after process death/recovery: %d", calls)
 	}
 }
 
