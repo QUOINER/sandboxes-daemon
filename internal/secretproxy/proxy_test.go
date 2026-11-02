@@ -16,10 +16,10 @@ import (
 )
 
 func TestUnixProxyChannelInjectsSecretAndRequiresToken(t *testing.T) {
-	var gotAuth, gotGuestAuth, gotMethod, gotPath string
+	var gotAuth, gotGuestAPIKey, gotMethod, gotPath string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
-		gotGuestAuth = r.Header.Get("X-Guest-Auth")
+		gotGuestAPIKey = r.Header.Get("X-Api-Key")
 		gotMethod = r.Method
 		gotPath = r.URL.Path
 		_, _ = w.Write([]byte("streamed-body"))
@@ -54,7 +54,8 @@ func TestUnixProxyChannelInjectsSecretAndRequiresToken(t *testing.T) {
 	}
 	req, _ := http.NewRequest(http.MethodPost, "http://upstream.test/v1/chat?q=1", strings.NewReader("payload"))
 	req.Header.Set(TokenHeader, token)
-	req.Header.Set("X-Guest-Auth", "guest-value")
+	req.Header.Set("Authorization", "Bearer guest-controlled")
+	req.Header.Set("X-Api-Key", "guest-controlled-api-key")
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -66,6 +67,9 @@ func TestUnixProxyChannelInjectsSecretAndRequiresToken(t *testing.T) {
 	}
 	if gotAuth != "Bearer s3cret" {
 		t.Fatalf("upstream authorization = %q", gotAuth)
+	}
+	if gotGuestAPIKey != "" {
+		t.Fatal("guest-controlled API key header reached upstream")
 	}
 	if gotMethod != http.MethodPost || gotPath != "/v1/chat" {
 		t.Fatalf("upstream request = %s %s", gotMethod, gotPath)
@@ -84,7 +88,6 @@ func TestUnixProxyChannelInjectsSecretAndRequiresToken(t *testing.T) {
 	if gotAuth != "Bearer s3cret" {
 		t.Fatal("unauthorized request reached upstream")
 	}
-	_ = gotGuestAuth
 }
 
 func TestUnixProxyRefusesToReplaceExistingSocketPath(t *testing.T) {
