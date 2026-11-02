@@ -388,10 +388,19 @@ func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 	if callsAfterBrokerStop != 3 {
 		t.Fatalf("broker recovery caused a missing or duplicate request (fixture calls=%d, want=3)", callsAfterBrokerStop)
 	}
+	if _, err := execInVM(ctx, backend, handleA, "kill 2"); err != nil {
+		t.Fatalf("stop owned guest proxy helper: %v", err)
+	}
+	expectPromptProxyFailure(t, ctx, backend, handleA, request, "VM A after guest helper termination")
+	mu.Lock()
+	callsAfterHelperStop := fixtureCalls
+	mu.Unlock()
+	if callsAfterHelperStop != 3 {
+		t.Fatalf("request escaped after guest helper termination; fixture calls=%d", callsAfterHelperStop)
+	}
 	if err := manager.Close(); err != nil {
 		t.Fatal(err)
 	}
-	expectPromptProxyFailure(t, ctx, backend, handleA, request, "VM A after final broker shutdown")
 
 	if err := scanForBytes(root, []byte(liveSecret)); err != nil {
 		t.Fatalf("synthetic credential persisted in owned host state: %v", err)
@@ -405,7 +414,7 @@ func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 	if elapsed := time.Since(testStarted); elapsed >= 90*time.Second {
 		t.Fatalf("live acceptance did not complete promptly (elapsed=%s)", elapsed)
 	}
-	t.Logf("PASS: VM A got controlled authenticated responses before/after broker restart; VM B denied; broker loss failed closed; token rotation worked; secret absent from guest env and owned host files; fixture calls=%d", callsAfterBrokerStop)
+	t.Logf("PASS: VM A got controlled authenticated responses before/after broker restart; VM B denied; broker loss and guest helper termination failed closed; token rotation worked; secret absent from guest env and owned host files; fixture calls=%d", callsAfterBrokerStop)
 }
 
 type liveTestInputs struct{ containerd, ctr, shim, kernel, rootfs, helper, libkrun, gvproxy, daemon, image string }
