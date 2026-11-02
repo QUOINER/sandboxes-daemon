@@ -57,3 +57,18 @@ jobs:
             ${{ runner.temp }}/klorq-proxy-helper-linux-arm64.sha256
           if-no-files-found: error
           retention-days: 90
+
+  windows:
+    runs-on: windows-2022
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Test Windows IPC and state security contracts
+        run: go test -count=1 ./...
