@@ -192,6 +192,9 @@ func TestDockerHubPATLoginValidatesAndStoresOnlyPAT(t *testing.T) {
 	if err := svc.LoginDockerHubPAT(context.Background(), "alice", []byte("synthetic-pat")); err != nil {
 		t.Fatal(err)
 	}
+	if present, err := svc.AccountCredentialsPresent(context.Background(), "docker"); err != nil || !present {
+		t.Fatalf("stored Docker PAT status present=%t err=%v", present, err)
+	}
 	for _, scope := range []registrycredentials.Scope{registrycredentials.ScopeHostOnly, registrycredentials.ScopeAllSandboxes} {
 		credential, err := registryStore.Load(context.Background(), "docker.io", scope, "")
 		if err != nil || credential.Username != "alice" || string(credential.Password) != "synthetic-pat" {
@@ -214,6 +217,9 @@ func TestDockerHubPATLoginValidatesAndStoresOnlyPAT(t *testing.T) {
 	svc.SetRegistryCredentialStore(registryStore)
 	if removed, err := svc.LogoutAccount(context.Background(), "docker"); !removed || err != nil {
 		t.Fatalf("logout retry failed: removed=%t err=%v", removed, err)
+	}
+	if present, err := svc.AccountCredentialsPresent(context.Background(), "docker"); err != nil || present {
+		t.Fatalf("Docker PAT status after logout present=%t err=%v", present, err)
 	}
 	for _, scope := range []registrycredentials.Scope{registrycredentials.ScopeHostOnly, registrycredentials.ScopeAllSandboxes} {
 		if _, err := registryStore.Load(context.Background(), "docker.io", scope, ""); !errors.Is(err, registrycredentials.ErrNotFound) {

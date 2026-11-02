@@ -205,6 +205,13 @@ func TestAccountRPCFailsClosedWithoutTrustedProvider(t *testing.T) {
 	if _, err := client.Login(ctx, &localv1.AccountServiceLoginRequest{Provider: "docker"}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("login should fail closed without configured provider, got %v", err)
 	}
+	accountStatus, err := client.Status(ctx, &localv1.AccountServiceStatusRequest{Provider: "docker"})
+	if err != nil || accountStatus.GetCredentialPresent() {
+		t.Fatalf("empty account status present=%t err=%v", accountStatus.GetCredentialPresent(), err)
+	}
+	if _, err := client.Status(ctx, &localv1.AccountServiceStatusRequest{Provider: "unregistered"}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("unregistered provider status should fail closed, got %v", err)
+	}
 	device, err := client.LoginDevice(ctx)
 	if err != nil {
 		t.Fatal(err)

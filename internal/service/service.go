@@ -38,12 +38,13 @@ import (
 )
 
 const (
-	tcpProtocol  = "tcp"
-	udpProtocol  = "udp"
-	tcp4Protocol = "tcp4"
-	udp4Protocol = "udp4"
-	tcp6Protocol = "tcp6"
-	udp6Protocol = "udp6"
+	tcpProtocol           = "tcp"
+	udpProtocol           = "udp"
+	tcp4Protocol          = "tcp4"
+	udp4Protocol          = "udp4"
+	tcp6Protocol          = "tcp6"
+	udp6Protocol          = "udp6"
+	dockerAccountProvider = "docker"
 )
 
 // Service coordinates durable sandbox state and operations.
@@ -133,6 +134,33 @@ func (s *Service) LoginAccount(ctx context.Context, name string) error {
 	return oauthsession.Authorize(ctx, provider.Config, provider.OpenBrowser, sink)
 }
 
+// AccountCredentialsPresent reports only whether host-side account credentials
+// or a Docker PAT ownership marker are stored. It never returns their values.
+func (s *Service) AccountCredentialsPresent(ctx context.Context, name string) (bool, error) {
+	if name != dockerAccountProvider {
+		if _, ok := s.oauthProviders[name]; !ok {
+			return false, ErrOAuthProviderUnavailable
+		}
+	}
+	release, err := s.acquireCredentialGate(ctx, accountGateKey(name))
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	sink, err := oauthsession.NewVaultSink(s.oauthVault(), name)
+	if err != nil {
+		return false, errors.New("OAuth host keychain is unavailable")
+	}
+	present, err := sink.HasTokens(ctx)
+	if err != nil || present {
+		return present, err
+	}
+	if name == dockerAccountProvider {
+		return sink.HasDockerHubPATFingerprint(ctx)
+	}
+	return false, nil
+}
+
 // BeginDeviceAccountLogin validates account availability and obtains a
 // short-lived device authorization without opening the browser or polling.
 // The caller receives only user-facing verification data; deviceCode remains
@@ -197,7 +225,7 @@ func sameIssuerDeviceProvider(provider oauthsession.DeviceProvider) bool {
 }
 
 func (s *Service) checkAccountLoginAvailable(ctx context.Context, name string, sink *oauthsession.VaultSink) error {
-	if name == "docker" {
+	if name == dockerAccountProvider {
 		return s.checkDockerHubLoginAvailable(ctx, sink)
 	}
 	if _, _, err := sink.Load(ctx); err == nil {
@@ -563,12 +591,12 @@ func (s *Service) LoginDockerHubPAT(ctx context.Context, username string, passwo
 	if !validDockerHubPATInput(username, password) {
 		return registrycredentials.ErrInvalidCredential
 	}
-	release, err := s.acquireCredentialGate(ctx, accountGateKey("docker"))
+	release, err := s.acquireCredentialGate(ctx, accountGateKey(dockerAccountProvider))
 	if err != nil {
 		return err
 	}
 	defer release()
-	sink, err := oauthsession.NewVaultSink(s.oauthVault(), "docker")
+	sink, err := oauthsession.NewVaultSink(s.oauthVault(), dockerAccountProvider)
 	if err != nil {
 		return errors.New("docker account host keychain is unavailable")
 	}
@@ -758,7 +786,7 @@ func (s *Service) acquireCredentialGate(ctx context.Context, key string) (func()
 }
 
 func accountGateKey(provider string) string {
-	if provider == "docker" {
+	if provider == dockerAccountProvider {
 		return "registry/docker.io"
 	}
 	return "oauth/" + provider

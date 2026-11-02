@@ -189,6 +189,24 @@ func (s *AccountServer) Logout(ctx context.Context, req *localv1.AccountServiceL
 	return &localv1.AccountServiceLogoutResponse{Removed: removed}, nil
 }
 
+func (s *AccountServer) Status(ctx context.Context, req *localv1.AccountServiceStatusRequest) (*localv1.AccountServiceStatusResponse, error) {
+	provider := req.GetProvider()
+	if provider == "" {
+		provider = defaultAccountProvider
+	}
+	present, err := s.svc.AccountCredentialsPresent(ctx, provider)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, mapError(err)
+		}
+		if errors.Is(err, service.ErrOAuthProviderUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, "OAuth provider is not configured on this daemon")
+		}
+		return nil, status.Error(codes.Unavailable, "OAuth host credential status is unavailable")
+	}
+	return &localv1.AccountServiceStatusResponse{Provider: provider, CredentialPresent: present}, nil
+}
+
 // Login stores registry credentials without returning or logging secret data.
 func (s *RegistryCredentialServer) Login(ctx context.Context, req *localv1.RegistryCredentialServiceLoginRequest) (*localv1.RegistryCredentialServiceLoginResponse, error) {
 	defer clear(req.Password)
