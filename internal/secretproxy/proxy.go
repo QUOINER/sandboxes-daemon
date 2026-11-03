@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -348,20 +349,47 @@ func dialPublicUnicast(
 	return dial(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
 }
 
+var (
+	publicIPv6Unicast = netip.MustParsePrefix("2000::/3")
+	nonPublicPrefixes = [...]netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/8"),
+		netip.MustParsePrefix("100.64.0.0/10"),
+		netip.MustParsePrefix("192.0.0.0/24"),
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("192.88.99.0/24"),
+		netip.MustParsePrefix("198.18.0.0/15"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+		netip.MustParsePrefix("224.0.0.0/4"),
+		netip.MustParsePrefix("240.0.0.0/4"),
+		netip.MustParsePrefix("64:ff9b::/96"),
+		netip.MustParsePrefix("64:ff9b:1::/48"),
+		netip.MustParsePrefix("100::/64"),
+		netip.MustParsePrefix("2001::/23"),
+		netip.MustParsePrefix("2001:db8::/32"),
+		netip.MustParsePrefix("2002::/16"),
+		netip.MustParsePrefix("3fff::/20"),
+	}
+)
+
 func isPublicUnicast(ip net.IP) bool {
-	if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+	if ip == nil {
 		return false
 	}
-	blocked := []string{
-		"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24",
-		"192.88.99.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
-		"224.0.0.0/4", "240.0.0.0/4", "64:ff9b::/96", "64:ff9b:1::/48",
-		"100::/64", "2001::/23", "2001:db8::/32", "2002::/16",
+	address, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
 	}
-	for _, cidr := range blocked {
-		_, network, _ := net.ParseCIDR(cidr)
-		if network.Contains(ip) {
+	address = address.Unmap()
+	if !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() ||
+		address.IsLinkLocalUnicast() || address.IsMulticast() || address.IsUnspecified() {
+		return false
+	}
+	if address.Is6() && !publicIPv6Unicast.Contains(address) {
+		return false
+	}
+	for _, prefix := range &nonPublicPrefixes {
+		if prefix.Contains(address) {
 			return false
 		}
 	}
