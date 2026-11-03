@@ -555,12 +555,16 @@ func TestPublicUnicastAddressFilter(t *testing.T) {
 	}{
 		{address: "8.8.8.8", allowed: true},
 		{address: "2001:4860:4860::8888", allowed: true},
+		{address: "2606:4700:4700::1111", allowed: true},
 		{address: "127.0.0.1"},
 		{address: "10.0.0.1"},
 		{address: "100.64.0.1"},
 		{address: "192.0.2.1"},
 		{address: "::1"},
 		{address: "2001:db8::1"},
+		{address: "3fff::1"},
+		{address: "5f00::1"},
+		{address: "4000::1"},
 	} {
 		ip := net.ParseIP(tc.address)
 		if ip == nil {
@@ -607,6 +611,9 @@ func TestDialPublicUnicastPinsCheckedDNSAnswers(t *testing.T) {
 	}{
 		{name: "private answer", ips: []net.IPAddr{{IP: net.ParseIP("10.0.0.1")}}},
 		{name: "mixed public and private answers", ips: []net.IPAddr{{IP: net.ParseIP("8.8.8.8")}, {IP: net.ParseIP("10.0.0.1")}}},
+		{name: "documentation IPv6 range", ips: []net.IPAddr{{IP: net.ParseIP("3fff::1")}}},
+		{name: "reserved IPv6 range", ips: []net.IPAddr{{IP: net.ParseIP("5f00::1")}}},
+		{name: "outside IPv6 global unicast allocation", ips: []net.IPAddr{{IP: net.ParseIP("4000::1")}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before := dialCalls
