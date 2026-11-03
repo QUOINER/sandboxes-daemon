@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
-	daemonnetwork "github.com/KLORQ/sandboxes-daemon/internal/network"
-	gateway "github.com/KLORQ/sandboxes-gateway"
-	rt "github.com/KLORQ/sandboxes-runtime"
-	"github.com/KLORQ/sandboxes-runtime/ctr"
+	daemonnetwork "github.com/quoiner/sandboxes-daemon/internal/network"
+	gateway "github.com/quoiner/sandboxes-gateway"
+	rt "github.com/quoiner/sandboxes-runtime"
+	"github.com/quoiner/sandboxes-runtime/ctr"
 )
 
 const liveSecret = "klorq-p04-synthetic-fixture-credential"

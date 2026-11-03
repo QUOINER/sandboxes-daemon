@@ -1,12 +1,13 @@
-module github.com/KLORQ/sandboxes-daemon
+module github.com/quoiner/sandboxes-daemon
 
 go 1.27
 
 require (
-	github.com/KLORQ/sandboxes-api v0.0.11
-	github.com/KLORQ/sandboxes-core v0.0.8
-	github.com/KLORQ/sandboxes-gateway v0.0.10
-	github.com/KLORQ/sandboxes-runtime v0.0.19
+	github.com/Microsoft/go-winio v0.6.4
+	github.com/quoiner/sandboxes-api v0.0.12
+	github.com/quoiner/sandboxes-core v0.0.9
+	github.com/quoiner/sandboxes-gateway v0.0.11
+	github.com/quoiner/sandboxes-runtime v0.0.20
 	github.com/zalando/go-keyring v0.2.6
 	golang.org/x/sys v0.49.0
 	google.golang.org/grpc v1.85.0
@@ -15,7 +16,6 @@ require (
 
 require (
 	al.essio.dev/pkg/shellescape v1.5.1 // indirect
-	github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29 // indirect
 	github.com/Microsoft/hcsshim v0.15.0-rc.4 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/containerd/cgroups/v3 v3.1.3 // indirect
@@ -59,9 +59,9 @@ require (
 	go.opentelemetry.io/otel/metric v1.46.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.46.0 // indirect
 	go.opentelemetry.io/otel/trace v1.46.0 // indirect
-	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260825221802-da73d73af1c5 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	modernc.org/libc v1.79.0 // indirect

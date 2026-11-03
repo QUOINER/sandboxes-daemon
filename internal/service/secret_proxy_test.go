@@ -7,15 +7,16 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 
-	core "github.com/KLORQ/sandboxes-core"
-	runtime "github.com/KLORQ/sandboxes-runtime"
+	core "github.com/quoiner/sandboxes-core"
+	runtime "github.com/quoiner/sandboxes-runtime"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/secretproxy"
-	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
-	"github.com/KLORQ/sandboxes-daemon/internal/store"
+	"github.com/quoiner/sandboxes-daemon/internal/secretproxy"
+	"github.com/quoiner/sandboxes-daemon/internal/servicesecrets"
+	"github.com/quoiner/sandboxes-daemon/internal/store"
 )
 
 func TestStripProxyCreateEnv(t *testing.T) {
@@ -91,6 +92,12 @@ func TestProxyEnvironmentUsesHostBrokerAndSurvivesRestart(t *testing.T) {
 		Image: "alpine:3.22",
 		Env:   map[string]string{"OPENAI_API_KEY": "${proxy:openai}"},
 	})
+	if goruntime.GOOS == "windows" {
+		if !errors.Is(err, core.ErrConflict) || backend.created != 0 {
+			t.Fatalf("unsupported Windows proxy was not rejected before runtime start: err=%v created=%d", err, backend.created)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

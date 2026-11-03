@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/KLORQ/sandboxes-gateway/registryauth"
+	"github.com/quoiner/sandboxes-gateway/registryauth"
 )
 
 // PullRequest contains host-authorized inputs for a single registry pull. The

@@ -16,14 +16,14 @@ import (
 	"testing"
 	"time"
 
-	core "github.com/KLORQ/sandboxes-core"
-	daemonnetwork "github.com/KLORQ/sandboxes-daemon/internal/network"
-	"github.com/KLORQ/sandboxes-daemon/internal/secretproxy"
-	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
-	"github.com/KLORQ/sandboxes-daemon/internal/store"
-	gateway "github.com/KLORQ/sandboxes-gateway"
-	rt "github.com/KLORQ/sandboxes-runtime"
-	"github.com/KLORQ/sandboxes-runtime/ctr"
+	core "github.com/quoiner/sandboxes-core"
+	daemonnetwork "github.com/quoiner/sandboxes-daemon/internal/network"
+	"github.com/quoiner/sandboxes-daemon/internal/secretproxy"
+	"github.com/quoiner/sandboxes-daemon/internal/servicesecrets"
+	"github.com/quoiner/sandboxes-daemon/internal/store"
+	gateway "github.com/quoiner/sandboxes-gateway"
+	rt "github.com/quoiner/sandboxes-runtime"
+	"github.com/quoiner/sandboxes-runtime/ctr"
 )
 
 const p04ServiceCredential = "klorq-p04-service-synthetic-credential"

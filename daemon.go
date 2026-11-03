@@ -6,23 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 
-	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
-	runtime "github.com/KLORQ/sandboxes-runtime"
+	localv1 "github.com/quoiner/sandboxes-api/gen/go/sandboxes/local/v1"
+	runtime "github.com/quoiner/sandboxes-runtime"
 	"google.golang.org/grpc"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/oauthsession"
-	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
-	"github.com/KLORQ/sandboxes-daemon/internal/secretproxy"
-	"github.com/KLORQ/sandboxes-daemon/internal/server"
-	"github.com/KLORQ/sandboxes-daemon/internal/service"
-	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
-	"github.com/KLORQ/sandboxes-daemon/internal/store"
+	"github.com/quoiner/sandboxes-daemon/internal/oauthsession"
+	"github.com/quoiner/sandboxes-daemon/internal/registrycredentials"
+	"github.com/quoiner/sandboxes-daemon/internal/secretproxy"
+	"github.com/quoiner/sandboxes-daemon/internal/server"
+	"github.com/quoiner/sandboxes-daemon/internal/service"
+	"github.com/quoiner/sandboxes-daemon/internal/servicesecrets"
+	"github.com/quoiner/sandboxes-daemon/internal/store"
 )
 
 // Config is the daemon configuration.
@@ -90,8 +88,8 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	if cfg.SocketPath == "" || cfg.StateDir == "" {
 		return fmt.Errorf("socket path and state dir are required")
 	}
-	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
-		return fmt.Errorf("create state dir: %w", err)
+	if err := prepareDaemonStateDirectory(cfg.StateDir); err != nil {
+		return fmt.Errorf("prepare state dir: %w", err)
 	}
 	lock, err := lockStateDirectory(cfg.StateDir)
 	if err != nil {
@@ -118,17 +116,9 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	if changed > 0 {
 		slog.Info("reconciled interrupted state", "records", changed)
 	}
-	if err := ensureSocketAvailable(cfg.SocketPath); err != nil {
-		return err
-	}
-	var lc net.ListenConfig
-	lis, err := lc.Listen(ctx, "unix", cfg.SocketPath)
+	lis, err := listenDaemon(ctx, cfg.SocketPath)
 	if err != nil {
-		return fmt.Errorf("listen unix socket: %w", err)
-	}
-	if err := os.Chmod(cfg.SocketPath, 0o600); err != nil {
-		_ = lis.Close()
-		return fmt.Errorf("chmod socket: %w", err)
+		return fmt.Errorf("listen local daemon endpoint: %w", err)
 	}
 
 	grpcServer := grpc.NewServer()
@@ -216,35 +206,6 @@ func stopGRPCOnCancel(ctx context.Context, runDone <-chan struct{}, grpcServer *
 	case <-timer.C:
 		grpcServer.Stop()
 	}
-}
-
-// lockStateDirectory prevents cooperative daemon instances from sharing one
-// SQLite store and runtime resources. The lock file is retained after shutdown.
-func lockStateDirectory(dir string) (*os.File, error) {
-	path := filepath.Join(dir, "daemon.lock")
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600) // #nosec G304 -- state directory is configured by the operator; symlinks are rejected
-	if err != nil {
-		return nil, fmt.Errorf("open daemon state lock: %w", err)
-	}
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		_ = file.Close()
-		return nil, fmt.Errorf("daemon state lock must be a regular file")
-	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("daemon state directory is already in use: %w", err)
-	}
-	return file, nil
-}
-
-func ensureSocketAvailable(path string) error {
-	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("inspect daemon socket: %w", err)
-	}
-	return fmt.Errorf("daemon socket path already exists")
 }
 
 func configureDockerVolume(svc *service.Service, stateDir string) {

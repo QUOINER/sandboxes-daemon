@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -30,11 +31,41 @@ type Service struct {
 }
 
 const (
-	authHeader     = "Authorization"
-	bearerPrefix   = "Bearer "
-	tokenPath      = "/__klorq/proxy/token" //nolint:gosec // internal route path, not a credential
-	maxRequestBody = 64 << 20
+	authHeader      = "Authorization"
+	bearerPrefix    = "Bearer "
+	tokenPath       = "/__klorq/proxy/token" //nolint:gosec // internal route path, not a credential
+	maxRequestBody  = 64 << 20
+	maxResponseBody = 64 << 20
 )
+
+var errResponseTooLarge = errors.New("proxy response exceeds configured limit")
+
+type boundedResponseBody struct {
+	body      io.ReadCloser
+	remaining int64
+}
+
+func (b *boundedResponseBody) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if b.remaining > 0 {
+		if int64(len(p)) > b.remaining {
+			p = p[:b.remaining]
+		}
+		n, err := b.body.Read(p)
+		b.remaining -= int64(n)
+		return n, err
+	}
+	var extra [1]byte
+	n, err := b.body.Read(extra[:])
+	if n > 0 {
+		return 0, errResponseTooLarge
+	}
+	return 0, err
+}
+
+func (b *boundedResponseBody) Close() error { return b.body.Close() }
 
 var services = map[string]Service{
 	"openai":     {Upstream: "https://api.openai.com", Header: authHeader, Prefix: bearerPrefix},
@@ -115,6 +146,15 @@ func (m *Manager) StartUnix(ctx context.Context, sandbox, service string, cfg Se
 	}
 	reverse := httputil.NewSingleHostReverseProxy(upstream)
 	reverse.Transport = outboundTransport(upstream.Scheme == "https", m.dialContext)
+	reverse.ModifyResponse = func(response *http.Response) error {
+		if response.ContentLength > maxResponseBody {
+			return errResponseTooLarge
+		}
+		if response.Body != nil {
+			response.Body = &boundedResponseBody{body: response.Body, remaining: maxResponseBody}
+		}
+		return nil
+	}
 	reverse.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 		http.Error(w, "proxy upstream unavailable", http.StatusBadGateway)
 	}
@@ -418,7 +458,10 @@ func RemovePrivateDir(path string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || !ownedByCurrentUser(info) {
 		return errors.New("refusing to remove a proxy directory not owned by the daemon user")
 	}
-	return os.Remove(path)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // RemoveStaleSocket removes a socket owned by this daemon user when no process

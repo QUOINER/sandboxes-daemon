@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func TestDeviceAuthorizationAndPolling(t *testing.T) {
+func TestDeviceAuthorizationManualBrowserFallbackAndPolling(t *testing.T) {
 	approved := false
 	var server *httptest.Server
 	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -57,7 +57,7 @@ func TestDeviceAuthorizationAndPolling(t *testing.T) {
 			t.Error("unexpected user device instructions")
 		}
 		approved = true
-		return nil
+		return ErrBrowserUnavailable
 	}, sink)
 	if err != nil {
 		t.Fatal(err)
@@ -67,6 +67,23 @@ func TestDeviceAuthorizationAndPolling(t *testing.T) {
 		t.Fatal("device tokens were not saved to the host vault")
 	}
 }
+
+func TestDeviceAuthorizationDoesNotSwallowCanceledBrowserHandoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	provider := DeviceProvider{DeviceEndpoint: "https://login.example/device", TokenEndpoint: "https://login.example/token", ClientID: "fixture", Audience: "https://login.example", Transport: http.DefaultTransport}
+	sink := deviceTestSink{}
+	err := CompleteDeviceAuthorization(ctx, provider, DeviceAuthorization{UserCode: "ABCD", VerificationURI: "https://login.example/device"}, func(context.Context, string, string) error {
+		return ErrBrowserUnavailable
+	}, sink)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled handoff must stop polling, got %v", err)
+	}
+}
+
+type deviceTestSink struct{}
+
+func (deviceTestSink) Save(context.Context, Tokens) error { return nil }
 
 func TestNewDockerHubProviderUsesDockerDeviceClient(t *testing.T) {
 	provider, err := NewDockerHubProvider(http.DefaultTransport)
@@ -91,6 +108,15 @@ func TestDeviceAuthorizationCompletesURLWhenProviderOmitsCompleteURI(t *testing.
 	}
 	if got != "https://login.example/activate?source=cli&user_code=SYNTHETIC-CODE" {
 		t.Fatalf("verification URL = %q", got)
+	}
+}
+
+func TestDeviceAuthorizationRejectsTerminalControlInUserCode(t *testing.T) {
+	for _, code := range []string{"ABCD\x1b[31m", "ABCD\nEFGH", strings.Repeat("A", 65)} {
+		body := []byte(`{"device_code":"synthetic-device","user_code":"` + code + `","verification_uri":"https://login.example/device","expires_in":60}`)
+		if _, err := parseDeviceAuthorization(body, "https://login.example/oauth/device"); err == nil {
+			t.Fatalf("unsafe user code accepted: %q", code)
+		}
 	}
 }
 

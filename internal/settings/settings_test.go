@@ -3,6 +3,7 @@ package settings
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -24,6 +25,12 @@ docker_volume_size = "20g"
 		t.Fatal(err)
 	}
 	values, err = Load(path)
+	if runtime.GOOS == "windows" {
+		if err == nil || !strings.Contains(err.Error(), "not writable") {
+			t.Fatalf("Load error = %v; expected fail-closed ACL rejection", err)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,6 +45,12 @@ func TestLoadRejectsUnsafeAndUnknown(t *testing.T) {
 	path := filepath.Join(dir, "settings.toml")
 	if err := os.WriteFile(path, []byte("unknown = true\n"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "not writable") {
+			t.Fatalf("Load error = %v; expected fail-closed ACL rejection", err)
+		}
+		return
 	}
 	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "unknown key") {
 		t.Fatalf("unknown key error=%v", err)

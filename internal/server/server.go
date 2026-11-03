@@ -7,19 +7,21 @@ import (
 	"fmt"
 	"time"
 
-	localv1 "github.com/KLORQ/sandboxes-api/gen/go/sandboxes/local/v1"
-	apiversion "github.com/KLORQ/sandboxes-api/version"
-	core "github.com/KLORQ/sandboxes-core"
-	"github.com/KLORQ/sandboxes-core/operation"
-	"github.com/KLORQ/sandboxes-core/sandbox"
+	localv1 "github.com/quoiner/sandboxes-api/gen/go/sandboxes/local/v1"
+	apiversion "github.com/quoiner/sandboxes-api/version"
+	core "github.com/quoiner/sandboxes-core"
+	"github.com/quoiner/sandboxes-core/operation"
+	"github.com/quoiner/sandboxes-core/sandbox"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
-	"github.com/KLORQ/sandboxes-daemon/internal/service"
-	"github.com/KLORQ/sandboxes-daemon/internal/version"
+	"github.com/quoiner/sandboxes-daemon/internal/registrycredentials"
+	"github.com/quoiner/sandboxes-daemon/internal/service"
+	"github.com/quoiner/sandboxes-daemon/internal/version"
 )
+
+const defaultAccountProvider = "docker"
 
 // SandboxServer implements the sandbox gRPC service.
 type SandboxServer struct {
@@ -70,7 +72,7 @@ func NewAccount(svc *service.Service) *AccountServer { return &AccountServer{svc
 func (s *AccountServer) Login(ctx context.Context, req *localv1.AccountServiceLoginRequest) (*localv1.AccountServiceLoginResponse, error) {
 	provider := req.GetProvider()
 	if provider == "" {
-		provider = "docker"
+		provider = defaultAccountProvider
 	}
 	loginCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
@@ -87,6 +89,61 @@ func (s *AccountServer) Login(ctx context.Context, req *localv1.AccountServiceLo
 		return nil, status.Error(codes.FailedPrecondition, "OAuth login failed; no credentials were returned")
 	}
 	return &localv1.AccountServiceLoginResponse{Provider: provider, Authenticated: true}, nil
+}
+
+// LoginDevice streams a public user code to the CLI, waits for the CLI's
+// explicit continuation after the browser handoff, then completes the trusted
+// daemon-side device flow. The provider device code never crosses gRPC.
+func (s *AccountServer) LoginDevice(stream grpc.BidiStreamingServer[localv1.AccountServiceLoginDeviceRequest, localv1.AccountServiceLoginDeviceResponse]) error {
+	first, err := stream.Recv()
+	if err != nil {
+		return mapError(err)
+	}
+	if first.GetContinueAfterHandoff() {
+		return status.Error(codes.InvalidArgument, "OAuth login must start before handoff confirmation")
+	}
+	provider := first.GetProvider()
+	if provider == "" {
+		provider = defaultAccountProvider
+	}
+	ctx, cancel := context.WithTimeout(stream.Context(), 30*time.Minute)
+	defer cancel()
+	authorization, err := s.svc.BeginDeviceAccountLogin(ctx, provider)
+	if err != nil {
+		return accountLoginError(err)
+	}
+	if err := stream.Send(&localv1.AccountServiceLoginDeviceResponse{
+		UserCode: authorization.UserCode, VerificationUri: authorization.VerificationURI,
+	}); err != nil {
+		return mapError(err)
+	}
+	ack, err := stream.Recv()
+	if err != nil {
+		return mapError(err)
+	}
+	if ack.GetProvider() != "" {
+		return status.Error(codes.InvalidArgument, "unexpected OAuth provider in handoff confirmation")
+	}
+	if !ack.GetContinueAfterHandoff() {
+		return status.Error(codes.Canceled, "OAuth login canceled")
+	}
+	if err := s.svc.CompleteDeviceAccountLogin(ctx, provider, authorization); err != nil {
+		return accountLoginError(err)
+	}
+	return stream.Send(&localv1.AccountServiceLoginDeviceResponse{Authenticated: true})
+}
+
+func accountLoginError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return mapError(err)
+	}
+	if errors.Is(err, service.ErrOAuthProviderUnavailable) {
+		return status.Error(codes.FailedPrecondition, "OAuth provider is not configured on this daemon")
+	}
+	if errors.Is(err, service.ErrOAuthPartialLogin) {
+		return status.Error(codes.FailedPrecondition, "OAuth login may have partially completed; run qsbx logout before retrying")
+	}
+	return status.Error(codes.FailedPrecondition, "OAuth login failed; no credentials were returned")
 }
 
 func (s *AccountServer) LoginWithPAT(ctx context.Context, req *localv1.AccountServiceLoginWithPATRequest) (*localv1.AccountServiceLoginWithPATResponse, error) {
@@ -114,7 +171,7 @@ func (s *AccountServer) LoginWithPAT(ctx context.Context, req *localv1.AccountSe
 func (s *AccountServer) Logout(ctx context.Context, req *localv1.AccountServiceLogoutRequest) (*localv1.AccountServiceLogoutResponse, error) {
 	provider := req.GetProvider()
 	if provider == "" {
-		provider = "docker"
+		provider = defaultAccountProvider
 	}
 	removed, err := s.svc.LogoutAccount(ctx, provider)
 	if err != nil {
@@ -130,6 +187,24 @@ func (s *AccountServer) Logout(ctx context.Context, req *localv1.AccountServiceL
 		return nil, status.Error(codes.Unavailable, "OAuth host keychain operation failed")
 	}
 	return &localv1.AccountServiceLogoutResponse{Removed: removed}, nil
+}
+
+func (s *AccountServer) Status(ctx context.Context, req *localv1.AccountServiceStatusRequest) (*localv1.AccountServiceStatusResponse, error) {
+	provider := req.GetProvider()
+	if provider == "" {
+		provider = defaultAccountProvider
+	}
+	present, err := s.svc.AccountCredentialsPresent(ctx, provider)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, mapError(err)
+		}
+		if errors.Is(err, service.ErrOAuthProviderUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, "OAuth provider is not configured on this daemon")
+		}
+		return nil, status.Error(codes.Unavailable, "OAuth host credential status is unavailable")
+	}
+	return &localv1.AccountServiceStatusResponse{Provider: provider, CredentialPresent: present}, nil
 }
 
 // Login stores registry credentials without returning or logging secret data.

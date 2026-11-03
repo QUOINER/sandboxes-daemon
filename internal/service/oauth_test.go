@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/oauthsession"
-	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
-	"github.com/KLORQ/sandboxes-daemon/internal/store"
+	"github.com/quoiner/sandboxes-daemon/internal/oauthsession"
+	"github.com/quoiner/sandboxes-daemon/internal/registrycredentials"
+	"github.com/quoiner/sandboxes-daemon/internal/store"
 )
 
 func TestDeviceAccountLoginStoresAndLogoutRevokesHostTokens(t *testing.T) {
@@ -92,7 +92,17 @@ func TestDeviceAccountLoginStoresAndLogoutRevokesHostTokens(t *testing.T) {
 	}})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := svc.LoginAccount(ctx, "docker"); err != nil {
+	authorization, err := svc.BeginDeviceAccountLogin(ctx, "docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorization.UserCode != "ABCD" || authorization.VerificationURI != server.URL+"/activate?user_code=ABCD" {
+		t.Fatalf("unexpected user handoff data: code=%q uri=%q", authorization.UserCode, authorization.VerificationURI)
+	}
+	if approved.Load() || patCalls.Load() != 0 {
+		t.Fatal("device flow started before the caller continued after the handoff")
+	}
+	if err := svc.CompleteDeviceAccountLogin(ctx, "docker", authorization); err != nil {
 		t.Fatal(err)
 	}
 	sink, err := oauthsession.NewVaultSink(vault, "docker")
@@ -147,6 +157,38 @@ func TestDeviceAccountLoginStoresAndLogoutRevokesHostTokens(t *testing.T) {
 	}
 }
 
+func TestAccountCredentialStatusReportsOAuthRecordPresence(t *testing.T) {
+	ctx := context.Background()
+	vault := &memoryOAuthVault{values: make(map[string]string)}
+	st, err := store.Open(ctx, t.TempDir()+"/oauth-status.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	svc.SetOAuthVault(vault)
+	svc.SetOAuthProviders(map[string]OAuthProvider{"fixture": {}})
+	sink, err := oauthsession.NewVaultSink(vault, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if present, err := svc.AccountCredentialsPresent(ctx, "fixture"); err != nil || present {
+		t.Fatalf("empty OAuth status present=%t err=%v", present, err)
+	}
+	if err := sink.Save(ctx, oauthsession.Tokens{AccessToken: "synthetic-access", TokenType: "Bearer", RefreshToken: "synthetic-refresh"}); err != nil {
+		t.Fatal(err)
+	}
+	if present, err := svc.AccountCredentialsPresent(ctx, "fixture"); err != nil || !present {
+		t.Fatalf("stored OAuth status present=%t err=%v", present, err)
+	}
+	if err := sink.Delete(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if present, err := svc.AccountCredentialsPresent(ctx, "fixture"); err != nil || present {
+		t.Fatalf("deleted OAuth status present=%t err=%v", present, err)
+	}
+}
+
 type dockerPATRoundTripper func(*http.Request) (*http.Response, error)
 
 func (f dockerPATRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
@@ -182,6 +224,9 @@ func TestDockerHubPATLoginValidatesAndStoresOnlyPAT(t *testing.T) {
 	if err := svc.LoginDockerHubPAT(context.Background(), "alice", []byte("synthetic-pat")); err != nil {
 		t.Fatal(err)
 	}
+	if present, err := svc.AccountCredentialsPresent(context.Background(), "docker"); err != nil || !present {
+		t.Fatalf("stored Docker PAT status present=%t err=%v", present, err)
+	}
 	for _, scope := range []registrycredentials.Scope{registrycredentials.ScopeHostOnly, registrycredentials.ScopeAllSandboxes} {
 		credential, err := registryStore.Load(context.Background(), "docker.io", scope, "")
 		if err != nil || credential.Username != "alice" || string(credential.Password) != "synthetic-pat" {
@@ -204,6 +249,9 @@ func TestDockerHubPATLoginValidatesAndStoresOnlyPAT(t *testing.T) {
 	svc.SetRegistryCredentialStore(registryStore)
 	if removed, err := svc.LogoutAccount(context.Background(), "docker"); !removed || err != nil {
 		t.Fatalf("logout retry failed: removed=%t err=%v", removed, err)
+	}
+	if present, err := svc.AccountCredentialsPresent(context.Background(), "docker"); err != nil || present {
+		t.Fatalf("Docker PAT status after logout present=%t err=%v", present, err)
 	}
 	for _, scope := range []registrycredentials.Scope{registrycredentials.ScopeHostOnly, registrycredentials.ScopeAllSandboxes} {
 		if _, err := registryStore.Load(context.Background(), "docker.io", scope, ""); !errors.Is(err, registrycredentials.ErrNotFound) {

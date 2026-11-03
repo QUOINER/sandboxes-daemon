@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"time"
 
-	gateway "github.com/KLORQ/sandboxes-gateway"
-	"github.com/KLORQ/sandboxes-gateway/policy"
-	runtime "github.com/KLORQ/sandboxes-runtime"
+	gateway "github.com/quoiner/sandboxes-gateway"
+	"github.com/quoiner/sandboxes-gateway/policy"
+	runtime "github.com/quoiner/sandboxes-runtime"
 )
 
 // Manager is the subset of the gateway manager used by the adapter.

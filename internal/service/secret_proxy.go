@@ -13,12 +13,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	core "github.com/KLORQ/sandboxes-core"
-	"github.com/KLORQ/sandboxes-core/sandbox"
-	runtime "github.com/KLORQ/sandboxes-runtime"
+	core "github.com/quoiner/sandboxes-core"
+	"github.com/quoiner/sandboxes-core/sandbox"
+	runtime "github.com/quoiner/sandboxes-runtime"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/secretproxy"
-	"github.com/KLORQ/sandboxes-daemon/internal/servicesecrets"
+	"github.com/quoiner/sandboxes-daemon/internal/secretproxy"
+	"github.com/quoiner/sandboxes-daemon/internal/servicesecrets"
 )
 
 const (

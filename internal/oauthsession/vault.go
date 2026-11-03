@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/registrycredentials"
+	"github.com/quoiner/sandboxes-daemon/internal/registrycredentials"
 )
 
 const oauthVaultService = "com.klorq.oauth.v1"
@@ -78,6 +78,19 @@ func (s *VaultSink) Load(ctx context.Context) (Tokens, time.Time, error) {
 	return record.Tokens, record.ExpiresAt, nil
 }
 
+// HasTokens reports only whether a provider token record exists. It never
+// returns or decodes token values.
+func (s *VaultSink) HasTokens(ctx context.Context) (bool, error) {
+	_, err := s.vault.Get(ctx, oauthVaultService, s.account)
+	if errors.Is(err, registrycredentials.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, errors.New("inspect OAuth credential presence failed")
+	}
+	return true, nil
+}
+
 // Delete removes only this provider's vault record.
 func (s *VaultSink) Delete(ctx context.Context) error {
 	if err := s.vault.Delete(ctx, oauthVaultService, s.account); err != nil {
@@ -116,6 +129,25 @@ func (s *VaultSink) DockerHubPATFingerprint(ctx context.Context) (string, error)
 	}
 	clear(decoded)
 	return value, nil
+}
+
+// HasDockerHubPATFingerprint validates only the presence and shape of the
+// non-authenticating ownership marker without returning its value.
+func (s *VaultSink) HasDockerHubPATFingerprint(ctx context.Context) (bool, error) {
+	value, err := s.vault.Get(ctx, oauthVaultService, s.account+":docker-hub-pat-sha256")
+	if errors.Is(err, registrycredentials.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, errors.New("inspect Docker Hub credential presence failed")
+	}
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != 32 {
+		clear(decoded)
+		return false, errors.New("invalid Docker Hub credential ownership record")
+	}
+	clear(decoded)
+	return true, nil
 }
 
 // DeleteDockerHubPATFingerprint clears only this provider's ownership marker.

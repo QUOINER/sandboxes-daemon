@@ -12,16 +12,16 @@ import (
 	"syscall"
 	"time"
 
-	gateway "github.com/KLORQ/sandboxes-gateway"
-	runtime "github.com/KLORQ/sandboxes-runtime"
-	runtimectr "github.com/KLORQ/sandboxes-runtime/ctr"
+	gateway "github.com/quoiner/sandboxes-gateway"
+	runtime "github.com/quoiner/sandboxes-runtime"
+	runtimectr "github.com/quoiner/sandboxes-runtime/ctr"
 
-	daemon "github.com/KLORQ/sandboxes-daemon"
-	daemonnetwork "github.com/KLORQ/sandboxes-daemon/internal/network"
-	"github.com/KLORQ/sandboxes-daemon/internal/oauthsession"
-	"github.com/KLORQ/sandboxes-daemon/internal/service"
-	"github.com/KLORQ/sandboxes-daemon/internal/settings"
-	"github.com/KLORQ/sandboxes-daemon/internal/version"
+	daemon "github.com/quoiner/sandboxes-daemon"
+	daemonnetwork "github.com/quoiner/sandboxes-daemon/internal/network"
+	"github.com/quoiner/sandboxes-daemon/internal/oauthsession"
+	"github.com/quoiner/sandboxes-daemon/internal/service"
+	"github.com/quoiner/sandboxes-daemon/internal/settings"
+	"github.com/quoiner/sandboxes-daemon/internal/version"
 )
 
 type options struct {
@@ -100,7 +100,7 @@ func parseOptions() options {
 	}
 	defaultState := filepath.Join(home, ".sandboxes")
 	flag.StringVar(&opts.stateDir, "state", defaultState, "state directory")
-	flag.StringVar(&opts.socketPath, "socket", filepath.Join(defaultState, "sandboxesd.sock"), "unix socket path")
+	flag.StringVar(&opts.socketPath, "socket", filepath.Join(defaultState, "sandboxesd.sock"), "local daemon endpoint")
 	flag.StringVar(&opts.containerdPath, "containerd", "", "containerd socket; empty keeps state-only mode")
 	flag.StringVar(&opts.ctrPath, "ctr", "ctr", "ctr binary path")
 	flag.StringVar(&opts.runtimeName, "runtime", "io.containerd.nerdbox.v1", "containerd runtime name")

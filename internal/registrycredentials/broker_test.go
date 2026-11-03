@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/KLORQ/sandboxes-gateway/registryauth"
+	"github.com/quoiner/sandboxes-gateway/registryauth"
 )
 
 func TestExchangeTokenUsesSelectedCredential(t *testing.T) {

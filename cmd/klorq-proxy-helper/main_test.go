@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -12,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/KLORQ/sandboxes-daemon/internal/secretproxy"
+	"github.com/quoiner/sandboxes-daemon/internal/secretproxy"
 )
 
 func TestVsockConnWrapsPollableFile(t *testing.T) {
