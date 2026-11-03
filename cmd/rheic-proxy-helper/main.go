@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
@@ -89,13 +90,43 @@ func main() {
 	handler := newHandler(*serviceHost, transport)
 	server := newHTTPServer(*listen, handler)
 	log.Printf("proxy helper listening on %s for %s", *listen, *serviceHost)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	listener, err := net.Listen("tcp", *listen)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := serve(ctx, listener, server); err != nil {
 		log.Fatal(err)
 	}
 }
 
 func newHTTPServer(listen string, handler http.Handler) *http.Server {
 	return &http.Server{Addr: listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+}
+
+func serve(ctx context.Context, listener net.Listener, server *http.Server) error {
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve(listener) }()
+	select {
+	case err := <-serveErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			_ = server.Close()
+			return fmt.Errorf("stop proxy helper: %w", err)
+		}
+		err := <-serveErr
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	}
 }
 
 func fetchToken(ctx context.Context, transport http.RoundTripper) (string, error) {

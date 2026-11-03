@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -77,6 +79,29 @@ func TestHelperServerBindsConfiguredLoopbackAddress(t *testing.T) {
 	server := newHTTPServer("127.0.0.1:3128", http.NotFoundHandler())
 	if server.Addr != "127.0.0.1:3128" {
 		t.Fatalf("server listen address = %q", server.Addr)
+	}
+}
+
+func TestHelperServerStopsOnSIGTERM(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newHTTPServer(listener.Addr().String(), http.NotFoundHandler())
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	defer stop()
+	done := make(chan error, 1)
+	go func() { done <- serve(ctx, listener, server) }()
+	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve() after cancellation = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy helper server did not stop after cancellation")
 	}
 }
 
