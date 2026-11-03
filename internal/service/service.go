@@ -1867,11 +1867,53 @@ func (s *Service) removeDockerVolume(id string) error {
 	if s.DockerVolumeDir == "" {
 		return nil
 	}
-	err := os.Remove(filepath.Join(s.DockerVolumeDir, id+".ext4"))
+	name, err := dockerVolumeName(id)
+	if err != nil {
+		return err
+	}
+	if !dockerVolumeSecuritySupported() {
+		return errors.New("safe docker volume validation is unsupported on this platform")
+	}
+	return removeDockerVolumeFile(s.DockerVolumeDir, name)
+}
+
+func removeDockerVolumeFile(dir, name string) error {
+	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("inspect docker volume directory: %w", err)
+	}
+	root, _, err := openDockerVolumeRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	file, err := openDockerVolumeFile(root, name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
+		return fmt.Errorf("validate docker volume before removal: %w", err)
+	}
+	info, err := file.Stat()
+	closeErr := file.Close()
+	if err != nil {
+		return fmt.Errorf("stat docker volume before removal: %w", err)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close docker volume before removal: %w", closeErr)
+	}
+	current, err := root.Lstat(name)
+	if err != nil {
+		return fmt.Errorf("recheck docker volume before removal: %w", err)
+	}
+	if !os.SameFile(info, current) {
+		return errors.New("docker volume changed before removal")
+	}
+	if err := validateDockerVolumeFileInfo(current); err != nil {
+		return fmt.Errorf("revalidate docker volume before removal: %w", err)
+	}
+	if err := root.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove docker volume: %w", err)
 	}
 	return nil
@@ -1881,39 +1923,178 @@ func (s *Service) ensureDockerVolume(ctx context.Context, id string) (string, er
 	if s.DockerVolumeDir == "" {
 		return "", errors.New("docker volume directory is not configured")
 	}
-	if err := os.MkdirAll(s.DockerVolumeDir, 0o700); err != nil {
-		return "", fmt.Errorf("create docker volume directory: %w", err)
-	}
-	path := filepath.Join(s.DockerVolumeDir, id+".ext4")
-	if _, err := os.Stat(path); err == nil {
-		return path, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("stat docker volume: %w", err)
-	}
-	size, err := parseVolumeSize(s.DockerVolumeSize)
+	name, err := dockerVolumeName(id)
 	if err != nil {
 		return "", err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600) //nolint:gosec // path is generated from the trusted state directory and sandbox ID
+	root, volumeDir, err := openDockerVolumeRoot(s.DockerVolumeDir)
 	if err != nil {
-		return "", fmt.Errorf("create docker volume: %w", err)
+		return "", err
 	}
-	if err := file.Truncate(size); err != nil {
-		_ = file.Close()
-		_ = os.Remove(path)
-		return "", fmt.Errorf("size docker volume: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
-		return "", fmt.Errorf("close docker volume: %w", err)
-	}
-	mkfs := s.resolveMkfs()
-	command := exec.CommandContext(ctx, mkfs, "-q", "-F", path) // #nosec G204 -- operator-configured binary and generated path
-	if output, err := command.CombinedOutput(); err != nil {
-		_ = os.Remove(path)
-		return "", fmt.Errorf("mkfs docker volume: %w: %s", err, strings.TrimSpace(string(output)))
+	defer func() { _ = root.Close() }()
+	path := filepath.Join(volumeDir, name)
+	if err := ensureDockerVolumeAt(ctx, root, name, s.DockerVolumeSize, s.resolveMkfs()); err != nil {
+		return "", err
 	}
 	return path, nil
+}
+
+func ensureDockerVolumeAt(ctx context.Context, root *os.Root, name, configuredSize, mkfs string) error {
+	if existing, err := openDockerVolumeFile(root, name); err == nil {
+		if closeErr := existing.Close(); closeErr != nil {
+			return fmt.Errorf("close existing docker volume: %w", closeErr)
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("validate existing docker volume: %w", err)
+	}
+	size, err := parseVolumeSize(configuredSize)
+	if err != nil {
+		return err
+	}
+	file, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("create docker volume: %w", err)
+	}
+	return formatDockerVolume(ctx, root, name, file, size, mkfs)
+}
+
+func formatDockerVolume(ctx context.Context, root *os.Root, name string, file *os.File, size int64, mkfs string) error {
+	createdInfo, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return fmt.Errorf("stat new docker volume: %w", err)
+	}
+	if err := validateDockerVolumeFileInfo(createdInfo); err != nil {
+		_ = file.Close()
+		removeDockerVolumeIfSameFile(root, name, createdInfo)
+		return fmt.Errorf("validate new docker volume: %w", err)
+	}
+	cleanup := func() { removeDockerVolumeIfSameFile(root, name, createdInfo) }
+	if err := file.Truncate(size); err != nil {
+		_ = file.Close()
+		cleanup()
+		return fmt.Errorf("size docker volume: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		cleanup()
+		return fmt.Errorf("sync docker volume: %w", err)
+	}
+	// Pass the already validated inode to mkfs through an inherited descriptor.
+	// Addressing the volume by its directory entry here would reintroduce a
+	// symlink/rename race between validation and the external formatter.
+	command := exec.CommandContext(ctx, mkfs, "-q", "-F", "/dev/fd/3") // #nosec G204 -- operator-configured binary
+	command.ExtraFiles = []*os.File{file}
+	if output, err := command.CombinedOutput(); err != nil {
+		_ = file.Close()
+		cleanup()
+		return fmt.Errorf("mkfs docker volume: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	if err := file.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("close formatted docker volume: %w", err)
+	}
+	created, err := openDockerVolumeFile(root, name)
+	if err != nil {
+		cleanup()
+		return fmt.Errorf("validate formatted docker volume: %w", err)
+	}
+	formattedInfo, statErr := created.Stat()
+	closeErr := created.Close()
+	if statErr != nil {
+		cleanup()
+		return fmt.Errorf("stat formatted docker volume: %w", statErr)
+	}
+	if closeErr != nil {
+		cleanup()
+		return fmt.Errorf("close formatted docker volume: %w", closeErr)
+	}
+	if !os.SameFile(createdInfo, formattedInfo) {
+		cleanup()
+		return errors.New("docker volume changed while it was formatted")
+	}
+	return nil
+}
+
+func dockerVolumeName(id string) (string, error) {
+	if id == "" || id == "." || id == ".." || strings.ContainsAny(id, `/\\`) || filepath.Base(id) != id {
+		return "", errors.New("invalid docker volume sandbox ID")
+	}
+	return id + ".ext4", nil
+}
+
+func openDockerVolumeRoot(path string) (*os.Root, string, error) {
+	if !dockerVolumeSecuritySupported() {
+		return nil, "", errors.New("safe docker volume validation is unsupported on this platform")
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return nil, "", fmt.Errorf("create docker volume directory: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve docker volume directory: %w", err)
+	}
+	info, err := os.Lstat(resolved)
+	if err != nil {
+		return nil, "", fmt.Errorf("inspect docker volume directory: %w", err)
+	}
+	if err := validateDockerVolumeDirectoryInfo(info); err != nil {
+		return nil, "", fmt.Errorf("unsafe docker volume directory: %w", err)
+	}
+	root, err := os.OpenRoot(resolved)
+	if err != nil {
+		return nil, "", fmt.Errorf("open docker volume directory: %w", err)
+	}
+	openedInfo, err := root.Stat(".")
+	if err != nil {
+		_ = root.Close()
+		return nil, "", fmt.Errorf("stat opened docker volume directory: %w", err)
+	}
+	if !os.SameFile(info, openedInfo) {
+		_ = root.Close()
+		return nil, "", errors.New("docker volume directory changed while opening")
+	}
+	if err := validateDockerVolumeDirectoryInfo(openedInfo); err != nil {
+		_ = root.Close()
+		return nil, "", fmt.Errorf("unsafe opened docker volume directory: %w", err)
+	}
+	return root, resolved, nil
+}
+
+func openDockerVolumeFile(root *os.Root, name string) (*os.File, error) {
+	info, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDockerVolumeFileInfo(info); err != nil {
+		return nil, err
+	}
+	file, err := root.OpenFile(name, os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	openedInfo, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("stat opened docker volume: %w", err)
+	}
+	if !os.SameFile(info, openedInfo) {
+		_ = file.Close()
+		return nil, errors.New("docker volume changed while opening")
+	}
+	if err := validateDockerVolumeFileInfo(openedInfo); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+func removeDockerVolumeIfSameFile(root *os.Root, name string, expected os.FileInfo) {
+	current, err := root.Lstat(name)
+	if err == nil && os.SameFile(expected, current) {
+		_ = root.Remove(name)
+	}
 }
 
 func parseVolumeSize(value string) (int64, error) {
