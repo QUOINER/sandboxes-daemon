@@ -148,7 +148,7 @@ jobs:
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
       - name: Scan reachable vulnerabilities
-        run: "$(go env GOPATH)/bin/govulncheck" ./...
+        run: '$(go env GOPATH)/bin/govulncheck ./...'
 
   windows-build:
     name: Windows Build
