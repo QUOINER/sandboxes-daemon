@@ -34,7 +34,7 @@ type Service struct {
 const (
 	authHeader      = "Authorization"
 	bearerPrefix    = "Bearer "
-	tokenPath       = "/__lickren/proxy/token" //nolint:gosec // internal route path, not a credential
+	tokenPath       = "/__rheic/proxy/token" //nolint:gosec // internal route path, not a credential
 	maxRequestBody  = 64 << 20
 	maxResponseBody = 64 << 20
 )
@@ -98,7 +98,7 @@ type proxy struct {
 // TokenHeader carries the per-VM bearer sent by the guest proxy helper. It is
 // only meaningful on the unix-socket transport, where the socket path is
 // already scoped to one sandbox.
-const TokenHeader = "X-Lickren-Proxy-Token" //nolint:gosec // HTTP header name, not a credential.
+const TokenHeader = "X-Rheic-Proxy-Token" //nolint:gosec // HTTP header name, not a credential.
 
 // Manager owns proxies keyed by sandbox and service.
 type Manager struct {
@@ -208,7 +208,7 @@ func proxyHandler(service string, p *proxy, reverse *httputil.ReverseProxy) http
 		if cfg.Header != "" {
 			r.Header.Set(cfg.Header, cfg.Prefix+string(secret))
 		}
-		r.Header.Set("X-Lickren-Secret-Proxy", service)
+		r.Header.Set("X-Rheic-Secret-Proxy", service)
 		reverse.ServeHTTP(w, r)
 	})
 }

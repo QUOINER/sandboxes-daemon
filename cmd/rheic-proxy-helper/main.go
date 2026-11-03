@@ -1,9 +1,9 @@
-// Command lickren-proxy-helper runs inside a sandbox and forwards HTTP requests
+// Command rheic-proxy-helper runs inside a sandbox and forwards HTTP requests
 // over the per-VM vsock channel to the host broker. The broker owns the real
 // service credential; the helper only carries the per-VM token.
 //go:build linux
 
-// lickren-proxy-helper runs inside the Linux guest and uses AF_VSOCK and Linux
+// rheic-proxy-helper runs inside the Linux guest and uses AF_VSOCK and Linux
 // device/syscall interfaces. It is deliberately not a Windows host executable.
 package main
 
@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	tokenHeader = "X-Lickren-Proxy-Token" //nolint:gosec // HTTP header name, not a credential.
+	tokenHeader = "X-Rheic-Proxy-Token" //nolint:gosec // HTTP header name, not a credential.
 	afVsock     = 40
 )
 
@@ -99,7 +99,7 @@ func newHTTPServer(listen string, handler http.Handler) *http.Server {
 }
 
 func fetchToken(ctx context.Context, transport http.RoundTripper) (string, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://broker/__lickren/proxy/token", http.NoBody)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://broker/__rheic/proxy/token", http.NoBody)
 	if err != nil {
 		return "", err
 	}

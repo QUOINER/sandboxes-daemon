@@ -229,7 +229,7 @@ func TestUnixProxySecretRefreshRotatesTokenAndRevokesChannel(t *testing.T) {
 	if err := manager.RevokeSecret("openai", "", "global"); err != nil {
 		t.Fatal(err)
 	}
-	request, _ = http.NewRequest(http.MethodGet, "http://upstream.test/__lickren/proxy/token", nil)
+	request, _ = http.NewRequest(http.MethodGet, "http://upstream.test/__rheic/proxy/token", nil)
 	if _, err := client.Do(request); err == nil {
 		t.Fatal("revoked broker still accepts requests")
 	}
@@ -337,8 +337,8 @@ func TestUnixProxyRevokeCancelsInflightRequestAndClosesChannel(t *testing.T) {
 
 func TestUnixProxyBrokerProcessDeathCancelsAndRecovers(t *testing.T) {
 	const (
-		childFlag = "LICKREN_P04_BROKER_CHILD"
-		childURL  = "LICKREN_P04_BROKER_UPSTREAM"
+		childFlag = "RHEIC_P04_BROKER_CHILD"
+		childURL  = "RHEIC_P04_BROKER_UPSTREAM"
 	)
 	if os.Getenv(childFlag) == "1" {
 		dir := filepath.Join(os.TempDir(), fmt.Sprintf("kqproxy-process-death-%d", os.Getppid()))

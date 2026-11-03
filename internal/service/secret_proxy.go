@@ -13,19 +13,19 @@ import (
 	"path/filepath"
 	"strings"
 
-	core "github.com/lickren/sandboxes-core"
-	"github.com/lickren/sandboxes-core/sandbox"
-	runtime "github.com/lickren/sandboxes-runtime"
+	core "github.com/rheic/sandboxes-core"
+	"github.com/rheic/sandboxes-core/sandbox"
+	runtime "github.com/rheic/sandboxes-runtime"
 
-	"github.com/lickren/sandboxes-daemon/internal/secretproxy"
-	"github.com/lickren/sandboxes-daemon/internal/servicesecrets"
+	"github.com/rheic/sandboxes-daemon/internal/secretproxy"
+	"github.com/rheic/sandboxes-daemon/internal/servicesecrets"
 )
 
 const (
 	proxySocketPort      = uint32(1027)
 	proxyGuestListenPort = uint16(3128)
 	proxySettingPrefix   = "sandbox.proxy-service."
-	proxyGuestHelperPath = "/tmp/lickren-proxy-helper"
+	proxyGuestHelperPath = "/tmp/rheic-proxy-helper"
 	proxyLocalV1BaseURL  = "http://127.0.0.1:3128/v1"
 )
 

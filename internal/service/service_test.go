@@ -11,14 +11,14 @@ import (
 	"testing"
 	"time"
 
-	core "github.com/lickren/sandboxes-core"
-	"github.com/lickren/sandboxes-core/operation"
-	"github.com/lickren/sandboxes-core/sandbox"
-	runtime "github.com/lickren/sandboxes-runtime"
+	core "github.com/rheic/sandboxes-core"
+	"github.com/rheic/sandboxes-core/operation"
+	"github.com/rheic/sandboxes-core/sandbox"
+	runtime "github.com/rheic/sandboxes-runtime"
 
-	"github.com/lickren/sandboxes-daemon/internal/registrycredentials"
-	"github.com/lickren/sandboxes-daemon/internal/servicesecrets"
-	"github.com/lickren/sandboxes-daemon/internal/store"
+	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
+	"github.com/rheic/sandboxes-daemon/internal/servicesecrets"
+	"github.com/rheic/sandboxes-daemon/internal/store"
 )
 
 func TestLifecycle(t *testing.T) {
@@ -250,7 +250,7 @@ func (f *fakeRuntime) Create(_ context.Context, cfg runtime.Config) (runtime.Han
 	if f.afterCreate != nil {
 		f.afterCreate()
 	}
-	return runtime.Handle{ID: "lickren-" + cfg.Name}, nil
+	return runtime.Handle{ID: "rheic-" + cfg.Name}, nil
 }
 func (f *fakeRuntime) CreateWithProxy(ctx context.Context, cfg *runtime.Config, helperPath string, guestPort uint16, serviceHost string) (runtime.Handle, error) {
 	f.proxyHelperPath = helperPath
@@ -308,7 +308,7 @@ func (f *fakeRuntime) Delete(ctx context.Context, _ runtime.Handle) error {
 	return f.deleteErr
 }
 func (f *fakeRuntime) Handle(name string) runtime.Handle {
-	return runtime.Handle{ID: "lickren-" + name}
+	return runtime.Handle{ID: "rheic-" + name}
 }
 
 func TestLifecycleWithRuntime(t *testing.T) {

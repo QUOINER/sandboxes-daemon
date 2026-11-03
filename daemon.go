@@ -10,17 +10,17 @@ import (
 	"path/filepath"
 	"time"
 
-	localv1 "github.com/lickren/sandboxes-api/gen/go/sandboxes/local/v1"
-	runtime "github.com/lickren/sandboxes-runtime"
+	localv1 "github.com/rheic/sandboxes-api/gen/go/sandboxes/local/v1"
+	runtime "github.com/rheic/sandboxes-runtime"
 	"google.golang.org/grpc"
 
-	"github.com/lickren/sandboxes-daemon/internal/oauthsession"
-	"github.com/lickren/sandboxes-daemon/internal/registrycredentials"
-	"github.com/lickren/sandboxes-daemon/internal/secretproxy"
-	"github.com/lickren/sandboxes-daemon/internal/server"
-	"github.com/lickren/sandboxes-daemon/internal/service"
-	"github.com/lickren/sandboxes-daemon/internal/servicesecrets"
-	"github.com/lickren/sandboxes-daemon/internal/store"
+	"github.com/rheic/sandboxes-daemon/internal/oauthsession"
+	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
+	"github.com/rheic/sandboxes-daemon/internal/secretproxy"
+	"github.com/rheic/sandboxes-daemon/internal/server"
+	"github.com/rheic/sandboxes-daemon/internal/service"
+	"github.com/rheic/sandboxes-daemon/internal/servicesecrets"
+	"github.com/rheic/sandboxes-daemon/internal/store"
 )
 
 // Config is the daemon configuration.

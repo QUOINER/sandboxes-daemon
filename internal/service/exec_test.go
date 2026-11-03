@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	runtime "github.com/lickren/sandboxes-runtime"
+	runtime "github.com/rheic/sandboxes-runtime"
 
-	"github.com/lickren/sandboxes-daemon/internal/store"
+	"github.com/rheic/sandboxes-daemon/internal/store"
 )
 
 type execTestRuntime struct {

@@ -1,4 +1,4 @@
-// Package settings loads the host-side Lickren settings file.
+// Package settings loads the host-side Rheic settings file.
 package settings
 
 import (
@@ -22,16 +22,16 @@ type Values struct {
 	DockerVolumeSize     string
 }
 
-// DefaultPath returns ~/.config/lickren/settings.toml, honoring XDG_CONFIG_HOME.
+// DefaultPath returns ~/.config/rheic/settings.toml, honoring XDG_CONFIG_HOME.
 func DefaultPath() string {
 	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
-		return filepath.Join(dir, "lickren", "settings.toml")
+		return filepath.Join(dir, "rheic", "settings.toml")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return ""
 	}
-	return filepath.Join(home, ".config", "lickren", "settings.toml")
+	return filepath.Join(home, ".config", "rheic", "settings.toml")
 }
 
 // Load reads the optional settings file. A missing file is not an error.

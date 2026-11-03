@@ -12,7 +12,7 @@ import (
 	"unicode/utf8"
 )
 
-const vaultService = "com.lickren.registry-credentials.v1"
+const vaultService = "com.rheic.registry-credentials.v1"
 
 var ErrInvalidCredential = errors.New("invalid registry credential")
 var ErrNotFound = errors.New("registry credential not found")

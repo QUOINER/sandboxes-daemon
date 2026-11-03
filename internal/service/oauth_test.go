@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lickren/sandboxes-daemon/internal/oauthsession"
-	"github.com/lickren/sandboxes-daemon/internal/registrycredentials"
-	"github.com/lickren/sandboxes-daemon/internal/store"
+	"github.com/rheic/sandboxes-daemon/internal/oauthsession"
+	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
+	"github.com/rheic/sandboxes-daemon/internal/store"
 )
 
 func TestDeviceAccountLoginStoresAndLogoutRevokesHostTokens(t *testing.T) {
@@ -235,7 +235,7 @@ func TestDockerHubPATLoginValidatesAndStoresOnlyPAT(t *testing.T) {
 		clear(credential.Password)
 	}
 	for key, value := range vault.values {
-		if strings.HasPrefix(key, "com.lickren.oauth.v1/") && (strings.Contains(value, "synthetic-bearer") || strings.Contains(value, "synthetic-pat")) {
+		if strings.HasPrefix(key, "com.rheic.oauth.v1/") && (strings.Contains(value, "synthetic-bearer") || strings.Contains(value, "synthetic-pat")) {
 			t.Fatal("short-lived bearer or PAT was persisted in the OAuth account vault entry")
 		}
 	}

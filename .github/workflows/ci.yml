@@ -189,16 +189,16 @@ jobs:
       - name: Build static Linux ARM64 guest proxy helper
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' \
-            -o "$RUNNER_TEMP/lickren-proxy-helper-linux-arm64" ./cmd/lickren-proxy-helper
-          file "$RUNNER_TEMP/lickren-proxy-helper-linux-arm64"
-          sha256sum "$RUNNER_TEMP/lickren-proxy-helper-linux-arm64" > "$RUNNER_TEMP/lickren-proxy-helper-linux-arm64.sha256"
+            -o "$RUNNER_TEMP/rheic-proxy-helper-linux-arm64" ./cmd/rheic-proxy-helper
+          file "$RUNNER_TEMP/rheic-proxy-helper-linux-arm64"
+          sha256sum "$RUNNER_TEMP/rheic-proxy-helper-linux-arm64" > "$RUNNER_TEMP/rheic-proxy-helper-linux-arm64.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: sandboxes-daemon-assets-${{ github.sha }}
           path: |
             ${{ runner.temp }}/sandboxes-daemon.cdx.json
-            ${{ runner.temp }}/lickren-proxy-helper-linux-arm64
-            ${{ runner.temp }}/lickren-proxy-helper-linux-arm64.sha256
+            ${{ runner.temp }}/rheic-proxy-helper-linux-arm64
+            ${{ runner.temp }}/rheic-proxy-helper-linux-arm64.sha256
           if-no-files-found: error
           retention-days: 90
 
@@ -218,5 +218,5 @@ jobs:
           path: ${{ runner.temp }}/sandboxes-daemon-assets
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: ${{ runner.temp }}/sandboxes-daemon-assets/lickren-proxy-helper-linux-arm64
+          subject-path: ${{ runner.temp }}/sandboxes-daemon-assets/rheic-proxy-helper-linux-arm64
           sbom-path: ${{ runner.temp }}/sandboxes-daemon-assets/sandboxes-daemon.cdx.json

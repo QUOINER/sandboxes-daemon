@@ -1,4 +1,4 @@
-//go:build darwin && lickren_p04_service_live
+//go:build darwin && rheic_p04_service_live
 
 package service
 
@@ -16,17 +16,17 @@ import (
 	"testing"
 	"time"
 
-	core "github.com/lickren/sandboxes-core"
-	daemonnetwork "github.com/lickren/sandboxes-daemon/internal/network"
-	"github.com/lickren/sandboxes-daemon/internal/secretproxy"
-	"github.com/lickren/sandboxes-daemon/internal/servicesecrets"
-	"github.com/lickren/sandboxes-daemon/internal/store"
-	gateway "github.com/lickren/sandboxes-gateway"
-	rt "github.com/lickren/sandboxes-runtime"
-	"github.com/lickren/sandboxes-runtime/ctr"
+	core "github.com/rheic/sandboxes-core"
+	daemonnetwork "github.com/rheic/sandboxes-daemon/internal/network"
+	"github.com/rheic/sandboxes-daemon/internal/secretproxy"
+	"github.com/rheic/sandboxes-daemon/internal/servicesecrets"
+	"github.com/rheic/sandboxes-daemon/internal/store"
+	gateway "github.com/rheic/sandboxes-gateway"
+	rt "github.com/rheic/sandboxes-runtime"
+	"github.com/rheic/sandboxes-runtime/ctr"
 )
 
-const p04ServiceCredential = "lickren-p04-service-synthetic-credential"
+const p04ServiceCredential = "rheic-p04-service-synthetic-credential"
 
 func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 	started := time.Now()
@@ -34,7 +34,7 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		t.Skip("P-04 service-level owned-VM acceptance currently requires macOS ARM64")
 	}
 	inputs := getP04ServiceInputs(t)
-	root, err := os.MkdirTemp("/private/tmp", "lsbx-p04-service-")
+	root, err := os.MkdirTemp("/private/tmp", "rsbx-p04-service-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		}
 	})
 	defer func() {
-		evidenceDir := os.Getenv("LICKREN_P04_EVIDENCE_DIR")
+		evidenceDir := os.Getenv("RHEIC_P04_EVIDENCE_DIR")
 		if !t.Failed() || evidenceDir == "" {
 			return
 		}
@@ -237,7 +237,7 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		}
 	}()
 
-	checkEnv := `/bin/sh -c 'test "$OPENAI_API_KEY" = lickren-proxy-placeholder && test "$OPENAI_BASE_URL" = http://127.0.0.1:3128/v1'`
+	checkEnv := `/bin/sh -c 'test "$OPENAI_API_KEY" = rheic-proxy-placeholder && test "$OPENAI_BASE_URL" = http://127.0.0.1:3128/v1'`
 	if err := waitP04ServiceHelper(ctx, svc, sandboxID); err != nil {
 		t.Fatalf("guest proxy helper did not start: %v", err)
 	}
@@ -311,16 +311,16 @@ func getP04ServiceInputs(t *testing.T) p04ServiceInputs {
 		}
 		return value
 	}
-	image := os.Getenv("LICKREN_P04_IMAGE")
+	image := os.Getenv("RHEIC_P04_IMAGE")
 	if image == "" {
 		image = "docker.io/library/alpine:3.22"
 	}
 	return p04ServiceInputs{
-		containerd: get("LICKREN_P04_CONTAINERD"), ctr: get("LICKREN_P04_CTR"),
-		shim: get("LICKREN_P04_SHIM"), kernel: get("LICKREN_P04_KERNEL"),
-		rootfs: get("LICKREN_P04_ROOTFS"), helper: get("LICKREN_P04_HELPER"),
-		libkrun: get("LICKREN_P04_LIBKRUN"), gvproxy: get("LICKREN_P04_GVPROXY"),
-		daemon: get("LICKREN_P04_DAEMON"), image: image,
+		containerd: get("RHEIC_P04_CONTAINERD"), ctr: get("RHEIC_P04_CTR"),
+		shim: get("RHEIC_P04_SHIM"), kernel: get("RHEIC_P04_KERNEL"),
+		rootfs: get("RHEIC_P04_ROOTFS"), helper: get("RHEIC_P04_HELPER"),
+		libkrun: get("RHEIC_P04_LIBKRUN"), gvproxy: get("RHEIC_P04_GVPROXY"),
+		daemon: get("RHEIC_P04_DAEMON"), image: image,
 	}
 }
 
@@ -359,7 +359,7 @@ func execP04Service(ctx context.Context, svc *Service, sandboxID, command string
 func waitP04ServiceHelper(ctx context.Context, svc *Service, sandboxID string) error {
 	command := `/bin/sh -c 'i=0; while [ "$i" -lt 50 ]; do busybox nc -z -w 1 127.0.0.1 3128 2>/dev/null && exit 0; i=$((i + 1)); sleep 0.1; done; exit 1'`
 	if _, err := execP04Service(ctx, svc, sandboxID, command, nil); err != nil {
-		diagnostics, diagnosticErr := execP04Service(ctx, svc, sandboxID, `/bin/sh -c 'echo processes; busybox ps; echo helper; ls -l /tmp/lickren-proxy-helper; echo tcp; cat /proc/net/tcp; echo tcp6; cat /proc/net/tcp6; echo fds; ls -l /proc/2/fd; echo nc; busybox nc --help 2>&1'`, nil)
+		diagnostics, diagnosticErr := execP04Service(ctx, svc, sandboxID, `/bin/sh -c 'echo processes; busybox ps; echo helper; ls -l /tmp/rheic-proxy-helper; echo tcp; cat /proc/net/tcp; echo tcp6; cat /proc/net/tcp6; echo fds; ls -l /proc/2/fd; echo nc; busybox nc --help 2>&1'`, nil)
 		return fmt.Errorf("wait for guest proxy listener: %w; diagnostics=%q (diagnostic error: %v)", err, diagnostics, diagnosticErr)
 	}
 	return nil

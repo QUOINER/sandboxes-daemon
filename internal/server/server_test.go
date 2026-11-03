@@ -17,18 +17,18 @@ import (
 	"testing"
 	"time"
 
-	localv1 "github.com/lickren/sandboxes-api/gen/go/sandboxes/local/v1"
-	runtime "github.com/lickren/sandboxes-runtime"
+	localv1 "github.com/rheic/sandboxes-api/gen/go/sandboxes/local/v1"
+	runtime "github.com/rheic/sandboxes-runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/lickren/sandboxes-daemon/internal/oauthsession"
-	"github.com/lickren/sandboxes-daemon/internal/registrycredentials"
-	"github.com/lickren/sandboxes-daemon/internal/service"
-	"github.com/lickren/sandboxes-daemon/internal/store"
+	"github.com/rheic/sandboxes-daemon/internal/oauthsession"
+	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
+	"github.com/rheic/sandboxes-daemon/internal/service"
+	"github.com/rheic/sandboxes-daemon/internal/store"
 )
 
 type graceBackend struct{ grace time.Duration }
