@@ -38,7 +38,7 @@ func validateDockerVolumeOwner(info os.FileInfo, requireSingleLink bool) error {
 	if int(stat.Uid) != os.Getuid() {
 		return errors.New("must be owned by the daemon user")
 	}
-	if requireSingleLink && int64(stat.Nlink) != 1 {
+	if requireSingleLink && stat.Nlink != 1 {
 		return errors.New("must have exactly one hard link")
 	}
 	return nil
