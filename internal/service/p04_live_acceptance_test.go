@@ -34,7 +34,7 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		t.Skip("P-04 service-level owned-VM acceptance currently requires macOS ARM64")
 	}
 	inputs := getP04ServiceInputs(t)
-	root, err := os.MkdirTemp("/private/tmp", "qsbx-p04-service-")
+	root, err := os.MkdirTemp("/private/tmp", "ksbx-p04-service-")
 	if err != nil {
 		t.Fatal(err)
 	}

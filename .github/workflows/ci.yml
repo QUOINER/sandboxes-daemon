@@ -32,6 +32,8 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test -race -count=1 ./...
+      - name: Fuzz smoke
+        run: go test -run=^$ -fuzz=Fuzz -fuzztime=30s ./internal/oauthsession
       - name: Install analyzers
         run: |
           go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
@@ -72,3 +74,22 @@ jobs:
         run: go build ./...
       - name: Test Windows IPC and state security contracts
         run: go test -count=1 ./...
+
+  attest:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: go
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sandboxes-daemon-assets-${{ github.sha }}
+          path: ${{ runner.temp }}/sandboxes-daemon-assets
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/sandboxes-daemon-assets/klorq-proxy-helper-linux-arm64
+          sbom-path: ${{ runner.temp }}/sandboxes-daemon-assets/sandboxes-daemon.cdx.json
