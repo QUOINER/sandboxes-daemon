@@ -509,7 +509,8 @@ func TestCreateIdempotencyReplayAndConflict(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	backend := &fakeRuntime{}
 	svc := New(st, backend)
-	req := CreateRequest{Name: "dev", IdempotencyKey: "key", Workspace: "/fixture"}
+	workspace := filepath.Join(t.TempDir(), "fixture")
+	req := CreateRequest{Name: "dev", IdempotencyKey: "key", Workspace: workspace}
 	first, err := svc.Create(ctx, req)
 	if err != nil {
 		t.Fatal(err)
@@ -518,14 +519,14 @@ func TestCreateIdempotencyReplayAndConflict(t *testing.T) {
 	if err != nil || first.ID != second.ID || backend.created != 1 {
 		t.Fatalf("idempotent replay: first=%s second=%s created=%d err=%v", first.ID, second.ID, backend.created, err)
 	}
-	req.Workspace = "/different"
+	req.Workspace = filepath.Join(t.TempDir(), "different")
 	if _, err := svc.Create(ctx, req); !errors.Is(err, core.ErrConflict) || backend.created != 1 {
 		t.Fatalf("different request accepted or reached runtime: %v", err)
 	}
 	if _, err := svc.Delete(ctx, first.SandboxID, true); err != nil {
 		t.Fatal(err)
 	}
-	req.Workspace = "/fixture"
+	req.Workspace = workspace
 	if _, err := svc.Create(ctx, req); !errors.Is(err, core.ErrConflict) || backend.created != 1 {
 		t.Fatalf("key reused after deletion: %v", err)
 	}
@@ -680,18 +681,20 @@ func TestCreatePassesWorkspacesAndStoresThem(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	backend := &fakeRuntime{}
 	svc := New(st, backend)
+	work := filepath.Join(t.TempDir(), "work")
+	docs := filepath.Join(t.TempDir(), "docs")
 	op, err := svc.Create(ctx, CreateRequest{Name: "multi", Agent: "shell", Detached: true, Workspaces: []sandbox.Workspace{
-		{Path: "/work"}, {Path: "/docs", ReadOnly: true},
+		{Path: work}, {Path: docs, ReadOnly: true},
 	}, Ports: []sandbox.Port{{Host: 8080, Guest: 3000}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(backend.lastConfig.Workspaces) != 2 || !backend.lastConfig.Workspaces[1].ReadOnly ||
-		backend.lastConfig.Workspace != "/work" || len(backend.lastConfig.Ports) != 1 || backend.lastConfig.Ports[0].Host != 8080 {
+		backend.lastConfig.Workspace != work || len(backend.lastConfig.Ports) != 1 || backend.lastConfig.Ports[0].Host != 8080 {
 		t.Fatalf("runtime config=%+v", backend.lastConfig)
 	}
 	sb, err := svc.Get(ctx, op.SandboxID)
-	if err != nil || len(sb.Workspaces) != 2 || sb.Workspace != "/work" || !sb.Workspaces[1].ReadOnly ||
+	if err != nil || len(sb.Workspaces) != 2 || sb.Workspace != work || !sb.Workspaces[1].ReadOnly ||
 		len(sb.Ports) != 1 || sb.Ports[0].Guest != 3000 || sb.Meta == nil || sb.Meta.Agent != "shell" || !sb.Meta.Detached {
 		t.Fatalf("sandbox=%+v err=%v", sb, err)
 	}

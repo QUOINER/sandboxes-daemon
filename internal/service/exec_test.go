@@ -37,7 +37,8 @@ func TestExecStartsStoppedVMAndDefaultsToWorkspace(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	backend := &immediateExecRuntime{}
 	svc := New(st, backend)
-	op, err := svc.Create(ctx, CreateRequest{Name: "owned", Workspace: "/workspace"})
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	op, err := svc.Create(ctx, CreateRequest{Name: "owned", Workspace: workspace})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,8 +48,8 @@ func TestExecStartsStoppedVMAndDefaultsToWorkspace(t *testing.T) {
 	if _, err := svc.Exec(ctx, op.SandboxID, runtime.ExecRequest{Argv: []string{"true"}}); err != nil {
 		t.Fatal(err)
 	}
-	if backend.started != 1 || backend.workdir != "/workspace" {
-		t.Fatalf("started=%d workdir=%q", backend.started, backend.workdir)
+	if backend.started != 1 || backend.workdir != workspace {
+		t.Fatalf("started=%d workdir=%q, want %q", backend.started, backend.workdir, workspace)
 	}
 }
 

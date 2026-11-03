@@ -458,7 +458,10 @@ func RemovePrivateDir(path string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || !ownedByCurrentUser(info) {
 		return errors.New("refusing to remove a proxy directory not owned by the daemon user")
 	}
-	return os.Remove(path)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // RemoveStaleSocket removes a socket owned by this daemon user when no process

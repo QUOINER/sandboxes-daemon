@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 
@@ -91,6 +92,12 @@ func TestProxyEnvironmentUsesHostBrokerAndSurvivesRestart(t *testing.T) {
 		Image: "alpine:3.22",
 		Env:   map[string]string{"OPENAI_API_KEY": "${proxy:openai}"},
 	})
+	if goruntime.GOOS == "windows" {
+		if !errors.Is(err, core.ErrConflict) || backend.created != 0 {
+			t.Fatalf("unsupported Windows proxy was not rejected before runtime start: err=%v created=%d", err, backend.created)
+		}
+		return
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
