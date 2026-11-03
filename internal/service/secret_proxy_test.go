@@ -11,12 +11,12 @@ import (
 	"strings"
 	"testing"
 
-	core "github.com/quoiner/sandboxes-core"
-	runtime "github.com/quoiner/sandboxes-runtime"
+	core "github.com/lickren/sandboxes-core"
+	runtime "github.com/lickren/sandboxes-runtime"
 
-	"github.com/quoiner/sandboxes-daemon/internal/secretproxy"
-	"github.com/quoiner/sandboxes-daemon/internal/servicesecrets"
-	"github.com/quoiner/sandboxes-daemon/internal/store"
+	"github.com/lickren/sandboxes-daemon/internal/secretproxy"
+	"github.com/lickren/sandboxes-daemon/internal/servicesecrets"
+	"github.com/lickren/sandboxes-daemon/internal/store"
 )
 
 func TestStripProxyCreateEnv(t *testing.T) {

@@ -1,13 +1,13 @@
-module github.com/quoiner/sandboxes-daemon
+module github.com/lickren/sandboxes-daemon
 
 go 1.27
 
 require (
 	github.com/Microsoft/go-winio v0.6.4
-	github.com/quoiner/sandboxes-api v0.0.12
-	github.com/quoiner/sandboxes-core v0.0.9
-	github.com/quoiner/sandboxes-gateway v0.0.11
-	github.com/quoiner/sandboxes-runtime v0.0.20
+	github.com/lickren/sandboxes-api v0.0.13
+	github.com/lickren/sandboxes-core v0.0.10
+	github.com/lickren/sandboxes-gateway v0.0.12
+	github.com/lickren/sandboxes-runtime v0.0.21
 	github.com/zalando/go-keyring v0.2.6
 	golang.org/x/sys v0.49.0
 	google.golang.org/grpc v1.85.0

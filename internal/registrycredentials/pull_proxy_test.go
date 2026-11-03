@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/quoiner/sandboxes-gateway/registryauth"
+	"github.com/lickren/sandboxes-gateway/registryauth"
 )
 
 func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {

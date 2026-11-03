@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/Microsoft/go-winio"
-	localv1 "github.com/quoiner/sandboxes-api/gen/go/sandboxes/local/v1"
+	localv1 "github.com/lickren/sandboxes-api/gen/go/sandboxes/local/v1"
 	"golang.org/x/sys/windows"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -36,7 +36,7 @@ func TestWindowsDaemonPipePathIsPerUserAndStable(t *testing.T) {
 	if !strings.HasPrefix(strings.ToLower(first), strings.ToLower(daemonPipePrefix)) || first == second || first != stable {
 		t.Fatalf("unexpected named-pipe identities: first=%q second=%q", first, second)
 	}
-	explicit := `\\.\pipe\quoiner-explicit-test`
+	explicit := `\\.\pipe\lickren-explicit-test`
 	got, _, err := daemonPipePath(explicit)
 	if err != nil {
 		t.Fatal(err)

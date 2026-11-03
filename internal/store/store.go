@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	core "github.com/quoiner/sandboxes-core"
-	"github.com/quoiner/sandboxes-core/operation"
-	"github.com/quoiner/sandboxes-core/sandbox"
+	core "github.com/lickren/sandboxes-core"
+	"github.com/lickren/sandboxes-core/operation"
+	"github.com/lickren/sandboxes-core/sandbox"
 	_ "modernc.org/sqlite"
 )
 

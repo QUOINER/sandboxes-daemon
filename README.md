@@ -1,5 +1,9 @@
 # sandboxes-daemon
 
+## Import path migration
+
+The canonical Go module path is now `github.com/lickren/sandboxes-daemon` (previously `github.com/quoiner/sandboxes-daemon`). Update imports and `go.mod` requirements when moving to a release that includes this change. The old module path is not kept as a compatibility alias.
+
 Policy updates use atomic single-rule mutations. The legacy whole-policy
 replacement RPC is rejected to prevent stale clients from restoring revoked
 rules; clients must upgrade with the coordinated API and SDK release.

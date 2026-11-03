@@ -7,18 +7,18 @@ import (
 	"fmt"
 	"time"
 
-	localv1 "github.com/quoiner/sandboxes-api/gen/go/sandboxes/local/v1"
-	apiversion "github.com/quoiner/sandboxes-api/version"
-	core "github.com/quoiner/sandboxes-core"
-	"github.com/quoiner/sandboxes-core/operation"
-	"github.com/quoiner/sandboxes-core/sandbox"
+	localv1 "github.com/lickren/sandboxes-api/gen/go/sandboxes/local/v1"
+	apiversion "github.com/lickren/sandboxes-api/version"
+	core "github.com/lickren/sandboxes-core"
+	"github.com/lickren/sandboxes-core/operation"
+	"github.com/lickren/sandboxes-core/sandbox"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/quoiner/sandboxes-daemon/internal/registrycredentials"
-	"github.com/quoiner/sandboxes-daemon/internal/service"
-	"github.com/quoiner/sandboxes-daemon/internal/version"
+	"github.com/lickren/sandboxes-daemon/internal/registrycredentials"
+	"github.com/lickren/sandboxes-daemon/internal/service"
+	"github.com/lickren/sandboxes-daemon/internal/version"
 )
 
 const defaultAccountProvider = "docker"
@@ -84,7 +84,7 @@ func (s *AccountServer) Login(ctx context.Context, req *localv1.AccountServiceLo
 			return nil, status.Error(codes.FailedPrecondition, "OAuth provider is not configured on this daemon")
 		}
 		if errors.Is(err, service.ErrOAuthPartialLogin) {
-			return nil, status.Error(codes.FailedPrecondition, "OAuth login may have partially completed; run qsbx logout before retrying")
+			return nil, status.Error(codes.FailedPrecondition, "OAuth login may have partially completed; run lsbx logout before retrying")
 		}
 		return nil, status.Error(codes.FailedPrecondition, "OAuth login failed; no credentials were returned")
 	}
@@ -141,7 +141,7 @@ func accountLoginError(err error) error {
 		return status.Error(codes.FailedPrecondition, "OAuth provider is not configured on this daemon")
 	}
 	if errors.Is(err, service.ErrOAuthPartialLogin) {
-		return status.Error(codes.FailedPrecondition, "OAuth login may have partially completed; run qsbx logout before retrying")
+		return status.Error(codes.FailedPrecondition, "OAuth login may have partially completed; run lsbx logout before retrying")
 	}
 	return status.Error(codes.FailedPrecondition, "OAuth login failed; no credentials were returned")
 }
@@ -160,7 +160,7 @@ func (s *AccountServer) LoginWithPAT(ctx context.Context, req *localv1.AccountSe
 		case errors.Is(err, service.ErrOAuthCredentialConflict):
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		case errors.Is(err, service.ErrOAuthPartialLogin):
-			return nil, status.Error(codes.FailedPrecondition, "Docker login may have partially completed; run qsbx logout before retrying")
+			return nil, status.Error(codes.FailedPrecondition, "Docker login may have partially completed; run lsbx logout before retrying")
 		default:
 			return nil, status.Error(codes.Unavailable, "Docker Hub login could not be completed")
 		}

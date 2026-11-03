@@ -9,7 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  go:
+  dependencies:
+    name: Dependencies
     runs-on: ubuntu-latest
     env:
       GOTOOLCHAIN: local
@@ -19,37 +20,178 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: true
+      - name: Download and verify dependencies
+        run: go mod download && go mod verify
+
+  tidy:
+    name: Module Tidy
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Check module files are tidy
+        run: go mod tidy && git diff --exit-code -- go.mod go.sum
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Build packages
+        run: go build ./...
+
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l .)"
+
+  vet:
+    name: Vet
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Run go vet
+        run: go vet ./...
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Run race tests
+        run: go test -race -count=1 ./...
+
+  fuzz-smoke:
+    name: Fuzz Smoke
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Run fuzz smoke
+        run: go test -run=^$ -fuzz=Fuzz -fuzztime=30s ./internal/oauthsession
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Install pinned analyzers
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Run strict lint
+        run: |
+          golangci-lint config verify
+          golangci-lint run ./...
+
+  vulnerability:
+    name: Vulnerability
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+      - name: Scan reachable vulnerabilities
+        run: '$(go env GOPATH)/bin/govulncheck ./...'
+
+  windows-build:
+    name: Windows Build
+    runs-on: windows-2022
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Build Windows packages
+        run: go build ./...
+
+  windows-test:
+    name: Windows Test
+    runs-on: windows-2022
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Run Windows tests
+        run: go test -count=1 ./...
+
+  sbom:
+    name: Sbom
+    runs-on: ubuntu-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Install CycloneDX generator
+        run: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
+      - name: Generate module SBOM
+        run: cyclonedx-gomod mod -json -licenses -test -type library -output "$RUNNER_TEMP/sandboxes-daemon.cdx.json" .
       - name: Build static Linux ARM64 guest proxy helper
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' \
             -o "$RUNNER_TEMP/klorq-proxy-helper-linux-arm64" ./cmd/klorq-proxy-helper
           file "$RUNNER_TEMP/klorq-proxy-helper-linux-arm64"
-          sha256sum "$RUNNER_TEMP/klorq-proxy-helper-linux-arm64" \
-            > "$RUNNER_TEMP/klorq-proxy-helper-linux-arm64.sha256"
-      - name: Format
-        run: test -z "$(gofmt -l .)"
-      - name: Vet
-        run: go vet ./...
-      - name: Test
-        run: go test -race -count=1 ./...
-      - name: Fuzz smoke
-        run: go test -run=^$ -fuzz=Fuzz -fuzztime=30s ./internal/oauthsession
-      - name: Install analyzers
-        run: |
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
-          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-      - name: Lint
-        run: |
-          golangci-lint config verify
-          golangci-lint run ./...
-      - name: Vulnerability check
-        run: govulncheck ./...
-      - name: Generate CycloneDX module SBOM
-        run: |
-          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
-          cyclonedx-gomod mod -json -licenses -test -type library \
-            -output "$RUNNER_TEMP/sandboxes-daemon.cdx.json" .
+          sha256sum "$RUNNER_TEMP/klorq-proxy-helper-linux-arm64" > "$RUNNER_TEMP/klorq-proxy-helper-linux-arm64.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: sandboxes-daemon-assets-${{ github.sha }}
@@ -60,24 +202,9 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
-  windows:
-    runs-on: windows-2022
-    env:
-      GOTOOLCHAIN: local
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.27.3'
-          cache: true
-      - name: Build
-        run: go build ./...
-      - name: Test Windows IPC and state security contracts
-        run: go test -count=1 ./...
-
   attest:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: go
+    needs: sbom
     runs-on: ubuntu-latest
     permissions:
       actions: read
