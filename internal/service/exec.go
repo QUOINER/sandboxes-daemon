@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
-	core "github.com/lickren/sandboxes-core"
-	"github.com/lickren/sandboxes-core/operation"
-	"github.com/lickren/sandboxes-core/sandbox"
-	runtime "github.com/lickren/sandboxes-runtime"
+	core "github.com/rheic/sandboxes-core"
+	"github.com/rheic/sandboxes-core/operation"
+	"github.com/rheic/sandboxes-core/sandbox"
+	runtime "github.com/rheic/sandboxes-runtime"
 
-	"github.com/lickren/sandboxes-daemon/internal/servicesecrets"
+	"github.com/rheic/sandboxes-daemon/internal/servicesecrets"
 )
 
 type execSession struct {
@@ -236,7 +236,7 @@ func (s *Service) resolveProxyEnvEntry(ctx context.Context, sb sandbox.Sandbox, 
 	if err != nil || configured != name {
 		return "", current, fmt.Errorf("%w: sandbox was not created with the %s proxy channel", core.ErrConflict, name)
 	}
-	return key + "=klorq-proxy-placeholder", name, nil
+	return key + "=rheic-proxy-placeholder", name, nil
 }
 
 func (s *Service) resolveSecretReference(ctx context.Context, sb sandbox.Sandbox, key, value string) (string, error) {

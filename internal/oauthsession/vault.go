@@ -8,10 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lickren/sandboxes-daemon/internal/registrycredentials"
+	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
 )
 
-const oauthVaultService = "com.klorq.oauth.v1"
+const oauthVaultService = "com.rheic.oauth.v1"
 
 var ErrNoTokens = errors.New("OAuth tokens are not stored")
 var ErrNoCredentialFingerprint = errors.New("OAuth credential fingerprint is not stored")

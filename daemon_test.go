@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	localv1 "github.com/lickren/sandboxes-api/gen/go/sandboxes/local/v1"
+	localv1 "github.com/rheic/sandboxes-api/gen/go/sandboxes/local/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -57,7 +57,7 @@ func TestRunStartsAndStops(t *testing.T) {
 }
 
 func TestRunShutdownClosesActiveWatch(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "lsbx-watch-test-")
+	dir, err := os.MkdirTemp("/tmp", "rsbx-watch-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestRunShutdownClosesActiveWatch(t *testing.T) {
 }
 
 func TestRunReportsCleanupErrorBeforeReleasingStateLock(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "lsbx-cleanup-test-")
+	dir, err := os.MkdirTemp("/tmp", "rsbx-cleanup-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestEnsureSocketAvailablePreservesExistingObjects(t *testing.T) {
 }
 
 func TestEnsureSocketAvailablePreservesSocketAndSymlink(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "lsbx-socket-test-")
+	dir, err := os.MkdirTemp("/tmp", "rsbx-socket-test-")
 	if err != nil {
 		t.Fatal(err)
 	}

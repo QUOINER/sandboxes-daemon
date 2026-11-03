@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"time"
 
-	gateway "github.com/lickren/sandboxes-gateway"
-	"github.com/lickren/sandboxes-gateway/policy"
-	runtime "github.com/lickren/sandboxes-runtime"
+	gateway "github.com/rheic/sandboxes-gateway"
+	"github.com/rheic/sandboxes-gateway/policy"
+	runtime "github.com/rheic/sandboxes-runtime"
 )
 
 // Manager is the subset of the gateway manager used by the adapter.

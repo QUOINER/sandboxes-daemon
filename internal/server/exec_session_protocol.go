@@ -5,9 +5,9 @@ import (
 	"errors"
 	"io"
 
-	runtime "github.com/lickren/sandboxes-runtime"
+	runtime "github.com/rheic/sandboxes-runtime"
 
-	localv1 "github.com/lickren/sandboxes-api/gen/go/sandboxes/local/v1"
+	localv1 "github.com/rheic/sandboxes-api/gen/go/sandboxes/local/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

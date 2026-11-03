@@ -7,7 +7,7 @@ build:
 
 build-proxy-helper:
 	mkdir -p bin
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o bin/klorq-proxy-helper-linux-arm64 ./cmd/klorq-proxy-helper
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o bin/rheic-proxy-helper-linux-arm64 ./cmd/rheic-proxy-helper
 
 test:
 	go test -race -count=1 ./...

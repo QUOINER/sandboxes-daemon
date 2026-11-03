@@ -24,17 +24,17 @@ import (
 	"time"
 	"unicode/utf8"
 
-	core "github.com/lickren/sandboxes-core"
-	"github.com/lickren/sandboxes-core/operation"
-	"github.com/lickren/sandboxes-core/sandbox"
-	gatewaypolicy "github.com/lickren/sandboxes-gateway/policy"
-	runtime "github.com/lickren/sandboxes-runtime"
+	core "github.com/rheic/sandboxes-core"
+	"github.com/rheic/sandboxes-core/operation"
+	"github.com/rheic/sandboxes-core/sandbox"
+	gatewaypolicy "github.com/rheic/sandboxes-gateway/policy"
+	runtime "github.com/rheic/sandboxes-runtime"
 
-	"github.com/lickren/sandboxes-daemon/internal/oauthsession"
-	"github.com/lickren/sandboxes-daemon/internal/registrycredentials"
-	"github.com/lickren/sandboxes-daemon/internal/secretproxy"
-	"github.com/lickren/sandboxes-daemon/internal/servicesecrets"
-	"github.com/lickren/sandboxes-daemon/internal/store"
+	"github.com/rheic/sandboxes-daemon/internal/oauthsession"
+	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
+	"github.com/rheic/sandboxes-daemon/internal/secretproxy"
+	"github.com/rheic/sandboxes-daemon/internal/servicesecrets"
+	"github.com/rheic/sandboxes-daemon/internal/store"
 )
 
 const (

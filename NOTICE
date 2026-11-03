@@ -1,7 +1,7 @@
-Klorq SandBoxes sandboxes-daemon
-Copyright 2026 Klorq contributors
+Rheic SandBoxes sandboxes-daemon
+Copyright 2026 Rheic contributors
 
-This product includes software developed by the Klorq contributors.
+This product includes software developed by the Rheic contributors.
 Third-party dependency licenses are recorded in the module SBOM.
 
 modernc.org/mathutil

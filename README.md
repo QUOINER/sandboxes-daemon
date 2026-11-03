@@ -2,7 +2,7 @@
 
 ## Import path migration
 
-The canonical Go module path is now `github.com/lickren/sandboxes-daemon` (previously `github.com/quoiner/sandboxes-daemon`). Update imports and `go.mod` requirements when moving to a release that includes this change. The old module path is not kept as a compatibility alias.
+The canonical Go module path is now `github.com/rheic/sandboxes-daemon` (previously `github.com/quoiner/sandboxes-daemon`). Update imports and `go.mod` requirements when moving to a release that includes this change. The old module path is not kept as a compatibility alias.
 
 Policy updates use atomic single-rule mutations. The legacy whole-policy
 replacement RPC is rejected to prevent stale clients from restoring revoked
@@ -49,7 +49,7 @@ sandboxesd --state "$HOME/.sandboxes" \
   --image docker.io/library/alpine:3.22
 ```
 
-`--settings` defaults to `~/.config/klorq/settings.toml`. Supported overrides
+`--settings` defaults to `~/.config/rheic/settings.toml`. Supported overrides
 are `dns_upstream`, `default_policy_profile`, `default_cpus`,
 `default_memory_mib` and `docker_volume_size`. The file is strict, mode-checked
 and never contains secrets. DNS and existing gateways need a daemon restart;
@@ -57,7 +57,7 @@ new sandboxes use the policy profile and resource defaults.
 
 Service proxy references require the matching static guest helper artifact.
 Build it with `make build-proxy-helper` and pass
-`--proxy-helper ./bin/klorq-proxy-helper-linux-arm64` to `sandboxesd`. The
+`--proxy-helper ./bin/rheic-proxy-helper-linux-arm64` to `sandboxesd`. The
 daemon accepts only a static Linux ARM64 ELF helper. If the helper is absent,
 `${proxy:service}` fails closed. Proxy-enabled sandboxes currently support one
 service per sandbox and require an image with `/bin/sh`.
@@ -101,5 +101,5 @@ all-sandboxes registry scopes, and records a non-authenticating fingerprint so
 logout removes only credentials created by that account flow. Existing registry
 entries are not overwritten. Docker account login uses the Docker public
 device-flow client ID embedded in Docker CLI and the installed Docker
-Sandboxes `sbx` binary. No Klorq OAuth registration is needed. Browser launch
+Sandboxes `sbx` binary. No Rheic OAuth registration is needed. Browser launch
 is supported on macOS; other platforms return unsupported.

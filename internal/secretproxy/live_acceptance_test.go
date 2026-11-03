@@ -1,4 +1,4 @@
-//go:build klorq_p04_live
+//go:build rheic_p04_live
 
 package secretproxy
 
@@ -20,13 +20,13 @@ import (
 	"testing"
 	"time"
 
-	daemonnetwork "github.com/lickren/sandboxes-daemon/internal/network"
-	gateway "github.com/lickren/sandboxes-gateway"
-	rt "github.com/lickren/sandboxes-runtime"
-	"github.com/lickren/sandboxes-runtime/ctr"
+	daemonnetwork "github.com/rheic/sandboxes-daemon/internal/network"
+	gateway "github.com/rheic/sandboxes-gateway"
+	rt "github.com/rheic/sandboxes-runtime"
+	"github.com/rheic/sandboxes-runtime/ctr"
 )
 
-const liveSecret = "klorq-p04-synthetic-fixture-credential"
+const liveSecret = "rheic-p04-synthetic-fixture-credential"
 
 func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 	testStarted := time.Now()
@@ -34,7 +34,7 @@ func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 		t.Skip("P-04 owned-VM acceptance currently requires macOS ARM64")
 	}
 	inputs := getLiveInputs(t)
-	root, err := os.MkdirTemp("/private/tmp", "lsbx-p04-vsock-")
+	root, err := os.MkdirTemp("/private/tmp", "rsbx-p04-vsock-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 		if !t.Failed() {
 			return
 		}
-		evidenceDir := os.Getenv("KLORQ_P04_EVIDENCE_DIR")
+		evidenceDir := os.Getenv("RHEIC_P04_EVIDENCE_DIR")
 		if evidenceDir == "" {
 			return
 		}
@@ -249,7 +249,7 @@ func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 	}()
 
 	cfgA := rt.Config{Name: nameA, Image: inputs.image, CPUs: 2, MemoryMiB: 1024, ProxyPort: 1027, ProxySocket: socketA, Env: []string{
-		"OPENAI_API_KEY=klorq-proxy-placeholder",
+		"OPENAI_API_KEY=rheic-proxy-placeholder",
 		"OPENAI_BASE_URL=http://127.0.0.1:3128/v1",
 	}}
 	handleA, err := backend.CreateWithProxy(ctx, &cfgA, inputs.helper, 3128, serviceHost)
@@ -258,7 +258,7 @@ func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 	}
 	owned = append(owned, handleA)
 
-	checkEnv := `/bin/sh -c 'test "$OPENAI_API_KEY" = klorq-proxy-placeholder && test "$OPENAI_BASE_URL" = http://127.0.0.1:3128/v1'`
+	checkEnv := `/bin/sh -c 'test "$OPENAI_API_KEY" = rheic-proxy-placeholder && test "$OPENAI_BASE_URL" = http://127.0.0.1:3128/v1'`
 	if _, err := execInVM(ctx, backend, handleA, checkEnv); err != nil {
 		t.Fatalf("VM A did not receive only proxy placeholder env: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 	request := `/bin/sh -c 'wget -T 3 -q -O - --header="Authorization: Bearer $OPENAI_API_KEY" "$OPENAI_BASE_URL/controlled"'`
 	output, err := execInVM(ctx, backend, handleA, request)
 	if err != nil || output != "controlled-upstream-ok" {
-		diagnostic, diagnosticErr := execInVM(ctx, backend, handleA, `/bin/sh -c 'printf "GET /v1/controlled HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\n\\r\\n" | busybox nc -w 2 127.0.0.1 3128 || true; ps; cat /proc/net/tcp; cat /proc/net/tcp6; ls -l /tmp/klorq-proxy-helper; ip addr show lo 2>/dev/null || true'`)
+		diagnostic, diagnosticErr := execInVM(ctx, backend, handleA, `/bin/sh -c 'printf "GET /v1/controlled HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\n\\r\\n" | busybox nc -w 2 127.0.0.1 3128 || true; ps; cat /proc/net/tcp; cat /proc/net/tcp6; ls -l /tmp/rheic-proxy-helper; ip addr show lo 2>/dev/null || true'`)
 		mu.Lock()
 		callsAtFailure := fixtureCalls
 		dialAtFailure := dialedAddress
@@ -293,7 +293,7 @@ func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 		}
 	}()
 	cfgB := rt.Config{Name: nameB, Image: inputs.image, CPUs: 2, MemoryMiB: 1024, ProxyPort: 1027, ProxySocket: filepath.Join(proxyDirB, "p.sock"), Env: []string{
-		"OPENAI_API_KEY=klorq-proxy-placeholder",
+		"OPENAI_API_KEY=rheic-proxy-placeholder",
 		"OPENAI_BASE_URL=http://127.0.0.1:3128/v1",
 	}}
 	handleB, err := backend.CreateWithProxy(ctx, &cfgB, inputs.helper, 3128, serviceHost)
@@ -431,16 +431,16 @@ func getLiveInputs(t *testing.T) liveTestInputs {
 		}
 		return value
 	}
-	image := os.Getenv("KLORQ_P04_IMAGE")
+	image := os.Getenv("RHEIC_P04_IMAGE")
 	if image == "" {
 		image = "docker.io/library/alpine:3.22"
 	}
 	return liveTestInputs{
-		containerd: get("KLORQ_P04_CONTAINERD"), ctr: get("KLORQ_P04_CTR"),
-		shim: get("KLORQ_P04_SHIM"), kernel: get("KLORQ_P04_KERNEL"),
-		rootfs: get("KLORQ_P04_ROOTFS"), helper: get("KLORQ_P04_HELPER"),
-		libkrun: get("KLORQ_P04_LIBKRUN"), gvproxy: get("KLORQ_P04_GVPROXY"),
-		daemon: get("KLORQ_P04_DAEMON"), image: image,
+		containerd: get("RHEIC_P04_CONTAINERD"), ctr: get("RHEIC_P04_CTR"),
+		shim: get("RHEIC_P04_SHIM"), kernel: get("RHEIC_P04_KERNEL"),
+		rootfs: get("RHEIC_P04_ROOTFS"), helper: get("RHEIC_P04_HELPER"),
+		libkrun: get("RHEIC_P04_LIBKRUN"), gvproxy: get("RHEIC_P04_GVPROXY"),
+		daemon: get("RHEIC_P04_DAEMON"), image: image,
 	}
 }
 

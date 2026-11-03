@@ -12,16 +12,16 @@ import (
 	"syscall"
 	"time"
 
-	gateway "github.com/lickren/sandboxes-gateway"
-	runtime "github.com/lickren/sandboxes-runtime"
-	runtimectr "github.com/lickren/sandboxes-runtime/ctr"
+	gateway "github.com/rheic/sandboxes-gateway"
+	runtime "github.com/rheic/sandboxes-runtime"
+	runtimectr "github.com/rheic/sandboxes-runtime/ctr"
 
-	daemon "github.com/lickren/sandboxes-daemon"
-	daemonnetwork "github.com/lickren/sandboxes-daemon/internal/network"
-	"github.com/lickren/sandboxes-daemon/internal/oauthsession"
-	"github.com/lickren/sandboxes-daemon/internal/service"
-	"github.com/lickren/sandboxes-daemon/internal/settings"
-	"github.com/lickren/sandboxes-daemon/internal/version"
+	daemon "github.com/rheic/sandboxes-daemon"
+	daemonnetwork "github.com/rheic/sandboxes-daemon/internal/network"
+	"github.com/rheic/sandboxes-daemon/internal/oauthsession"
+	"github.com/rheic/sandboxes-daemon/internal/service"
+	"github.com/rheic/sandboxes-daemon/internal/settings"
+	"github.com/rheic/sandboxes-daemon/internal/version"
 )
 
 type options struct {

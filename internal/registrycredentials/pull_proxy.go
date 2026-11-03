@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lickren/sandboxes-gateway/registryauth"
+	"github.com/rheic/sandboxes-gateway/registryauth"
 )
 
 // PullProxy is a host-side, read-only registry handler bound to an identity
