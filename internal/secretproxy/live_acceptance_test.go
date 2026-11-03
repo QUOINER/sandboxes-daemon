@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
-	daemonnetwork "github.com/quoiner/sandboxes-daemon/internal/network"
-	gateway "github.com/quoiner/sandboxes-gateway"
-	rt "github.com/quoiner/sandboxes-runtime"
-	"github.com/quoiner/sandboxes-runtime/ctr"
+	daemonnetwork "github.com/lickren/sandboxes-daemon/internal/network"
+	gateway "github.com/lickren/sandboxes-gateway"
+	rt "github.com/lickren/sandboxes-runtime"
+	"github.com/lickren/sandboxes-runtime/ctr"
 )
 
 const liveSecret = "klorq-p04-synthetic-fixture-credential"
@@ -34,7 +34,7 @@ func TestP04LiveVsockProxyAgainstControlledFixture(t *testing.T) {
 		t.Skip("P-04 owned-VM acceptance currently requires macOS ARM64")
 	}
 	inputs := getLiveInputs(t)
-	root, err := os.MkdirTemp("/private/tmp", "ksbx-p04-vsock-")
+	root, err := os.MkdirTemp("/private/tmp", "lsbx-p04-vsock-")
 	if err != nil {
 		t.Fatal(err)
 	}

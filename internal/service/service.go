@@ -24,17 +24,17 @@ import (
 	"time"
 	"unicode/utf8"
 
-	core "github.com/quoiner/sandboxes-core"
-	"github.com/quoiner/sandboxes-core/operation"
-	"github.com/quoiner/sandboxes-core/sandbox"
-	gatewaypolicy "github.com/quoiner/sandboxes-gateway/policy"
-	runtime "github.com/quoiner/sandboxes-runtime"
+	core "github.com/lickren/sandboxes-core"
+	"github.com/lickren/sandboxes-core/operation"
+	"github.com/lickren/sandboxes-core/sandbox"
+	gatewaypolicy "github.com/lickren/sandboxes-gateway/policy"
+	runtime "github.com/lickren/sandboxes-runtime"
 
-	"github.com/quoiner/sandboxes-daemon/internal/oauthsession"
-	"github.com/quoiner/sandboxes-daemon/internal/registrycredentials"
-	"github.com/quoiner/sandboxes-daemon/internal/secretproxy"
-	"github.com/quoiner/sandboxes-daemon/internal/servicesecrets"
-	"github.com/quoiner/sandboxes-daemon/internal/store"
+	"github.com/lickren/sandboxes-daemon/internal/oauthsession"
+	"github.com/lickren/sandboxes-daemon/internal/registrycredentials"
+	"github.com/lickren/sandboxes-daemon/internal/secretproxy"
+	"github.com/lickren/sandboxes-daemon/internal/servicesecrets"
+	"github.com/lickren/sandboxes-daemon/internal/store"
 )
 
 const (

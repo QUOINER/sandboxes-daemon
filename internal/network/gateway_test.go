@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	gateway "github.com/quoiner/sandboxes-gateway"
-	"github.com/quoiner/sandboxes-gateway/policy"
-	runtime "github.com/quoiner/sandboxes-runtime"
+	gateway "github.com/lickren/sandboxes-gateway"
+	"github.com/lickren/sandboxes-gateway/policy"
+	runtime "github.com/lickren/sandboxes-runtime"
 )
 
 type fakeManager struct {

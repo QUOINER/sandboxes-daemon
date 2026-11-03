@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quoiner/sandboxes-daemon/internal/secretproxy"
+	"github.com/lickren/sandboxes-daemon/internal/secretproxy"
 )
 
 func TestVsockConnWrapsPollableFile(t *testing.T) {

@@ -16,14 +16,14 @@ import (
 	"testing"
 	"time"
 
-	core "github.com/quoiner/sandboxes-core"
-	daemonnetwork "github.com/quoiner/sandboxes-daemon/internal/network"
-	"github.com/quoiner/sandboxes-daemon/internal/secretproxy"
-	"github.com/quoiner/sandboxes-daemon/internal/servicesecrets"
-	"github.com/quoiner/sandboxes-daemon/internal/store"
-	gateway "github.com/quoiner/sandboxes-gateway"
-	rt "github.com/quoiner/sandboxes-runtime"
-	"github.com/quoiner/sandboxes-runtime/ctr"
+	core "github.com/lickren/sandboxes-core"
+	daemonnetwork "github.com/lickren/sandboxes-daemon/internal/network"
+	"github.com/lickren/sandboxes-daemon/internal/secretproxy"
+	"github.com/lickren/sandboxes-daemon/internal/servicesecrets"
+	"github.com/lickren/sandboxes-daemon/internal/store"
+	gateway "github.com/lickren/sandboxes-gateway"
+	rt "github.com/lickren/sandboxes-runtime"
+	"github.com/lickren/sandboxes-runtime/ctr"
 )
 
 const p04ServiceCredential = "klorq-p04-service-synthetic-credential"
@@ -34,7 +34,7 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		t.Skip("P-04 service-level owned-VM acceptance currently requires macOS ARM64")
 	}
 	inputs := getP04ServiceInputs(t)
-	root, err := os.MkdirTemp("/private/tmp", "ksbx-p04-service-")
+	root, err := os.MkdirTemp("/private/tmp", "lsbx-p04-service-")
 	if err != nil {
 		t.Fatal(err)
 	}

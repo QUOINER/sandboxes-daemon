@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"time"
 
-	gateway "github.com/quoiner/sandboxes-gateway"
-	"github.com/quoiner/sandboxes-gateway/policy"
-	runtime "github.com/quoiner/sandboxes-runtime"
+	gateway "github.com/lickren/sandboxes-gateway"
+	"github.com/lickren/sandboxes-gateway/policy"
+	runtime "github.com/lickren/sandboxes-runtime"
 )
 
 // Manager is the subset of the gateway manager used by the adapter.
@@ -50,11 +50,12 @@ func (a *Adapter) Start(ctx context.Context, sandbox string, ports []runtime.Por
 		return runtime.NetworkAttachment{}, err
 	}
 	return runtime.NetworkAttachment{
-		SocketPath:  net.SocketPath,
-		MAC:         net.MAC,
-		DeviceIP:    net.DeviceIP,
-		GatewayIP:   net.GatewayIP,
-		Annotations: net.Annotations,
+		SocketPath:   net.SocketPath,
+		QEMUEndpoint: net.QEMUEndpoint,
+		MAC:          net.MAC,
+		DeviceIP:     net.DeviceIP,
+		GatewayIP:    net.GatewayIP,
+		Annotations:  net.Annotations,
 	}, nil
 }
 

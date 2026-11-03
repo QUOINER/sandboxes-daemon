@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quoiner/sandboxes-daemon/internal/oauthsession"
-	"github.com/quoiner/sandboxes-daemon/internal/registrycredentials"
-	"github.com/quoiner/sandboxes-daemon/internal/store"
+	"github.com/lickren/sandboxes-daemon/internal/oauthsession"
+	"github.com/lickren/sandboxes-daemon/internal/registrycredentials"
+	"github.com/lickren/sandboxes-daemon/internal/store"
 )
 
 func TestDeviceAccountLoginStoresAndLogoutRevokesHostTokens(t *testing.T) {

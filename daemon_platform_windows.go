@@ -18,7 +18,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const daemonPipePrefix = `\\.\pipe\quoiner-sandboxesd-`
+const daemonPipePrefix = `\\.\pipe\lickren-sandboxesd-`
 
 func listenDaemon(_ context.Context, address string) (net.Listener, error) {
 	pipe, sid, err := daemonPipePath(address)
