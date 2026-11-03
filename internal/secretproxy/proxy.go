@@ -418,6 +418,12 @@ func listenPrivateUnix(path string) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen for proxy channel: %w", err)
 	}
+	unixListener, ok := listener.(*net.UnixListener)
+	if !ok {
+		_ = listener.Close()
+		return nil, errors.New("proxy channel listener is not a Unix socket")
+	}
+	unixListener.SetUnlinkOnClose(false)
 	if err := os.Chmod(path, 0o600); err != nil {
 		_ = listener.Close()
 		return nil, fmt.Errorf("protect proxy channel socket: %w", err)
