@@ -220,3 +220,30 @@ jobs:
         with:
           subject-path: ${{ runner.temp }}/sandboxes-daemon-assets/klorq-proxy-helper-linux-arm64
           sbom-path: ${{ runner.temp }}/sandboxes-daemon-assets/sandboxes-daemon.cdx.json
+  go:
+    if: always()
+    needs:
+      - dependencies
+      - tidy
+      - build
+      - format
+      - vet
+      - test
+      - fuzz-smoke
+      - lint
+      - vulnerability
+      - windows-build
+      - windows-test
+      - sbom
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all verification jobs to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            if [[ "$result" != "success" ]]; then
+              echo "A verification job returned: $result" >&2
+              exit 1
+            fi
+          done
