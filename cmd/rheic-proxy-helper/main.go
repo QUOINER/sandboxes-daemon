@@ -95,8 +95,9 @@ func main() {
 		log.Fatal(err)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	if err := serve(ctx, listener, server); err != nil {
+	err = serve(ctx, listener, server)
+	stop()
+	if err != nil {
 		log.Fatal(err)
 	}
 }
