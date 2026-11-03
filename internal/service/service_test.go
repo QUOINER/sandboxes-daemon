@@ -1193,10 +1193,20 @@ func TestCreatePassesPrivileged(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	backend := &fakeRuntime{}
 	svc := New(st, backend)
-	svc.DockerVolumeDir = t.TempDir()
+	svc.DockerVolumeDir = filepath.Join(t.TempDir(), "docker-volumes")
+	if err := os.Mkdir(svc.DockerVolumeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	svc.DockerVolumeSize = "512m"
 	svc.MkfsExt4 = "true"
-	if _, err := svc.Create(ctx, CreateRequest{Name: "priv", Privileged: true}); err != nil {
+	_, err = svc.Create(ctx, CreateRequest{Name: "priv", Privileged: true})
+	if !dockerVolumeSecuritySupported() {
+		if err == nil || backend.created != 0 {
+			t.Fatalf("privileged create did not fail closed on unsupported volume security: err=%v created=%d", err, backend.created)
+		}
+		return
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
 	if !backend.lastConfig.Privileged {
