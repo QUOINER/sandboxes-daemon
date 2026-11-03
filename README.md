@@ -51,6 +51,13 @@ are `dns_upstream`, `default_policy_profile`, `default_cpus`,
 and never contains secrets. DNS and existing gateways need a daemon restart;
 new sandboxes use the policy profile and resource defaults.
 
+Service proxy references require the matching static guest helper artifact.
+Build it with `make build-proxy-helper` and pass
+`--proxy-helper ./bin/klorq-proxy-helper-linux-arm64` to `sandboxesd`. The
+daemon accepts only a static Linux ARM64 ELF helper. If the helper is absent,
+`${proxy:service}` fails closed. Proxy-enabled sandboxes currently support one
+service per sandbox and require an image with `/bin/sh`.
+
 Empty `--containerd` keeps the state-only control plane. With a runtime backend,
 create/start/stop/delete call the runtime adapter. With `--gvproxy`, the daemon
 also starts a default-deny gateway and attaches nerdbox network annotations;
@@ -66,15 +73,17 @@ pulls are not wired yet.
 in the host vault, scoped globally or to one sandbox. Values are held in memory
 only for the RPC and are never returned by `List`. A non-secret SQLite index
 supports listing and sandbox-scoped cleanup; the value itself never enters the
-database, logs, argv or sandbox snapshots. At exec time a whole-value `${secret:service}` environment reference is
-resolved from the host vault and passed only to that process; sandbox scope wins
-over global. A `${proxy:service}` reference is currently **fail-closed**: the host proxy is
-implemented and unit-tested, but the pinned guest network has no reliable
-guest-to-host route for an arbitrary loopback listener. The daemon returns a
-clear error instead of handing the guest an unreachable URL. The value is not written to SQLite or sandbox metadata. This is an
-explicit environment-injection mode: a guest root process can read its own
-environment, so it is weaker than Docker sbx's host proxy and is documented as
-such.
+database, logs, argv or sandbox snapshots. At exec time a whole-value
+`${secret:service}` environment reference is resolved from the host vault and
+passed only to that process; sandbox scope wins over global. The
+`${proxy:service}` Create/Start/exec path is implemented on the current feature
+branches and remains **unreleased and pending verification**. It requires
+`--proxy-helper`, a supported provider credential variable, and `/bin/sh` in the
+image. The guest gets a placeholder and provider base URL; the host broker reads
+the real value from the vault and checks sandbox network policy on each request.
+The broker refuses to replace an existing socket path and requires a private
+parent directory owned by the daemon user. The value is not written to SQLite
+or sandbox metadata.
 
 Global network rules are stored as daemon settings, merged with each sandbox's
 explicit rules at gateway start/update, and re-applied to running sandboxes on

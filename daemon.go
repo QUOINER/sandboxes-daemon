@@ -41,13 +41,15 @@ type Config struct {
 	DefaultMemoryMiB     uint32
 	DockerVolumeSize     string
 	// GatewayLost reports sandboxes whose gateway exited unexpectedly.
-	GatewayLost <-chan string
+	GatewayLost     <-chan string
+	ProxyHelperPath string
 }
 
 // configureService applies host configuration, wires credential storage and
 // starts the gateway-loss watcher.
 func configureService(ctx context.Context, cfg Config, svc *service.Service) (func() error, error) {
 	applyConfig(svc, cfg)
+	svc.SetSecretProxyRuntime(cfg.ProxyHelperPath, "/tmp")
 	credentialCleanup, err := configureCredentialStores(svc)
 	if err != nil {
 		return nil, err

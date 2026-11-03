@@ -54,6 +54,8 @@ type Service struct {
 	registryCredentials  *registrycredentials.Store
 	serviceSecrets       *servicesecrets.Store
 	secretProxies        *secretproxy.Manager
+	proxyHelperPath      string
+	proxyTempDir         string
 	oauthProviders       map[string]OAuthProvider
 	oauthVaultStore      oauthsession.Vault
 	dockerHubAuth        http.RoundTripper
@@ -342,8 +344,16 @@ func (s *Service) SetSecretProxyManager(manager *secretproxy.Manager) {
 	s.secretProxies = manager
 }
 
+// SetSecretProxyRuntime configures the static guest helper and short host-side
+// socket directory used by the per-sandbox vsock broker.
+func (s *Service) SetSecretProxyRuntime(helperPath, tempDir string) {
+	s.proxyHelperPath = helperPath
+	s.proxyTempDir = tempDir
+}
+
 // SetServiceSecret stores one service secret and a non-secret index entry.
 func (s *Service) SetServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string, value []byte) (servicesecrets.Summary, error) {
+	defer clear(value)
 	if s.serviceSecrets == nil {
 		return servicesecrets.Summary{}, errors.New("service secret store is unavailable")
 	}
@@ -361,6 +371,9 @@ func (s *Service) SetServiceSecret(ctx context.Context, service string, scope se
 	}); err != nil {
 		_, _ = s.serviceSecrets.Delete(ctx, summary.Service, summary.Scope, summary.SandboxName)
 		return servicesecrets.Summary{}, err
+	}
+	if s.secretProxies != nil {
+		s.secretProxies.RefreshSecret(summary.Service, summary.SandboxName, string(summary.Scope), value)
 	}
 	return summary, nil
 }
@@ -388,6 +401,11 @@ func (s *Service) RemoveServiceSecret(ctx context.Context, service string, scope
 	removed, err := s.serviceSecrets.Delete(ctx, service, scope, sandboxName)
 	if err != nil || !removed {
 		return removed, err
+	}
+	if s.secretProxies != nil {
+		if err := s.secretProxies.RevokeSecret(strings.ToLower(strings.TrimSpace(service)), sandboxName, string(scope)); err != nil {
+			return true, fmt.Errorf("revoke active service proxy: %w", err)
+		}
 	}
 	if err := s.store.DeleteServiceSecretIndex(ctx, strings.ToLower(strings.TrimSpace(service)), string(scope), sandboxName); err != nil {
 		return true, err
@@ -742,6 +760,13 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	if err != nil {
 		return operation.Operation{}, err
 	}
+	env, proxyServiceName, err := stripProxyCreateEnv(env)
+	if err != nil {
+		return operation.Operation{}, err
+	}
+	if proxyServiceName != "" && s.backend == nil {
+		return operation.Operation{}, fmt.Errorf("%w: service proxy requires a VM runtime", core.ErrConflict)
+	}
 	workspace, workspaces, err := normalizeCreateWorkspaces(req)
 	if err != nil {
 		return operation.Operation{}, err
@@ -753,6 +778,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	intent := createIntent{
 		name: name, image: image, workspace: workspace, workspaces: workspaces, ports: ports,
 		allow: allow, deny: deny, agent: req.Agent, detached: req.Detached, cpus: cpus, memoryMiB: memoryMiB,
+		proxyService: proxyServiceName,
 	}
 	if existing, found, err := s.replayCreateIfRequested(ctx, req.IdempotencyKey, intent); err != nil {
 		return operation.Operation{}, err
@@ -766,6 +792,12 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	sbID, err := newID("sb")
 	if err != nil {
 		return operation.Operation{}, err
+	}
+	cleanupProxy := func() error {
+		if proxyServiceName == "" {
+			return nil
+		}
+		return s.stopProxyChannel(name, sbID, true)
 	}
 	opID, err := newID("op")
 	if err != nil {
@@ -788,13 +820,19 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	}
 	state := sandbox.Stopped
 	var handle runtime.Handle
+	var proxyConfig proxyRuntimeConfig
+	if proxyServiceName != "" {
+		proxyConfig, err = s.proxyChannelConfig(ctx, sandbox.Sandbox{ID: sbID, Name: name}, proxyServiceName)
+		if err != nil {
+			return operation.Operation{}, err
+		}
+	}
 	if s.backend != nil {
 		effectiveAllow, effectiveDeny, policyErr := s.effectiveRules(ctx, allow, deny)
 		if policyErr != nil {
-			return operation.Operation{}, policyErr
+			return operation.Operation{}, errors.Join(policyErr, cleanupProxy())
 		}
-		var err error
-		handle, err = s.backend.Create(ctx, runtime.Config{
+		runtimeConfig := runtime.Config{
 			Name:         name,
 			Image:        image,
 			Workspace:    workspace,
@@ -807,18 +845,26 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 			MemoryMiB:    memoryMiB,
 			Env:          env,
 			Privileged:   req.Privileged,
-		})
+			ProxyPort:    proxyConfig.port,
+			ProxySocket:  proxyConfig.socketPath,
+		}
+		handle, err = s.createRuntimeSandbox(ctx, &runtimeConfig, proxyServiceName, proxyConfig)
 		if err != nil {
-			return operation.Operation{}, err
+			return operation.Operation{}, errors.Join(err, cleanupProxy())
 		}
 		if err := s.ensureDockerProfile(ctx, req.Privileged, handle); err != nil {
-			return operation.Operation{}, errors.Join(err, s.cleanupCreateFailure(ctx, handle, errors.New("docker profile startup failed")))
+			return operation.Operation{}, errors.Join(err, s.cleanupCreateFailure(ctx, handle, errors.New("docker profile startup failed")), cleanupProxy())
 		}
 		state = sandbox.Running
 	}
 	sb := newSandboxRecord(sbID, name, state, image, workspace, workspaces, ports, allow, deny, req.Agent, req.Detached, profile, cpus, memoryMiB, now)
 	if err := s.setDockerProfile(ctx, sbID, req.Privileged); err != nil {
-		return operation.Operation{}, s.cleanupCreateFailure(ctx, handle, err)
+		return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), cleanupProxy())
+	}
+	if proxyServiceName != "" {
+		if err := s.store.SetSetting(ctx, proxyServiceSettingKey(sbID), proxyServiceName); err != nil {
+			return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), s.stopProxyChannel(name, sbID, true))
+		}
 	}
 	op := operation.Operation{
 		ID:             opID,
@@ -831,9 +877,23 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		UpdatedAt:      now,
 	}
 	if err := s.store.CreateSandboxWithOperation(ctx, sb, op); err != nil {
-		return operation.Operation{}, s.cleanupCreateFailure(ctx, handle, err)
+		if proxyServiceName != "" {
+			_ = s.store.DeleteSetting(ctx, proxyServiceSettingKey(sbID))
+		}
+		return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), cleanupProxy())
 	}
 	return op, nil
+}
+
+func (s *Service) createRuntimeSandbox(ctx context.Context, cfg *runtime.Config, proxyService string, proxyConfig proxyRuntimeConfig) (runtime.Handle, error) {
+	if proxyService == "" {
+		return s.backend.Create(ctx, *cfg)
+	}
+	proxyBackend, ok := s.backend.(proxyRuntime)
+	if !ok {
+		return runtime.Handle{}, fmt.Errorf("%w: runtime backend does not support the service proxy helper", core.ErrConflict)
+	}
+	return proxyBackend.CreateWithProxy(ctx, cfg, proxyConfig.helperPath, proxyConfig.guestPort, proxyConfig.serviceHost)
 }
 
 func (s *Service) replayCreateIfRequested(ctx context.Context, key string, intent createIntent) (operation.Operation, bool, error) {
@@ -1651,6 +1711,9 @@ func (s *Service) startRuntimeSandbox(ctx context.Context, sb sandbox.Sandbox) e
 	if err != nil {
 		return err
 	}
+	if err := s.prepareStoredProxy(ctx, sb); err != nil {
+		return err
+	}
 	handle := s.backend.Handle(sb.Name)
 	handle.Ports = runtimePorts(sb.Ports)
 	handle.Allow = runtimeRules(allow)
@@ -1808,17 +1871,18 @@ exit 1
 }
 
 type createIntent struct {
-	name       string
-	image      string
-	workspace  string
-	workspaces []sandbox.Workspace
-	ports      []sandbox.Port
-	allow      []sandbox.NetworkRule
-	deny       []sandbox.NetworkRule
-	agent      string
-	detached   bool
-	cpus       uint32
-	memoryMiB  uint32
+	name         string
+	image        string
+	workspace    string
+	workspaces   []sandbox.Workspace
+	ports        []sandbox.Port
+	allow        []sandbox.NetworkRule
+	deny         []sandbox.NetworkRule
+	agent        string
+	detached     bool
+	cpus         uint32
+	memoryMiB    uint32
+	proxyService string
 }
 
 func (s *Service) replayCreate(ctx context.Context, key string, intent createIntent) (operation.Operation, error) {
@@ -1833,7 +1897,13 @@ func (s *Service) replayCreate(ctx context.Context, key string, intent createInt
 	if err != nil {
 		return operation.Operation{}, err
 	}
-	if op.Kind != operation.KindCreate || !matchesCreateIntent(sb, intent) {
+	proxyService, proxyErr := s.store.GetSetting(ctx, proxyServiceSettingKey(sb.ID))
+	if errors.Is(proxyErr, core.ErrNotFound) {
+		proxyService = ""
+	} else if proxyErr != nil {
+		return operation.Operation{}, proxyErr
+	}
+	if op.Kind != operation.KindCreate || !matchesCreateIntent(sb, intent) || proxyService != intent.proxyService {
 		return operation.Operation{}, fmt.Errorf("%w: idempotency key was used for a different request", core.ErrConflict)
 	}
 	return op, nil
@@ -1915,7 +1985,7 @@ func (s *Service) Start(ctx context.Context, id string) (operation.Operation, er
 		return operation.Operation{}, fmt.Errorf("%w: sandbox is being deleted", core.ErrConflict)
 	}
 	if s.backend != nil {
-		if err := s.startRuntimeSandbox(ctx, sb); err != nil {
+		if err := s.prepareSandboxForStart(ctx, sb); err != nil {
 			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 		}
 	}
@@ -1924,6 +1994,27 @@ func (s *Service) Start(ctx context.Context, id string) (operation.Operation, er
 		return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 	}
 	return op, err
+}
+
+func (s *Service) prepareSandboxForStart(ctx context.Context, sb sandbox.Sandbox) error {
+	if err := s.stopUnknownProxySandbox(ctx, sb); err != nil {
+		return err
+	}
+	return s.startRuntimeSandbox(ctx, sb)
+}
+
+func (s *Service) stopUnknownProxySandbox(ctx context.Context, sb sandbox.Sandbox) error {
+	if sb.State != sandbox.Unknown {
+		return nil
+	}
+	proxyConfigured, err := s.hasStoredProxy(ctx, sb)
+	if err != nil || !proxyConfigured {
+		return err
+	}
+	if err := s.backend.Stop(ctx, s.backend.Handle(sb.Name), 5*time.Second); err != nil {
+		return fmt.Errorf("stop unknown proxy sandbox before restart: %w", err)
+	}
+	return nil
 }
 
 // UpdatePorts replaces the stored and live published ports.
@@ -2143,10 +2234,8 @@ func (s *Service) StopWithGrace(ctx context.Context, id string, grace time.Durat
 			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 		}
 	}
-	if s.secretProxies != nil {
-		if err := s.secretProxies.StopSandbox(sb.Name); err != nil {
-			return operation.Operation{}, fmt.Errorf("stop secret proxies: %w", err)
-		}
+	if err := s.stopProxyChannel(sb.Name, sb.ID, true); err != nil {
+		return operation.Operation{}, err
 	}
 	op, err := s.apply(ctx, sb, operation.KindStop, sandbox.Stopped)
 	if err != nil && s.backend != nil {
@@ -2179,10 +2268,8 @@ func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.
 			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 		}
 	}
-	if s.secretProxies != nil {
-		if err := s.secretProxies.StopSandbox(sb.Name); err != nil {
-			return operation.Operation{}, fmt.Errorf("stop secret proxies: %w", err)
-		}
+	if err := s.stopProxyChannel(sb.Name, sb.ID, false); err != nil {
+		return operation.Operation{}, err
 	}
 	now := s.now().UTC()
 	opID, err := newID("op")
@@ -2203,6 +2290,12 @@ func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.
 			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 		}
 		return operation.Operation{}, err
+	}
+	if err := s.store.DeleteSetting(ctx, proxyServiceSettingKey(id)); err != nil {
+		return op, err
+	}
+	if err := s.stopProxyChannel(sb.Name, sb.ID, true); err != nil {
+		return op, err
 	}
 	if err := s.cleanupSandboxServiceSecrets(ctx, sb.Name); err != nil {
 		return op, err

@@ -19,12 +19,21 @@ jobs:
         with:
           go-version: '1.27.3'
           cache: true
+      - name: Build static Linux ARM64 guest proxy helper
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' \
+            -o "$RUNNER_TEMP/klorq-proxy-helper-linux-arm64" ./cmd/klorq-proxy-helper
+          file "$RUNNER_TEMP/klorq-proxy-helper-linux-arm64"
+          sha256sum "$RUNNER_TEMP/klorq-proxy-helper-linux-arm64" \
+            > "$RUNNER_TEMP/klorq-proxy-helper-linux-arm64.sha256"
       - name: Format
         run: test -z "$(gofmt -l .)"
       - name: Vet
         run: go vet ./...
       - name: Test
         run: go test -race -count=1 ./...
+      - name: Fuzz smoke
+        run: go test -run=^$ -fuzz=Fuzz -fuzztime=30s ./internal/oauthsession
       - name: Install analyzers
         run: |
           go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
@@ -36,3 +45,36 @@ jobs:
           golangci-lint run ./...
       - name: Vulnerability check
         run: govulncheck ./...
+      - name: Generate CycloneDX module SBOM
+        run: |
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
+          cyclonedx-gomod mod -json -licenses -test -type library \
+            -output "$RUNNER_TEMP/sandboxes-daemon.cdx.json" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sandboxes-daemon-assets-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/sandboxes-daemon.cdx.json
+            ${{ runner.temp }}/klorq-proxy-helper-linux-arm64
+            ${{ runner.temp }}/klorq-proxy-helper-linux-arm64.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  attest:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: go
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sandboxes-daemon-assets-${{ github.sha }}
+          path: ${{ runner.temp }}/sandboxes-daemon-assets
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/sandboxes-daemon-assets/klorq-proxy-helper-linux-arm64
+          sbom-path: ${{ runner.temp }}/sandboxes-daemon-assets/sandboxes-daemon.cdx.json
