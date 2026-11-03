@@ -65,6 +65,14 @@ github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/klauspost/compress v1.20.0 h1:a3C1ke2ohxFymNlb2HWAHjDeKCI90scRskErZkR0ezA=
 github.com/klauspost/compress v1.20.0/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
+github.com/lickren/sandboxes-api v0.0.13 h1:ApS2d9x0HqIV7J7dVlepj8fR+hv3VvoDK//dL6verPc=
+github.com/lickren/sandboxes-api v0.0.13/go.mod h1:cTZ8gO8wS8CkbdTrHWDhTecF+9rVXGamZh0WIwdpqa4=
+github.com/lickren/sandboxes-core v0.0.10 h1:1OORNs0dMmda7S1qSfxfx9TXKz0LpbHSOJhND7FKx8Q=
+github.com/lickren/sandboxes-core v0.0.10/go.mod h1:DR0cPth6KuOF3Tq31b39emJjUSHBEitE8JtP7mio208=
+github.com/lickren/sandboxes-gateway v0.0.12 h1:yiKJPRDSl38/wuxKCqtJpU3lZr2pyGptM23MkOBmA2U=
+github.com/lickren/sandboxes-gateway v0.0.12/go.mod h1:gyPjTSu9sikS0O/11e+q+n4/tcobA+y5XnnLycf0zT4=
+github.com/lickren/sandboxes-runtime v0.0.21 h1:VD+VjQ9pSbWCkeVN/G/fPCyKZdwldqomHNTDMgB9onc=
+github.com/lickren/sandboxes-runtime v0.0.21/go.mod h1:0Yw5ZmfPWopQ/LF6Qzot1b74q5pQ3C5GISmpt8StOUA=
 github.com/mattn/go-isatty v0.0.24 h1:tGZZoVgT/KiqK1c8ocVLeDS8BSWMRd47J3Lbz7vsReI=
 github.com/mattn/go-isatty v0.0.24/go.mod h1:nMCL3Zebbrt45jsMDgnfIwz6ydEQApk5oEI3HqDio6A=
 github.com/moby/locker v1.0.1 h1:fOXqR41zeveg4fFODix+1Ch4mj/gT0NE1XJbp/epuBg=
