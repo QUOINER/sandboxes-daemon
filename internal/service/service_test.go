@@ -250,7 +250,7 @@ func (f *fakeRuntime) Create(_ context.Context, cfg runtime.Config) (runtime.Han
 	if f.afterCreate != nil {
 		f.afterCreate()
 	}
-	return runtime.Handle{ID: "klorq-" + cfg.Name}, nil
+	return runtime.Handle{ID: "lickren-" + cfg.Name}, nil
 }
 func (f *fakeRuntime) CreateWithProxy(ctx context.Context, cfg *runtime.Config, helperPath string, guestPort uint16, serviceHost string) (runtime.Handle, error) {
 	f.proxyHelperPath = helperPath
@@ -307,7 +307,9 @@ func (f *fakeRuntime) Delete(ctx context.Context, _ runtime.Handle) error {
 	f.deleteCtxErr = ctx.Err()
 	return f.deleteErr
 }
-func (f *fakeRuntime) Handle(name string) runtime.Handle { return runtime.Handle{ID: "klorq-" + name} }
+func (f *fakeRuntime) Handle(name string) runtime.Handle {
+	return runtime.Handle{ID: "lickren-" + name}
+}
 
 func TestLifecycleWithRuntime(t *testing.T) {
 	ctx := context.Background()

@@ -126,7 +126,7 @@ func TestProxyEnvironmentUsesHostBrokerAndSurvivesRestart(t *testing.T) {
 	if strings.Contains(strings.Join(backend.lastExec.Env, "\n"), "sk-synthetic-proxy-secret") {
 		t.Fatalf("secret value entered guest environment: %v", backend.lastExec.Env)
 	}
-	if !containsEnv(backend.lastExec.Env, "OPENAI_API_KEY=klorq-proxy-placeholder") || !containsEnv(backend.lastExec.Env, "OPENAI_BASE_URL=http://127.0.0.1:3128/v1") {
+	if !containsEnv(backend.lastExec.Env, "OPENAI_API_KEY=lickren-proxy-placeholder") || !containsEnv(backend.lastExec.Env, "OPENAI_BASE_URL=http://127.0.0.1:3128/v1") {
 		t.Fatalf("proxy environment contract=%v", backend.lastExec.Env)
 	}
 	if _, err := svc.Delete(ctx, op.SandboxID, true); err != nil {

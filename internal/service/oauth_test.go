@@ -235,7 +235,7 @@ func TestDockerHubPATLoginValidatesAndStoresOnlyPAT(t *testing.T) {
 		clear(credential.Password)
 	}
 	for key, value := range vault.values {
-		if strings.HasPrefix(key, "com.klorq.oauth.v1/") && (strings.Contains(value, "synthetic-bearer") || strings.Contains(value, "synthetic-pat")) {
+		if strings.HasPrefix(key, "com.lickren.oauth.v1/") && (strings.Contains(value, "synthetic-bearer") || strings.Contains(value, "synthetic-pat")) {
 			t.Fatal("short-lived bearer or PAT was persisted in the OAuth account vault entry")
 		}
 	}

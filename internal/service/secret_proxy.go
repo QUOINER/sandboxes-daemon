@@ -25,7 +25,7 @@ const (
 	proxySocketPort      = uint32(1027)
 	proxyGuestListenPort = uint16(3128)
 	proxySettingPrefix   = "sandbox.proxy-service."
-	proxyGuestHelperPath = "/tmp/klorq-proxy-helper"
+	proxyGuestHelperPath = "/tmp/lickren-proxy-helper"
 	proxyLocalV1BaseURL  = "http://127.0.0.1:3128/v1"
 )
 

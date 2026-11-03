@@ -236,7 +236,7 @@ func (s *Service) resolveProxyEnvEntry(ctx context.Context, sb sandbox.Sandbox, 
 	if err != nil || configured != name {
 		return "", current, fmt.Errorf("%w: sandbox was not created with the %s proxy channel", core.ErrConflict, name)
 	}
-	return key + "=klorq-proxy-placeholder", name, nil
+	return key + "=lickren-proxy-placeholder", name, nil
 }
 
 func (s *Service) resolveSecretReference(ctx context.Context, sb sandbox.Sandbox, key, value string) (string, error) {

@@ -12,7 +12,7 @@ import (
 	keyring "github.com/zalando/go-keyring"
 )
 
-const vaultService = "com.klorq.service-secrets.v1"
+const vaultService = "com.lickren.service-secrets.v1"
 
 var (
 	ErrInvalid  = errors.New("invalid service secret")
