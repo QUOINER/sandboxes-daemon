@@ -60,7 +60,7 @@ Build it with `make build-proxy-helper` and pass
 `--proxy-helper ./bin/rheic-proxy-helper-linux-arm64` to `sandboxesd`. The
 daemon accepts only a static Linux ARM64 ELF helper. If the helper is absent,
 `${proxy:service}` fails closed. Proxy-enabled sandboxes currently support one
-service per sandbox and require an image with `/bin/sh`.
+service per sandbox.
 
 Empty `--containerd` keeps the state-only control plane. With a runtime backend,
 create/start/stop/delete call the runtime adapter. With `--gvproxy`, the daemon
@@ -82,8 +82,8 @@ database, logs, argv or sandbox snapshots. At exec time a whole-value
 passed only to that process; sandbox scope wins over global. The
 `${proxy:service}` Create/Start/exec path is implemented on the current feature
 branches and remains **unreleased and pending verification**. It requires
-`--proxy-helper`, a supported provider credential variable, and `/bin/sh` in the
-image. The guest gets a placeholder and provider base URL; the host broker reads
+`--proxy-helper` and a supported provider credential variable; the guest image
+does not need `/bin/sh`. The guest gets a placeholder and provider base URL; the host broker reads
 the real value from the vault and checks sandbox network policy on each request.
 The broker refuses to replace an existing socket path and requires a private
 parent directory owned by the daemon user. The value is not written to SQLite
