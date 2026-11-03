@@ -147,15 +147,7 @@ func (m *Manager) StartUnix(ctx context.Context, sandbox, service string, cfg Se
 	}
 	reverse := httputil.NewSingleHostReverseProxy(upstream)
 	reverse.Transport = outboundTransport(upstream.Scheme == "https", m.dialContext)
-	reverse.ModifyResponse = func(response *http.Response) error {
-		if response.ContentLength > maxResponseBody {
-			return errResponseTooLarge
-		}
-		if response.Body != nil {
-			response.Body = &boundedResponseBody{body: response.Body, remaining: maxResponseBody}
-		}
-		return nil
-	}
+	reverse.ModifyResponse = enforceResponseLimit
 	reverse.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 		http.Error(w, "proxy upstream unavailable", http.StatusBadGateway)
 	}
@@ -172,6 +164,16 @@ func (m *Manager) StartUnix(ctx context.Context, sandbox, service string, cfg Se
 	m.mu.Unlock()
 	go func() { _ = srv.Serve(listener) }()
 	return p.url, nil
+}
+
+func enforceResponseLimit(response *http.Response) error {
+	if response.ContentLength > maxResponseBody {
+		return errResponseTooLarge
+	}
+	if response.Body != nil {
+		response.Body = &boundedResponseBody{body: response.Body, remaining: maxResponseBody}
+	}
+	return nil
 }
 
 func proxyHandler(service string, p *proxy, reverse *httputil.ReverseProxy) http.Handler {
