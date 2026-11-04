@@ -8,8 +8,12 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,8 +21,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -103,19 +109,25 @@ func main() {
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	err := serveConfigured(ctx, *listen, *serviceHost, routes, transport)
+	err := serveConfigured(ctx, *listen, *serviceHost, routes, transport, dial)
 	stop()
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func serveConfigured(ctx context.Context, listen, serviceHost string, routes []string, transport http.RoundTripper) error {
+func serveConfigured(ctx context.Context, listen, serviceHost string, routes []string, transport http.RoundTripper, rawDial ...func(context.Context) (net.Conn, error)) error {
+	dialTunnel := firstTunnelDialer(rawDial)
+	if dialTunnel != nil {
+		if err := bootstrapProxyTrust(ctx, serviceHost, routes, transport); err != nil {
+			return fmt.Errorf("bootstrap registry proxy trust: %w", err)
+		}
+	}
 	if len(routes) == 0 {
 		if serviceHost == "" {
 			return errors.New("service-host is required when no routes are configured")
 		}
-		return runSingle(ctx, listen, serviceHost, transport)
+		return runSingle(ctx, listen, serviceHost, transport, dialTunnel)
 	}
 	if serviceHost != "" || listen != "127.0.0.1:0" || len(routes) < 2 || len(routes) > 32 {
 		return errors.New("multi-route mode requires two to 32 routes and no legacy listener or service host")
@@ -137,20 +149,147 @@ func serveConfigured(ctx context.Context, listen, serviceHost string, routes []s
 			closeProxyServers(servers)
 			return fmt.Errorf("listen for proxy route: %w", listenErr)
 		}
-		server := newHTTPServer(listener.Addr().String(), newRouteHandler(route.service, route.host, transport))
+		server := newHTTPServer(listener.Addr().String(), newRouteHandlerWithDial(route.service, route.host, transport, dialTunnel))
 		servers = append(servers, proxyServer{listener: listener, server: server})
 		log.Printf("proxy helper listening on %s for configured service", listener.Addr())
 	}
 	return serveAll(ctx, servers)
 }
 
-func runSingle(ctx context.Context, listen, serviceHost string, transport http.RoundTripper) error {
+const proxyCAFile = "/tmp/rheic-proxy-ca-bundle.pem"
+
+func bootstrapProxyTrust(ctx context.Context, serviceHost string, routes []string, transport http.RoundTripper) error {
+	hosts := []string{serviceHost}
+	if len(routes) > 0 {
+		parsed, err := parseProxyRoutes(routes)
+		if err != nil {
+			return err
+		}
+		hosts = hosts[:0]
+		for _, route := range parsed {
+			hosts = append(hosts, route.host)
+		}
+	}
+	for _, host := range hosts {
+		if !strings.EqualFold(host, "registry-1.docker.io") {
+			continue
+		}
+		cert, err := fetchProxyCA(ctx, transport)
+		if err != nil {
+			return err
+		}
+		if len(cert) == 0 {
+			return errors.New("registry proxy did not provide a trusted CA")
+		}
+		return installProxyCA(cert)
+	}
+	return nil
+}
+
+func fetchProxyCA(ctx context.Context, transport http.RoundTripper) ([]byte, error) {
+	token, err := fetchTokenForService(ctx, transport, "")
+	if err != nil {
+		return nil, err
+	}
+	defer clear([]byte(token))
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://broker/__rheic/proxy/ca", http.NoBody)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set(tokenHeader, token)
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if response.StatusCode != http.StatusOK || response.ContentLength > 16<<10 {
+		return nil, errors.New("registry proxy CA response is invalid")
+	}
+	cert, err := io.ReadAll(io.LimitReader(response.Body, (16<<10)+1))
+	if err != nil || len(cert) == 0 || len(cert) > 16<<10 {
+		clear(cert)
+		return nil, errors.New("registry proxy CA response exceeds limits")
+	}
+	block, rest := pem.Decode(cert)
+	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
+		clear(cert)
+		return nil, errors.New("registry proxy CA response is not a single certificate")
+	}
+	parsed, err := x509.ParseCertificate(block.Bytes)
+	if err != nil || !parsed.IsCA || parsed.KeyUsage&x509.KeyUsageCertSign == 0 {
+		clear(cert)
+		return nil, errors.New("registry proxy certificate is not a CA")
+	}
+	return cert, nil
+}
+
+func installProxyCA(ca []byte) error {
+	var system []byte
+	var failures []error
+	for _, path := range []string{"/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt"} {
+		data, err := os.ReadFile(path)
+		if err == nil && len(data) > 0 {
+			system = data
+			break
+		}
+		if err != nil {
+			failures = append(failures, err)
+		}
+	}
+	if len(system) == 0 {
+		return fmt.Errorf("read system CA bundle: %w", errors.Join(failures...))
+	}
+	bundle := make([]byte, 0, len(system)+len(ca)+2)
+	bundle = append(bundle, system...)
+	if bundle[len(bundle)-1] != '\n' {
+		bundle = append(bundle, '\n')
+	}
+	bundle = append(bundle, ca...)
+	temporary, err := os.CreateTemp(filepath.Dir(proxyCAFile), ".rheic-ca-*")
+	if err != nil {
+		clear(bundle)
+		return err
+	}
+	temporaryName := temporary.Name()
+	defer func() { _ = os.Remove(temporaryName) }()
+	if err := temporary.Chmod(0o644); err != nil {
+		_ = temporary.Close()
+		clear(bundle)
+		return err
+	}
+	if _, err := temporary.Write(bundle); err != nil {
+		_ = temporary.Close()
+		clear(bundle)
+		return err
+	}
+	clear(bundle)
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryName, proxyCAFile)
+}
+
+func runSingle(ctx context.Context, listen, serviceHost string, transport http.RoundTripper, rawDial ...func(context.Context) (net.Conn, error)) error {
 	listener, err := net.Listen("tcp", listen)
 	if err != nil {
 		return err
 	}
 	log.Printf("proxy helper listening on %s for %s", listener.Addr(), serviceHost)
-	return serve(ctx, listener, newHTTPServer(listen, newHandler(serviceHost, transport)))
+	return serve(ctx, listener, newHTTPServer(listen, newRouteHandlerWithDial("", serviceHost, transport, firstTunnelDialer(rawDial))))
+}
+
+func firstTunnelDialer(dialers []func(context.Context) (net.Conn, error)) func(context.Context) (net.Conn, error) {
+	if len(dialers) == 0 {
+		return nil
+	}
+	return dialers[0]
 }
 
 func parseProxyRoutes(values []string) ([]proxyRoute, error) {
@@ -301,9 +440,17 @@ func newHandler(serviceHost string, transport http.RoundTripper) http.Handler {
 }
 
 func newRouteHandler(service, serviceHost string, transport http.RoundTripper) http.Handler {
+	return newRouteHandlerWithDial(service, serviceHost, transport, nil)
+}
+
+func newRouteHandlerWithDial(service, serviceHost string, transport http.RoundTripper, dial func(context.Context) (net.Conn, error)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
-			http.Error(w, "connect tunnels are not supported", http.StatusMethodNotAllowed)
+			if dial == nil || !allowedConnectTarget(serviceHost, r.Host) {
+				http.Error(w, "connect target is not supported", http.StatusForbidden)
+				return
+			}
+			serveConnectTunnel(w, r, service, dial, transport)
 			return
 		}
 		out := r.Clone(r.Context())
@@ -337,6 +484,102 @@ func newRouteHandler(service, serviceHost string, transport http.RoundTripper) h
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 	})
+}
+
+func allowedConnectTarget(routeHost, target string) bool {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil || port != "443" || strings.ContainsAny(target, "@/?#\\") {
+		return false
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if strings.EqualFold(routeHost, "registry-1.docker.io") {
+		return host == "registry-1.docker.io" || host == "auth.docker.io" || host == "production.cloudfront.docker.com"
+	}
+	return strings.EqualFold(host, routeHost)
+}
+
+func serveConnectTunnel(w http.ResponseWriter, r *http.Request, service string, dial func(context.Context) (net.Conn, error), transport http.RoundTripper) {
+	clientConn, clientReader, err := hijackConnectClient(w)
+	if err != nil {
+		return
+	}
+	defer func() { _ = clientConn.Close() }()
+	ctx := r.Context()
+	channel, err := dial(ctx)
+	if err != nil {
+		_ = writeConnectError(clientConn, http.StatusBadGateway)
+		return
+	}
+	defer func() { _ = channel.Close() }()
+	token, err := fetchTokenForService(ctx, transport, service)
+	if err != nil {
+		_ = writeConnectError(clientConn, http.StatusBadGateway)
+		return
+	}
+	defer clear([]byte(token))
+	if err := writeHostConnect(channel, service, r.Host, token); err != nil {
+		_ = writeConnectError(clientConn, http.StatusBadGateway)
+		return
+	}
+	channelReader := bufio.NewReader(channel)
+	connectRequest := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: r.Host}, Host: r.Host}
+	response, err := http.ReadResponse(channelReader, connectRequest)
+	if err != nil {
+		_ = writeConnectError(clientConn, http.StatusBadGateway)
+		return
+	}
+	if response.StatusCode != http.StatusOK {
+		if response.Body != nil {
+			_ = response.Body.Close()
+		}
+		_ = writeConnectError(clientConn, response.StatusCode)
+		return
+	}
+	if _, err := io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		return
+	}
+	copyTunnel(ctx, clientConn, clientReader, channel, channelReader)
+}
+
+func hijackConnectClient(w http.ResponseWriter) (net.Conn, *bufio.Reader, error) {
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "connect tunnel unavailable", http.StatusInternalServerError)
+		return nil, nil, errors.New("HTTP hijacking is unavailable")
+	}
+	conn, reader, err := hijacker.Hijack()
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, reader.Reader, nil
+}
+
+func writeHostConnect(conn net.Conn, service, target, token string) error {
+	request := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: target}, Host: target, Header: make(http.Header)}
+	request.Header.Set(tokenHeader, token)
+	if service != "" {
+		request.Header.Set(serviceHeader, service)
+	}
+	request.Header.Set("Connection", "keep-alive")
+	return request.Write(conn)
+}
+
+func writeConnectError(conn net.Conn, status int) error {
+	return (&http.Response{StatusCode: status, ProtoMajor: 1, ProtoMinor: 1, Header: http.Header{"Connection": []string{"close"}}, Body: http.NoBody}).Write(conn)
+}
+
+func copyTunnel(ctx context.Context, guest net.Conn, guestReader *bufio.Reader, host net.Conn, hostReader *bufio.Reader) {
+	done := make(chan struct{}, 2)
+	copy := func(dst io.Writer, src io.Reader) { _, _ = io.Copy(dst, src); done <- struct{}{} }
+	go copy(host, guestReader)
+	go copy(guest, hostReader)
+	select {
+	case <-ctx.Done():
+	case <-done:
+	}
+	_ = guest.Close()
+	_ = host.Close()
+	<-done
 }
 
 func dialVsock(ctx context.Context, cid, port int) (net.Conn, error) {

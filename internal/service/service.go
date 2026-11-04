@@ -2172,14 +2172,21 @@ func (s *Service) startDockerProfile(ctx context.Context, handle runtime.Handle,
 		return errors.New("runtime does not support native docker profile startup")
 	}
 	registryMirrorArg := ""
+	registryProxyEnv := ""
 	if registryMirror {
 		registryMirrorArg = " --registry-mirror=" + registryMirrorURL
+		registryProxyEnv = `export HTTP_PROXY=http://127.0.0.1:43134 HTTPS_PROXY=http://127.0.0.1:43134
+export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY"
+export NO_PROXY=localhost,127.0.0.1,::1
+export no_proxy="$NO_PROXY"
+export SSL_CERT_FILE=/tmp/rheic-proxy-ca-bundle.pem
+`
 	}
 	script := `mkdir -p /sys/fs/cgroup
 mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup
 mount -o remount,rw /proc/sys 2>/dev/null || true
 echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
-setsid dockerd --host=unix:///var/run/docker.sock` + registryMirrorArg + ` >/var/log/dockerd.log 2>&1 &
+` + registryProxyEnv + `setsid dockerd --host=unix:///var/run/docker.sock` + registryMirrorArg + ` >/var/log/dockerd.log 2>&1 &
 for i in $(seq 1 50); do docker info >/dev/null 2>&1 && exit 0; sleep 0.2; done
 exit 1
 `

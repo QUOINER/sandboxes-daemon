@@ -36,7 +36,7 @@ type sandboxRegistryTransportFactory struct {
 	sandboxID string
 }
 
-func (f sandboxRegistryTransportFactory) Registry(ctx context.Context, authority string) (*registryauth.RegistryTransport, error) {
+func (f sandboxRegistryTransportFactory) Registry(ctx context.Context, authority string) (http.RoundTripper, error) {
 	if authority != dockerHubRegistryHost {
 		return nil, errors.New("untrusted Docker Hub registry authority")
 	}
@@ -44,10 +44,10 @@ func (f sandboxRegistryTransportFactory) Registry(ctx context.Context, authority
 	if err != nil {
 		return nil, err
 	}
-	return registryauth.NewRegistryTransport(authority, prefixes, nil)
+	return registrycredentials.NewForwardRegistryTransport(authority, prefixes, nil)
 }
 
-func (f sandboxRegistryTransportFactory) Token(ctx context.Context, realm registryauth.Realm) (*registryauth.TokenTransport, error) {
+func (f sandboxRegistryTransportFactory) Token(ctx context.Context, realm registryauth.Realm) (http.RoundTripper, error) {
 	if realm.Host != dockerHubAuthHost || realm.Path != "/token" {
 		return nil, errors.New("untrusted Docker Hub token realm")
 	}
@@ -146,9 +146,13 @@ func (s *Service) checkResolvedEgress(ctx context.Context, sandboxID, host strin
 	return PolicyDecision{Allowed: decision.Allow, RuleID: decision.RuleID, Reason: decision.Reason}, nil
 }
 
-func (s *Service) buildDockerHubProxy(_ context.Context, sb sandbox.Sandbox, scope registrycredentials.Scope) (secretproxy.RouteConfig, string, error) {
+func (s *Service) buildDockerHubProxy(ctx context.Context, sb sandbox.Sandbox, scope registrycredentials.Scope) (secretproxy.RouteConfig, string, error) {
 	if s.registryCredentials == nil || (scope != registrycredentials.ScopeSandbox && scope != registrycredentials.ScopeAllSandboxes) {
 		return secretproxy.RouteConfig{}, "", fmt.Errorf("%w: Docker Hub registry broker is unavailable", core.ErrConflict)
+	}
+	ca, err := s.registryCredentials.ProxyCA(ctx)
+	if err != nil {
+		return secretproxy.RouteConfig{}, "", fmt.Errorf("load Docker Hub proxy CA: %w", err)
 	}
 	proxy, err := registrycredentials.NewPullProxy(s.registryCredentials, registrycredentials.PullProxyConfig{
 		Registry: dockerHubRegistry, Authority: dockerHubRegistryHost, SandboxName: sb.Name,
@@ -157,6 +161,7 @@ func (s *Service) buildDockerHubProxy(_ context.Context, sb sandbox.Sandbox, sco
 		TransportFactory: sandboxRegistryTransportFactory{service: s, sandboxID: sb.ID},
 		Limiter:          s.registryPullLimiter,
 		MaxBytes:         16 << 30,
+		TLSAuthority:     ca,
 	})
 	if err != nil {
 		return secretproxy.RouteConfig{}, "", fmt.Errorf("configure Docker Hub pull broker: %w", err)
@@ -167,7 +172,7 @@ func (s *Service) buildDockerHubProxy(_ context.Context, sb sandbox.Sandbox, sco
 	}
 	return secretproxy.RouteConfig{
 		Service: secretproxy.Service{Upstream: "https://" + dockerHubRegistryHost, CredentialScope: string(scope)},
-		Handler: proxy, Token: token,
+		Handler: proxy, Token: token, CACert: ca.Certificate(), MaxRequestBody: 16 << 30,
 	}, fmt.Sprintf("%s=%s:%d", dockerHubProxyService, dockerHubRegistryHost, dockerHubGuestPort), nil
 }
 

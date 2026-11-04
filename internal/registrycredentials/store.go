@@ -9,10 +9,20 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 )
 
 const vaultService = "com.rheic.registry-credentials.v1"
+const registryHTTPScheme = "https"
+const registryActionPull = "pull"
+const registryActionPush = "push"
+const registryV2Path = "/v2/"
+const registryTokenPath = "/token"
+const registryBlobPath = "blobs"
+const registryUploadsPath = "uploads"
+const registryUploadInitKind = "upload-init"
+const registryUploadKind = "upload"
 
 var ErrInvalidCredential = errors.New("invalid registry credential")
 var ErrNotFound = errors.New("registry credential not found")
@@ -46,7 +56,10 @@ type Vault interface {
 	Delete(ctx context.Context, service, account string) error
 }
 
-type Store struct{ vault Vault }
+type Store struct {
+	vault Vault
+	mu    sync.Mutex
+}
 
 // Load reads only the explicitly selected scope; it never falls back to another.
 func (s *Store) Load(ctx context.Context, registry string, scope Scope, sandboxName string) (Credential, error) {

@@ -1,13 +1,16 @@
 package registrycredentials
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -24,10 +27,91 @@ func (f pullRoundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error)
 
 type pullRedirectFactory struct{ redirect http.RoundTripper }
 
-func (pullRedirectFactory) Registry(context.Context, string) (*registryauth.RegistryTransport, error) {
+func (pullRedirectFactory) Registry(context.Context, string) (http.RoundTripper, error) {
 	return nil, errors.New("unused")
 }
-func (pullRedirectFactory) Token(context.Context, registryauth.Realm) (*registryauth.TokenTransport, error) {
+
+func TestForwardProxyConnectTerminatesTLSForBoundHostOnly(t *testing.T) {
+	authority, err := generateProxyAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := &PullProxy{authority: "registry-1.docker.io", tlsAuthority: authority, tunnelSlots: make(chan struct{}, 8)}
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(authority.Certificate()) {
+		t.Fatal("failed to load test proxy CA")
+	}
+
+	connect := func(serverName string) (net.Conn, error) {
+		conn, err := net.Dial("tcp", server.Listener.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		if _, err := fmt.Fprintf(conn, "CONNECT registry-1.docker.io:443 HTTP/1.1\r\nHost: registry-1.docker.io:443\r\n\r\n"); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		if response.StatusCode != http.StatusOK {
+			_ = conn.Close()
+			return nil, fmt.Errorf("CONNECT status %d", response.StatusCode)
+		}
+		tlsConn := tls.Client(conn, &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: serverName})
+		if err := tlsConn.Handshake(); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+
+	conn, err := connect("registry-1.docker.io")
+	if err != nil {
+		t.Fatalf("trusted CONNECT failed: %v", err)
+	}
+	if _, err := fmt.Fprint(conn, "GET /v2/ HTTP/1.1\r\nHost: registry-1.docker.io\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	_ = conn.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("registry probe status=%d body=%q headers=%v", response.StatusCode, body, response.Header)
+	}
+
+	mismatchedHost, err := connect("registry-1.docker.io")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprint(mismatchedHost, "GET /token?service=registry.docker.io&scope=repository:team/image:pull HTTP/1.1\r\nHost: auth.docker.io\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	mismatchResponse, err := http.ReadResponse(bufio.NewReader(mismatchedHost), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = mismatchResponse.Body.Close()
+	_ = mismatchedHost.Close()
+	if mismatchResponse.StatusCode != http.StatusMisdirectedRequest {
+		t.Fatalf("mismatched CONNECT/SNI/Host status=%d", mismatchResponse.StatusCode)
+	}
+
+	wrongSNI, err := connect("auth.docker.io")
+	if err == nil {
+		_ = wrongSNI.Close()
+		t.Fatal("CONNECT target accepted a mismatched TLS SNI")
+	}
+}
+func (pullRedirectFactory) Token(context.Context, registryauth.Realm) (http.RoundTripper, error) {
 	return nil, errors.New("unused")
 }
 func (f pullRedirectFactory) Redirect(_ context.Context, authority string) (http.RoundTripper, error) {

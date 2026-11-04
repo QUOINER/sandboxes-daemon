@@ -289,3 +289,28 @@ func TestParseProxyRoutesRejectsUnsafeConfiguration(t *testing.T) {
 		}
 	}
 }
+
+func TestAllowedConnectTargetIsDockerHubScoped(t *testing.T) {
+	tests := []struct {
+		routeHost string
+		target    string
+		allowed   bool
+	}{
+		{"registry-1.docker.io", "registry-1.docker.io:443", true},
+		{"registry-1.docker.io", "auth.docker.io:443", true},
+		{"registry-1.docker.io", "production.cloudfront.docker.com:443", true},
+		{"registry-1.docker.io", "attacker.example:443", false},
+		{"registry-1.docker.io", "auth.docker.io:8443", false},
+		{"registry-1.docker.io", "user@auth.docker.io:443", false},
+		{"registry-1.docker.io", "auth.docker.io:443/path", false},
+		{"example.com", "auth.docker.io:443", false},
+		{"example.com", "example.com:443", true},
+	}
+	for _, test := range tests {
+		t.Run(test.target, func(t *testing.T) {
+			if actual := allowedConnectTarget(test.routeHost, test.target); actual != test.allowed {
+				t.Fatalf("allowedConnectTarget(%q, %q) = %t, want %t", test.routeHost, test.target, actual, test.allowed)
+			}
+		})
+	}
+}

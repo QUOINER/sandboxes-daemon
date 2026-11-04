@@ -3,8 +3,10 @@ package registrycredentials
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/rheic/sandboxes-gateway/registryauth"
 )
@@ -27,7 +29,7 @@ type PullRequest struct {
 // ExchangePullToken derives the repository scope from the actual pull request
 // before reading credentials. The returned bearer token is a secret and must
 // remain on the host. This is not a proxy or authorization gate.
-func (s *Store) ExchangePullToken(ctx context.Context, transport *registryauth.TokenTransport, request PullRequest) (string, error) {
+func (s *Store) ExchangePullToken(ctx context.Context, transport http.RoundTripper, request PullRequest) (string, error) {
 	if transport == nil {
 		return "", errors.New("registry token transport is required")
 	}
@@ -44,6 +46,86 @@ func (s *Store) ExchangePullToken(ctx context.Context, transport *registryauth.T
 		return "", err
 	}
 	return s.exchangeToken(ctx, transport, registry, request.Scope, request.SandboxName, request.Challenge, request.Realms, request.Service, scope)
+}
+
+// ExchangeScopedToken obtains a bearer for a previously parsed, least-privilege
+// repository scope. The caller must validate the scope and bind it to the
+// authenticated sandbox before invoking this method.
+func (s *Store) ExchangeScopedToken(ctx context.Context, transport http.RoundTripper, registry string, scope Scope, sandboxName, service, repositoryScope string, realms []registryauth.Realm) (string, error) {
+	if transport == nil || service == "" || len(realms) == 0 || !validRepositoryScope(repositoryScope) {
+		return "", errors.New("invalid registry token scope")
+	}
+	registry, err := canonicalRegistry(registry)
+	if err != nil {
+		return "", err
+	}
+	if scope != ScopeSandbox && scope != ScopeAllSandboxes {
+		return "", errors.New("registry scope is not authorized for guest access")
+	}
+	if scope == ScopeAllSandboxes {
+		sandboxName = ""
+	} else if _, _, err := validateScope(scope, sandboxName); err != nil {
+		return "", err
+	}
+	credential, err := s.Load(ctx, registry, scope, sandboxName)
+	if err != nil {
+		return "", err
+	}
+	defer clear(credential.Password)
+	realmURL := (&url.URL{Scheme: registryHTTPScheme, Host: realms[0].Host, Path: realms[0].Path}).String()
+	header := fmt.Sprintf(`Bearer realm=%q,service=%q,scope=%q`, realmURL, service, repositoryScope)
+	return s.exchangeToken(ctx, transport, registry, scope, sandboxName, header, realms, service, repositoryScope)
+}
+
+func validRepositoryScope(value string) bool {
+	separator := strings.LastIndex(value, ":")
+	if separator <= 0 || separator == len(value)-1 {
+		return false
+	}
+	resource, actions := value[:separator], value[separator+1:]
+	if !strings.HasPrefix(resource, "repository:") {
+		return false
+	}
+	name := strings.TrimPrefix(resource, "repository:")
+	if name == "" || len(name) > 255 || strings.ContainsAny(name, "?#%\\\x00\r\n") {
+		return false
+	}
+	for _, component := range strings.Split(name, "/") {
+		if component == "" || !validRepoComponent(component) {
+			return false
+		}
+	}
+	if actions == "" {
+		return false
+	}
+	seen := make(map[string]struct{}, 2)
+	for _, action := range strings.Split(actions, ",") {
+		if action != registryActionPull && action != registryActionPush {
+			return false
+		}
+		if _, exists := seen[action]; exists {
+			return false
+		}
+		seen[action] = struct{}{}
+	}
+	return true
+}
+
+func validRepoComponent(value string) bool {
+	if value == "" || len(value) > 255 || !lowerAlphaNumeric(value[0]) || !lowerAlphaNumeric(value[len(value)-1]) {
+		return false
+	}
+	for i := range value {
+		char := value[i]
+		if !lowerAlphaNumeric(char) && char != '.' && char != '_' && char != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerAlphaNumeric(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9'
 }
 
 // exchangeToken obtains a token using the exact credential scope selected by a
