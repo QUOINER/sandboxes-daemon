@@ -205,6 +205,10 @@ func fetchProxyCA(ctx context.Context, transport http.RoundTripper) ([]byte, err
 	if response.StatusCode == http.StatusNotFound {
 		return nil, nil
 	}
+	return readProxyCAResponse(response)
+}
+
+func readProxyCAResponse(response *http.Response) ([]byte, error) {
 	if response.StatusCode != http.StatusOK || response.ContentLength > 16<<10 {
 		return nil, errors.New("registry proxy CA response is invalid")
 	}
@@ -227,20 +231,12 @@ func fetchProxyCA(ctx context.Context, transport http.RoundTripper) ([]byte, err
 }
 
 func installProxyCA(ca []byte) error {
-	var system []byte
-	var failures []error
-	for _, path := range []string{"/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt"} {
-		data, err := os.ReadFile(path)
-		if err == nil && len(data) > 0 {
-			system = data
-			break
-		}
-		if err != nil {
-			failures = append(failures, err)
-		}
+	system, err := readSystemCABundle()
+	if err != nil {
+		return err
 	}
 	if len(system) == 0 {
-		return fmt.Errorf("read system CA bundle: %w", errors.Join(failures...))
+		return errors.New("read system CA bundle: no supported bundle found")
 	}
 	bundle := make([]byte, 0, len(system)+len(ca)+2)
 	bundle = append(bundle, system...)
@@ -274,6 +270,27 @@ func installProxyCA(ca []byte) error {
 		return err
 	}
 	return os.Rename(temporaryName, proxyCAFile)
+}
+
+func readSystemCABundle() ([]byte, error) {
+	var failures []error
+	for _, read := range []func() ([]byte, error){
+		func() ([]byte, error) { return os.ReadFile("/etc/ssl/certs/ca-certificates.crt") },
+		func() ([]byte, error) { return os.ReadFile("/etc/ssl/cert.pem") },
+		func() ([]byte, error) { return os.ReadFile("/etc/pki/tls/certs/ca-bundle.crt") },
+	} {
+		data, err := read()
+		if err == nil && len(data) > 0 {
+			return data, nil
+		}
+		if err != nil {
+			failures = append(failures, err)
+		}
+	}
+	if len(failures) != 0 {
+		return nil, fmt.Errorf("read system CA bundle: %w", errors.Join(failures...))
+	}
+	return nil, nil
 }
 
 func runSingle(ctx context.Context, listen, serviceHost string, transport http.RoundTripper, rawDial ...func(context.Context) (net.Conn, error)) error {
@@ -570,9 +587,9 @@ func writeConnectError(conn net.Conn, status int) error {
 
 func copyTunnel(ctx context.Context, guest net.Conn, guestReader *bufio.Reader, host net.Conn, hostReader *bufio.Reader) {
 	done := make(chan struct{}, 2)
-	copy := func(dst io.Writer, src io.Reader) { _, _ = io.Copy(dst, src); done <- struct{}{} }
-	go copy(host, guestReader)
-	go copy(guest, hostReader)
+	copyStream := func(dst io.Writer, src io.Reader) { _, _ = io.Copy(dst, src); done <- struct{}{} }
+	go copyStream(host, guestReader)
+	go copyStream(guest, hostReader)
 	select {
 	case <-ctx.Done():
 	case <-done:

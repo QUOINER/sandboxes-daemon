@@ -3,9 +3,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +26,48 @@ import (
 
 	"github.com/rheic/sandboxes-daemon/internal/secretproxy"
 )
+
+func TestReadProxyCAResponseRequiresSigningCA(t *testing.T) {
+	valid := proxyCATestPEM(t, true)
+	response := &http.Response{StatusCode: http.StatusOK, ContentLength: int64(len(valid)), Body: io.NopCloser(bytes.NewReader(valid))}
+	got, err := readProxyCAResponse(response)
+	_ = response.Body.Close()
+	if err != nil || !bytes.Equal(got, valid) {
+		t.Fatalf("valid CA result matches=%t err=%v", bytes.Equal(got, valid), err)
+	}
+
+	for name, body := range map[string][]byte{
+		"not pem":          []byte("not a certificate"),
+		"leaf certificate": proxyCATestPEM(t, false),
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := &http.Response{StatusCode: http.StatusOK, ContentLength: int64(len(body)), Body: io.NopCloser(bytes.NewReader(body))}
+			defer func() { _ = response.Body.Close() }()
+			if got, err := readProxyCAResponse(response); err == nil || len(got) != 0 {
+				t.Fatalf("accepted non-CA response, bytes=%d err=%v", len(got), err)
+			}
+		})
+	}
+}
+
+func proxyCATestPEM(t *testing.T, isCA bool) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "synthetic proxy CA"}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature}
+	if isCA {
+		template.IsCA = true
+		template.BasicConstraintsValid = true
+		template.KeyUsage |= x509.KeyUsageCertSign
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
 
 func TestVsockConnWrapsPollableFile(t *testing.T) {
 	reader, writer, err := os.Pipe()
