@@ -313,6 +313,9 @@ func (p *PullProxy) registryRequest(ctx context.Context, client *http.Client, in
 			req.Header.Add(key, value)
 		}
 	}
+	// Prevent net/http's implicit gzip negotiation and decompression from
+	// hiding the upstream wire length from the bounded streaming path.
+	req.Header.Set("Accept-Encoding", "identity")
 	if token != "" {
 		if strings.ContainsAny(token, "\r\n") {
 			return nil, errors.New("invalid registry token")
@@ -323,7 +326,7 @@ func (p *PullProxy) registryRequest(ctx context.Context, client *http.Client, in
 }
 
 func copyPullResponseHeaders(dst, src http.Header) {
-	for _, key := range []string{"Content-Type", "Content-Length", "Content-Range", "Docker-Content-Digest", "Docker-Distribution-Api-Version", "ETag", "Last-Modified"} {
+	for _, key := range []string{"Content-Type", "Content-Encoding", "Content-Length", "Content-Range", "Docker-Content-Digest", "Docker-Distribution-Api-Version", "ETag", "Last-Modified"} {
 		for _, value := range src.Values(key) {
 			dst.Add(key, value)
 		}

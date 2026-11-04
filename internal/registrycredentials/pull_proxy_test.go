@@ -1,6 +1,8 @@
 package registrycredentials
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/x509"
 	"errors"
@@ -100,6 +102,26 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 			_, _ = fmt.Fprint(w, `{"public":true}`)
 			return
 		}
+		if r.URL.Path == "/v2/public-gzip/manifests/latest" {
+			if r.Header.Get("Accept-Encoding") != "identity" {
+				t.Errorf("upstream Accept-Encoding = %q, want identity", r.Header.Get("Accept-Encoding"))
+			}
+			var encoded bytes.Buffer
+			compressor := gzip.NewWriter(&encoded)
+			if _, err := compressor.Write([]byte(`{"compressed":true}`)); err != nil {
+				t.Errorf("compress fixture: %v", err)
+				return
+			}
+			if err := compressor.Close(); err != nil {
+				t.Errorf("close compressed fixture: %v", err)
+				return
+			}
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Length", fmt.Sprint(encoded.Len()))
+			_, _ = w.Write(encoded.Bytes())
+			return
+		}
 		if strings.Contains(r.Header.Get("Authorization"), "guest-secret") {
 			t.Error("guest authorization reached upstream")
 		}
@@ -170,6 +192,20 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	proxy.ServeHTTP(public, httptest.NewRequest(http.MethodGet, "http://guest/v2/public/manifests/latest", http.NoBody))
 	if public.Code != http.StatusOK || public.Body.String() != `{"public":true}` || tokenRequests != 2 {
 		t.Fatal("public pull did not succeed without a token exchange")
+	}
+	compressed := httptest.NewRecorder()
+	proxy.ServeHTTP(compressed, httptest.NewRequest(http.MethodGet, "http://guest/v2/public-gzip/manifests/latest", http.NoBody))
+	if compressed.Code != http.StatusOK || compressed.Header().Get("Content-Encoding") != "gzip" || compressed.Header().Get("Content-Length") == "" {
+		t.Fatalf("compressed manifest metadata was not preserved: status=%d headers=%v", compressed.Code, compressed.Header())
+	}
+	decoder, err := gzip.NewReader(bytes.NewReader(compressed.Body.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := io.ReadAll(decoder)
+	_ = decoder.Close()
+	if err != nil || string(decoded) != `{"compressed":true}` {
+		t.Fatalf("compressed manifest body = %q, error = %v", decoded, err)
 	}
 	probe := httptest.NewRecorder()
 	proxy.ServeHTTP(probe, httptest.NewRequest(http.MethodGet, "http://guest/v2/", http.NoBody))
