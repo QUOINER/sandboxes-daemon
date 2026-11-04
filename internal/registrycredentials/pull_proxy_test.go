@@ -173,6 +173,17 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for range maxQueuedRegistryPulls {
+		proxy.limiter.queued <- struct{}{}
+	}
+	overloaded := httptest.NewRecorder()
+	proxy.ServeHTTP(overloaded, httptest.NewRequest(http.MethodGet, "http://guest/v2/demo/manifests/latest", http.NoBody))
+	if overloaded.Code != http.StatusServiceUnavailable || overloaded.Header().Get("Retry-After") != "1" {
+		t.Fatalf("overloaded registry request status=%d headers=%v", overloaded.Code, overloaded.Header())
+	}
+	for range maxQueuedRegistryPulls {
+		<-proxy.limiter.queued
+	}
 	request := httptest.NewRequest(http.MethodGet, "http://guest/v2/demo/manifests/latest", http.NoBody)
 	request.Header.Set("Authorization", "Bearer guest-secret")
 	response := httptest.NewRecorder()
