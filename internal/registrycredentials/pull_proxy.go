@@ -117,6 +117,11 @@ func (p *PullProxy) serveAllowed(w http.ResponseWriter, r *http.Request, endpoin
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
 	if !p.limiter.acquire(ctx) {
+		if r.Context().Err() != nil {
+			return
+		}
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "registry proxy is busy", http.StatusServiceUnavailable)
 		return
 	}
 	defer p.limiter.release()

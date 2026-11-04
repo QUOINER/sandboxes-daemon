@@ -7,6 +7,16 @@ import (
 
 func TestPullLimiterBoundsAggregateRequestsAndHonorsCancellation(t *testing.T) {
 	limiter := NewPullLimiter()
+	for range maxQueuedRegistryPulls {
+		limiter.queued <- struct{}{}
+	}
+	if limiter.acquire(context.Background()) {
+		t.Fatal("limiter admitted an unbounded queued request")
+	}
+	for range maxQueuedRegistryPulls {
+		<-limiter.queued
+	}
+
 	for range maxConcurrentRegistryPulls {
 		if !limiter.acquire(context.Background()) {
 			t.Fatal("limiter rejected a slot below its capacity")
