@@ -863,6 +863,24 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	if err != nil {
 		return operation.Operation{}, err
 	}
+	if !req.Privileged {
+		if inspector, ok := s.backend.(runtime.ImageInspector); ok {
+			if labels, inspectErr := inspector.ImageLabels(ctx, image); inspectErr == nil && labels["com.docker.sandboxes.start-docker"] == "true" {
+				req.Privileged = true
+			}
+		}
+	}
+	registryScope := registrycredentials.Scope("")
+	if req.Privileged {
+		registryScope, err = s.availableDockerHubScope(ctx, name, true)
+		if err != nil {
+			return operation.Operation{}, fmt.Errorf("inspect Docker Hub sandbox credentials: %w", err)
+		}
+		if registryScope != "" {
+			proxyServiceNames = append(proxyServiceNames, dockerHubProxyService)
+			sort.Strings(proxyServiceNames)
+		}
+	}
 	if len(proxyServiceNames) != 0 && s.backend == nil {
 		return operation.Operation{}, fmt.Errorf("%w: service proxy requires a VM runtime", core.ErrConflict)
 	}
@@ -902,13 +920,6 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	if err != nil {
 		return operation.Operation{}, err
 	}
-	if !req.Privileged {
-		if inspector, ok := s.backend.(runtime.ImageInspector); ok {
-			if labels, err := inspector.ImageLabels(ctx, image); err == nil && labels["com.docker.sandboxes.start-docker"] == "true" {
-				req.Privileged = true
-			}
-		}
-	}
 	var blockVolumes []runtime.BlockVolume
 	if req.Privileged {
 		volume, err := s.ensureDockerVolume(ctx, sbID)
@@ -921,7 +932,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	var handle runtime.Handle
 	var proxyConfig proxyRuntimeConfig
 	if len(proxyServiceNames) != 0 {
-		proxyConfig, err = s.proxyChannelConfig(ctx, sandbox.Sandbox{ID: sbID, Name: name}, proxyServiceNames)
+		proxyConfig, err = s.proxyChannelConfig(ctx, sandbox.Sandbox{ID: sbID, Name: name}, proxyServiceNames, registryScope)
 		if err != nil {
 			return operation.Operation{}, err
 		}
@@ -951,7 +962,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		if err != nil {
 			return operation.Operation{}, errors.Join(err, cleanupProxy())
 		}
-		if err := s.ensureDockerProfile(ctx, req.Privileged, handle); err != nil {
+		if err := s.ensureDockerProfile(ctx, req.Privileged, registryScope != "", handle); err != nil {
 			return operation.Operation{}, errors.Join(err, s.cleanupCreateFailure(ctx, handle, errors.New("docker profile startup failed")), cleanupProxy())
 		}
 		state = sandbox.Running
@@ -962,6 +973,11 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	}
 	if len(proxyServiceNames) != 0 {
 		if err := s.store.SetSetting(ctx, proxyServiceSettingKey(sbID), encodeProxyServices(proxyServiceNames)); err != nil {
+			return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), s.stopProxyChannel(name, sbID, true))
+		}
+	}
+	if registryScope != "" {
+		if err := s.store.SetSetting(ctx, registryProxySettingKey(sbID), string(registryScope)); err != nil {
 			return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), s.stopProxyChannel(name, sbID, true))
 		}
 	}
@@ -978,6 +994,9 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	if err := s.store.CreateSandboxWithOperation(ctx, sb, op); err != nil {
 		if len(proxyServiceNames) != 0 {
 			_ = s.store.DeleteSetting(ctx, proxyServiceSettingKey(sbID))
+		}
+		if registryScope != "" {
+			_ = s.store.DeleteSetting(ctx, registryProxySettingKey(sbID))
 		}
 		return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), cleanupProxy())
 	}
@@ -999,11 +1018,10 @@ func (s *Service) createRuntimeSandbox(ctx context.Context, cfg *runtime.Config,
 	if !ok {
 		return runtime.Handle{}, fmt.Errorf("%w: runtime backend does not support the service proxy helper", core.ErrConflict)
 	}
-	contract, ok := proxyContract(proxyServices[0])
-	if !ok {
-		return runtime.Handle{}, fmt.Errorf("%w: unsupported service proxy route", core.ErrConflict)
+	if proxyConfig.guestPort == 0 || proxyConfig.serviceHost == "" {
+		return runtime.Handle{}, fmt.Errorf("%w: unsupported single proxy route", core.ErrConflict)
 	}
-	return proxyBackend.CreateWithProxy(ctx, cfg, proxyConfig.helperPath, contract.guestPort, contract.upstreamHost)
+	return proxyBackend.CreateWithProxy(ctx, cfg, proxyConfig.helperPath, proxyConfig.guestPort, proxyConfig.serviceHost)
 }
 
 func (s *Service) replayCreateIfRequested(ctx context.Context, key string, intent createIntent) (operation.Operation, bool, error) {
@@ -1838,7 +1856,13 @@ func (s *Service) startRuntimeSandbox(ctx context.Context, sb sandbox.Sandbox) e
 	if !enabled {
 		return nil
 	}
-	return s.startDockerProfile(ctx, handle)
+	registryScope, err := s.store.GetSetting(ctx, registryProxySettingKey(sb.ID))
+	if errors.Is(err, core.ErrNotFound) {
+		registryScope = ""
+	} else if err != nil {
+		return err
+	}
+	return s.startDockerProfile(ctx, handle, registryScope != "")
 }
 
 func dockerSettingKey(id string) string { return "sandbox.docker." + id }
@@ -2133,23 +2157,27 @@ func parseVolumeSize(value string) (int64, error) {
 	return size, nil
 }
 
-func (s *Service) ensureDockerProfile(ctx context.Context, enabled bool, handle runtime.Handle) error {
+func (s *Service) ensureDockerProfile(ctx context.Context, enabled bool, registryMirror bool, handle runtime.Handle) error {
 	if !enabled {
 		return nil
 	}
-	return s.startDockerProfile(ctx, handle)
+	return s.startDockerProfile(ctx, handle, registryMirror)
 }
 
-func (s *Service) startDockerProfile(ctx context.Context, handle runtime.Handle) error {
+func (s *Service) startDockerProfile(ctx context.Context, handle runtime.Handle, registryMirror bool) error {
 	native, ok := s.backend.(runtime.NativeExecutor)
 	if !ok {
 		return errors.New("runtime does not support native docker profile startup")
+	}
+	registryMirrorArg := ""
+	if registryMirror {
+		registryMirrorArg = " --registry-mirror=" + registryMirrorURL
 	}
 	script := `mkdir -p /sys/fs/cgroup
 mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup
 mount -o remount,rw /proc/sys 2>/dev/null || true
 echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
-setsid dockerd --host=unix:///var/run/docker.sock >/var/log/dockerd.log 2>&1 &
+setsid dockerd --host=unix:///var/run/docker.sock` + registryMirrorArg + ` >/var/log/dockerd.log 2>&1 &
 for i in $(seq 1 50); do docker info >/dev/null 2>&1 && exit 0; sleep 0.2; done
 exit 1
 `
@@ -2583,6 +2611,9 @@ func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.
 		return operation.Operation{}, err
 	}
 	if err := s.store.DeleteSetting(ctx, proxyServiceSettingKey(id)); err != nil {
+		return op, err
+	}
+	if err := s.store.DeleteSetting(ctx, registryProxySettingKey(id)); err != nil {
 		return op, err
 	}
 	if err := s.stopProxyChannel(sb.Name, sb.ID, true); err != nil {

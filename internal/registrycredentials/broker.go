@@ -14,6 +14,7 @@ import (
 // trusted host code after authenticating the caller and enforcing its policy.
 type PullRequest struct {
 	Registry    string
+	Authority   string
 	Scope       Scope
 	SandboxName string
 	Method      string
@@ -34,7 +35,11 @@ func (s *Store) ExchangePullToken(ctx context.Context, transport *registryauth.T
 	if err != nil {
 		return "", err
 	}
-	scope, err := registryauth.PullScope(request.Method, request.URL, registry)
+	authority := request.Authority
+	if authority == "" {
+		authority = registry
+	}
+	scope, err := registryauth.PullScope(request.Method, request.URL, authority)
 	if err != nil {
 		return "", err
 	}

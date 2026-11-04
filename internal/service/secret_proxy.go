@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/rheic/sandboxes-core/sandbox"
 	runtime "github.com/rheic/sandboxes-runtime"
 
+	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
 	"github.com/rheic/sandboxes-daemon/internal/secretproxy"
 	"github.com/rheic/sandboxes-daemon/internal/servicesecrets"
 )
@@ -30,10 +32,12 @@ const (
 )
 
 type proxyRuntimeConfig struct {
-	port       uint32
-	socketPath string
-	helperPath string
-	routes     []string
+	port        uint32
+	socketPath  string
+	helperPath  string
+	routes      []string
+	guestPort   uint16
+	serviceHost string
 }
 
 type proxyRuntime interface {
@@ -142,8 +146,11 @@ func stripProxyCreateEnv(env []string) ([]string, []string, error) {
 
 func proxyServiceSettingKey(id string) string { return proxySettingPrefix + id }
 
-func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, serviceNames []string) (proxyRuntimeConfig, error) {
-	if !validProxyServiceNames(serviceNames) || s.secretProxies == nil || s.serviceSecrets == nil {
+func registryProxySettingKey(id string) string { return "sandbox.registry-proxy." + id }
+
+func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, serviceNames []string, registryScope registrycredentials.Scope) (proxyRuntimeConfig, error) {
+	needsServiceSecret := hasServiceSecretRoute(serviceNames)
+	if !validProxyServiceNames(serviceNames) || s.secretProxies == nil || (needsServiceSecret && s.serviceSecrets == nil) {
 		return proxyRuntimeConfig{}, fmt.Errorf("%w: service proxy is unavailable", core.ErrConflict)
 	}
 	if err := validateProxyHelperBinary(s.proxyHelperPath); err != nil {
@@ -165,7 +172,7 @@ func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, se
 			_ = secretproxy.RemovePrivateDir(dir)
 		}
 	}()
-	routes, runtimeRoutes, err := s.buildProxyRoutes(ctx, sb, serviceNames)
+	routes, runtimeRoutes, err := s.buildProxyRoutes(ctx, sb, serviceNames, registryScope)
 	if err != nil {
 		return proxyRuntimeConfig{}, err
 	}
@@ -175,7 +182,31 @@ func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, se
 	}
 	clearRouteSecrets(routes)
 	prepared = true
-	return proxyRuntimeConfig{port: proxySocketPort, socketPath: socketPath, helperPath: s.proxyHelperPath, routes: runtimeRoutes}, nil
+	config := proxyRuntimeConfig{port: proxySocketPort, socketPath: socketPath, helperPath: s.proxyHelperPath, routes: runtimeRoutes}
+	config.guestPort, config.serviceHost = singleProxyEndpoint(serviceNames, runtimeRoutes)
+	return config, nil
+}
+
+func hasServiceSecretRoute(serviceNames []string) bool {
+	for _, name := range serviceNames {
+		if name != dockerHubProxyService {
+			return true
+		}
+	}
+	return false
+}
+
+func singleProxyEndpoint(serviceNames, runtimeRoutes []string) (uint16, string) {
+	if len(runtimeRoutes) != 1 || len(serviceNames) != 1 {
+		return 0, ""
+	}
+	if serviceNames[0] == dockerHubProxyService {
+		return dockerHubGuestPort, dockerHubRegistryHost
+	}
+	if contract, ok := proxyContract(serviceNames[0]); ok {
+		return contract.guestPort, contract.upstreamHost
+	}
+	return 0, ""
 }
 
 func validProxyServiceNames(names []string) bool {
@@ -204,10 +235,20 @@ func (s *Service) proxyRoutesActive(sandboxName string, names []string) bool {
 	return false
 }
 
-func (s *Service) buildProxyRoutes(ctx context.Context, sb sandbox.Sandbox, serviceNames []string) (map[string]secretproxy.RouteConfig, []string, error) {
+func (s *Service) buildProxyRoutes(ctx context.Context, sb sandbox.Sandbox, serviceNames []string, registryScope registrycredentials.Scope) (map[string]secretproxy.RouteConfig, []string, error) {
 	routes := make(map[string]secretproxy.RouteConfig, len(serviceNames))
 	runtimeRoutes := make([]string, 0, len(serviceNames))
 	for _, serviceName := range serviceNames {
+		if serviceName == dockerHubProxyService {
+			route, runtimeRoute, err := s.buildDockerHubProxy(ctx, sb, registryScope)
+			if err != nil {
+				clearRouteSecrets(routes)
+				return nil, nil, err
+			}
+			routes[serviceName] = route
+			runtimeRoutes = append(runtimeRoutes, runtimeRoute)
+			continue
+		}
 		route, runtimeRoute, err := s.buildProxyRoute(ctx, sb, serviceName)
 		if err != nil {
 			clearRouteSecrets(routes)
@@ -228,19 +269,27 @@ func (s *Service) buildProxyRoute(ctx context.Context, sb sandbox.Sandbox, name 
 	if err != nil {
 		return secretproxy.RouteConfig{}, "", err
 	}
-	var randomToken [32]byte
-	if _, err := rand.Read(randomToken[:]); err != nil {
+	token, err := newProxyToken()
+	if err != nil {
 		clear(secret)
-		clear(randomToken[:])
-		return secretproxy.RouteConfig{}, "", fmt.Errorf("generate per-sandbox proxy token: %w", err)
+		return secretproxy.RouteConfig{}, "", err
 	}
-	token := hex.EncodeToString(randomToken[:])
-	clear(randomToken[:])
 	service := contractService(name)
 	service.CredentialScope = string(scope)
 	service.Authorize = s.proxyPolicyAuthorizer(sb.ID, contract.upstreamHost)
 	return secretproxy.RouteConfig{Service: service, Secret: secret, Token: token},
 		fmt.Sprintf("%s=%s:%d", name, contract.upstreamHost, contract.guestPort), nil
+}
+
+func newProxyToken() (string, error) {
+	var randomToken [32]byte
+	if _, err := rand.Read(randomToken[:]); err != nil {
+		clear(randomToken[:])
+		return "", fmt.Errorf("generate per-sandbox proxy token: %w", err)
+	}
+	token := hex.EncodeToString(randomToken[:])
+	clear(randomToken[:])
+	return token, nil
 }
 
 func (s *Service) proxyPolicyAuthorizer(sandboxID, host string) func(context.Context) error {
@@ -275,12 +324,16 @@ func encodeProxyServices(services []string) string {
 }
 
 func proxyRouteConfigured(service string) bool {
+	if service == dockerHubProxyService {
+		return true
+	}
 	_, ok := proxyContract(service)
 	return ok
 }
 
 func clearRouteSecrets(routes map[string]secretproxy.RouteConfig) {
-	for _, route := range routes {
+	for i := range routes {
+		route := routes[i]
 		clear(route.Secret)
 	}
 }
@@ -288,13 +341,61 @@ func clearRouteSecrets(routes map[string]secretproxy.RouteConfig) {
 func (s *Service) prepareStoredProxy(ctx context.Context, sb sandbox.Sandbox) error {
 	serviceSetting, err := s.store.GetSetting(ctx, proxyServiceSettingKey(sb.ID))
 	if errors.Is(err, core.ErrNotFound) {
-		return nil
-	}
-	if err != nil {
+		serviceSetting = ""
+	} else if err != nil {
 		return fmt.Errorf("load sandbox proxy configuration: %w", err)
 	}
-	_, err = s.proxyChannelConfig(ctx, sb, decodeProxyServices(serviceSetting))
+	serviceNames := decodeProxyServices(serviceSetting)
+	registryScopeValue, err := s.store.GetSetting(ctx, registryProxySettingKey(sb.ID))
+	if errors.Is(err, core.ErrNotFound) {
+		registryScopeValue = ""
+	} else if err != nil {
+		return fmt.Errorf("load sandbox registry proxy scope: %w", err)
+	}
+	serviceNames, registryScopeValue, err = s.discoverDockerHubProxy(ctx, sb, serviceNames, registryScopeValue)
+	if err != nil {
+		return err
+	}
+	if len(serviceNames) == 0 {
+		return nil
+	}
+	if slices.Contains(serviceNames, dockerHubProxyService) && registryScopeValue == "" {
+		return errors.New("sandbox registry proxy scope is missing")
+	}
+	_, err = s.proxyChannelConfig(ctx, sb, serviceNames, registrycredentials.Scope(registryScopeValue))
 	return err
+}
+
+func (s *Service) discoverDockerHubProxy(ctx context.Context, sb sandbox.Sandbox, serviceNames []string, scopeValue string) ([]string, string, error) {
+	if scopeValue != "" {
+		if !slices.Contains(serviceNames, dockerHubProxyService) {
+			serviceNames = append(serviceNames, dockerHubProxyService)
+		}
+		return serviceNames, scopeValue, nil
+	}
+	if slices.Contains(serviceNames, dockerHubProxyService) {
+		return serviceNames, scopeValue, nil
+	}
+	dockerEnabled, err := s.dockerProfileEnabled(ctx, sb.ID)
+	if err != nil || !dockerEnabled {
+		return serviceNames, scopeValue, err
+	}
+	scope, err := s.availableDockerHubScope(ctx, sb.Name, false)
+	if err != nil {
+		return nil, "", fmt.Errorf("load sandbox-scoped Docker Hub credential: %w", err)
+	}
+	if scope == "" {
+		return serviceNames, scopeValue, nil
+	}
+	scopeValue = string(scope)
+	serviceNames = append(serviceNames, dockerHubProxyService)
+	if err := s.store.SetSetting(ctx, registryProxySettingKey(sb.ID), scopeValue); err != nil {
+		return nil, "", fmt.Errorf("store sandbox registry proxy scope: %w", err)
+	}
+	if err := s.store.SetSetting(ctx, proxyServiceSettingKey(sb.ID), encodeProxyServices(serviceNames)); err != nil {
+		return nil, "", fmt.Errorf("store sandbox proxy route configuration: %w", err)
+	}
+	return serviceNames, scopeValue, nil
 }
 
 func (s *Service) hasStoredProxy(ctx context.Context, sb sandbox.Sandbox) (bool, error) {

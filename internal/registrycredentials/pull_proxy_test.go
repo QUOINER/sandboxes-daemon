@@ -16,6 +16,58 @@ import (
 	"github.com/rheic/sandboxes-gateway/registryauth"
 )
 
+type pullRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f pullRoundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type pullRedirectFactory struct{ redirect http.RoundTripper }
+
+func (pullRedirectFactory) Registry(context.Context, string) (*registryauth.RegistryTransport, error) {
+	return nil, errors.New("unused")
+}
+func (pullRedirectFactory) Token(context.Context, registryauth.Realm) (*registryauth.TokenTransport, error) {
+	return nil, errors.New("unused")
+}
+func (f pullRedirectFactory) Redirect(_ context.Context, authority string) (http.RoundTripper, error) {
+	if authority != "production.cloudfront.docker.com" {
+		return nil, errors.New("unexpected redirect authority")
+	}
+	return f.redirect, nil
+}
+
+func TestPullProxyRedirectDropsBearerAndRejectsUntrustedAuthority(t *testing.T) {
+	registryRequests, blobRequests := 0, 0
+	registryTransport := pullRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		registryRequests++
+		if got := r.Header.Get("Authorization"); got != "Bearer registry-token" {
+			t.Fatalf("registry authorization = %q", got)
+		}
+		return &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: http.Header{"Location": []string{"https://production.cloudfront.docker.com/blob?sig=synthetic"}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	blobTransport := pullRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		blobRequests++
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("registry bearer crossed origin: %q", got)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Length": []string{"4"}}, Body: io.NopCloser(strings.NewReader("blob")), ContentLength: 4}, nil
+	})
+	p := &PullProxy{authority: "registry-1.docker.io", transportFactory: pullRedirectFactory{redirect: blobTransport}, maxBytes: 8}
+	client := &http.Client{Transport: registryTransport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	endpoint, _ := url.Parse("https://registry-1.docker.io/v2/library/test/blobs/sha256:abcd")
+	resp, err := p.followPullRedirects(context.Background(), client, httptest.NewRequest(http.MethodGet, "http://guest/v2/library/test/blobs/sha256:abcd", http.NoBody), endpoint, "registry-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != "blob" || registryRequests != 1 || blobRequests != 1 {
+		t.Fatalf("redirect result body=%q err=%v registry=%d blob=%d", body, err, registryRequests, blobRequests)
+	}
+	if trustedPullRedirectHost("attacker.example") || trustedPullRedirectHost("production.cloudfront.docker.com:444") {
+		t.Fatal("untrusted pull redirect host accepted")
+	}
+}
+
 func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	tokenRequests, registryRequests := 0, 0
 	challengeRealm := ""
@@ -197,6 +249,45 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	proxy.ServeHTTP(afterLogout, httptest.NewRequest(http.MethodGet, "http://guest/v2/demo/manifests/latest", http.NoBody))
 	if afterLogout.Code != http.StatusBadGateway || tokenRequests != 2 {
 		t.Fatal("pull obtained new token after logout")
+	}
+}
+
+func TestPullProxyPreservesNotModifiedResponse(t *testing.T) {
+	transport := pullRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("ETag", "\"fixture\"")
+		return &http.Response{StatusCode: http.StatusNotModified, Header: header, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	proxy := &PullProxy{authority: "registry-1.docker.io"}
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	endpoint, _ := url.Parse("https://registry-1.docker.io/v2/library/test/manifests/latest")
+	response, err := proxy.followPullRedirects(context.Background(), client, httptest.NewRequest(http.MethodGet, "http://guest/v2/library/test/manifests/latest", http.NoBody), endpoint, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNotModified || response.Header.Get("ETag") != "\"fixture\"" {
+		t.Fatalf("not-modified response = status %d, ETag %q", response.StatusCode, response.Header.Get("ETag"))
+	}
+}
+
+func TestValidatePullRedirectRejectsUnsafeTargets(t *testing.T) {
+	current, _ := url.Parse("https://registry-1.docker.io/v2/library/test/blobs/sha256:abcd")
+	for _, location := range []string{
+		"",
+		"http://production.cloudfront.docker.com/blob",
+		"https://user@production.cloudfront.docker.com/blob",
+		"https://production.cloudfront.docker.com:444/blob",
+		"https://registry-1.docker.io.attacker.example/blob",
+		"https://attacker.example/blob",
+	} {
+		if _, err := validatePullRedirect(current, location, "registry-1.docker.io"); err == nil {
+			t.Errorf("accepted unsafe redirect target %q", location)
+		}
+	}
+	got, err := validatePullRedirect(current, "https://production.cloudfront.docker.com/blob?sig=synthetic", "registry-1.docker.io")
+	if err != nil || got.Host != "production.cloudfront.docker.com" {
+		t.Fatalf("rejected trusted blob redirect: target=%v err=%v", got, err)
 	}
 }
 
