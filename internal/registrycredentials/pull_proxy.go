@@ -205,7 +205,7 @@ func (p *PullProxy) writeResponse(w http.ResponseWriter, method string, resp *ht
 }
 
 func allowedPullStatus(code int) bool {
-	return code == http.StatusOK || code == http.StatusPartialContent || code == http.StatusNotModified
+	return code == http.StatusOK || code == http.StatusPartialContent || code == http.StatusNotModified || code == http.StatusNotFound
 }
 
 func (p *PullProxy) pull(ctx context.Context, incoming *http.Request, endpoint *url.URL) (*http.Response, error) {

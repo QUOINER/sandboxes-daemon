@@ -102,6 +102,12 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 			_, _ = fmt.Fprint(w, `{"public":true}`)
 			return
 		}
+		if r.URL.Path == "/v2/missing/manifests/latest" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprint(w, `{"errors":[{"code":"MANIFEST_UNKNOWN"}]}`)
+			return
+		}
 		if r.URL.Path == "/v2/public-gzip/manifests/latest" {
 			if r.Header.Get("Accept-Encoding") != "identity" {
 				t.Errorf("upstream Accept-Encoding = %q, want identity", r.Header.Get("Accept-Encoding"))
@@ -214,6 +220,11 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	proxy.ServeHTTP(public, httptest.NewRequest(http.MethodGet, "http://guest/v2/public/manifests/latest", http.NoBody))
 	if public.Code != http.StatusOK || public.Body.String() != `{"public":true}` || tokenRequests != 2 {
 		t.Fatal("public pull did not succeed without a token exchange")
+	}
+	missing := httptest.NewRecorder()
+	proxy.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "http://guest/v2/missing/manifests/latest", http.NoBody))
+	if missing.Code != http.StatusNotFound || !strings.Contains(missing.Body.String(), "MANIFEST_UNKNOWN") || tokenRequests != 2 {
+		t.Fatalf("missing manifest response status=%d body=%q tokens=%d", missing.Code, missing.Body.String(), tokenRequests)
 	}
 	compressed := httptest.NewRecorder()
 	proxy.ServeHTTP(compressed, httptest.NewRequest(http.MethodGet, "http://guest/v2/public-gzip/manifests/latest", http.NoBody))
