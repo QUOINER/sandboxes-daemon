@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	core "github.com/rheic/sandboxes-core"
@@ -23,22 +24,24 @@ import (
 
 const (
 	proxySocketPort      = uint32(1027)
-	proxyGuestListenPort = uint16(3128)
 	proxySettingPrefix   = "sandbox.proxy-service."
 	proxyGuestHelperPath = "/tmp/rheic-proxy-helper"
-	proxyLocalV1BaseURL  = "http://127.0.0.1:3128/v1"
+	proxyMaxRoutes       = 32
 )
 
 type proxyRuntimeConfig struct {
-	port        uint32
-	socketPath  string
-	helperPath  string
-	guestPort   uint16
-	serviceHost string
+	port       uint32
+	socketPath string
+	helperPath string
+	routes     []string
 }
 
 type proxyRuntime interface {
 	CreateWithProxy(context.Context, *runtime.Config, string, uint16, string) (runtime.Handle, error)
+}
+
+type proxyRoutesRuntime interface {
+	CreateWithProxyRouteArgs(context.Context, *runtime.Config, string, []string) (runtime.Handle, error)
 }
 
 type proxyEnvContract struct {
@@ -47,6 +50,7 @@ type proxyEnvContract struct {
 	baseURLEnv    string
 	baseURL       string
 	upstreamHost  string
+	guestPort     uint16
 }
 
 func proxyContract(name string) (proxyEnvContract, bool) {
@@ -61,34 +65,48 @@ func proxyContract(name string) (proxyEnvContract, bool) {
 	contract := proxyEnvContract{serviceName: strings.ToLower(name), upstreamHost: upstream.Host}
 	switch contract.serviceName {
 	case "openai":
-		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "OPENAI_API_KEY", "OPENAI_BASE_URL", proxyLocalV1BaseURL
+		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "OPENAI_API_KEY", "OPENAI_BASE_URL", 3128
 	case "anthropic":
-		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "http://127.0.0.1:3128"
+		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", 43129
 	case "groq":
-		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "GROQ_API_KEY", "GROQ_BASE_URL", "http://127.0.0.1:3128/openai/v1"
+		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "GROQ_API_KEY", "GROQ_BASE_URL", 43130
 	case "mistral":
-		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "MISTRAL_API_KEY", "MISTRAL_BASE_URL", proxyLocalV1BaseURL
+		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "MISTRAL_API_KEY", "MISTRAL_BASE_URL", 43131
 	case "openrouter":
-		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "http://127.0.0.1:3128/api/v1"
+		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", 43132
 	case "xai":
-		contract.credentialEnv, contract.baseURLEnv, contract.baseURL = "XAI_API_KEY", "XAI_BASE_URL", proxyLocalV1BaseURL
+		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "XAI_API_KEY", "XAI_BASE_URL", 43133
 	default:
 		return proxyEnvContract{}, false
 	}
+	contract.baseURL = proxyBaseURL(contract.serviceName, contract.guestPort)
 	return contract, true
 }
 
+func proxyBaseURL(service string, port uint16) string {
+	base := fmt.Sprintf("http://127.0.0.1:%d", port)
+	switch service {
+	case "openai", "mistral", "xai":
+		return base + "/v1"
+	case "groq":
+		return base + "/openai/v1"
+	case "openrouter":
+		return base + "/api/v1"
+	default:
+		return base
+	}
+}
+
 // stripProxyCreateEnv removes credential references from the container's
-// persistent environment while returning the single service needed to prepare
-// the per-VM channel before the guest init process starts.
-func stripProxyCreateEnv(env []string) ([]string, string, error) {
+// persistent environment and returns all required fixed proxy services.
+func stripProxyCreateEnv(env []string) ([]string, []string, error) {
 	filtered := make([]string, 0, len(env))
-	serviceName := ""
+	serviceNames := make(map[string]struct{})
 	keys := make(map[string]string, len(env))
 	for _, entry := range env {
 		key, value, ok := strings.Cut(entry, "=")
 		if !ok {
-			return nil, "", fmt.Errorf("%w: invalid environment entry", core.ErrConflict)
+			return nil, nil, fmt.Errorf("%w: invalid environment entry", core.ErrConflict)
 		}
 		keys[key] = value
 		if !strings.Contains(value, "${proxy:") {
@@ -96,32 +114,36 @@ func stripProxyCreateEnv(env []string) ([]string, string, error) {
 			continue
 		}
 		if !strings.HasPrefix(value, "${proxy:") || !strings.HasSuffix(value, "}") || strings.Count(value, "${proxy:") != 1 {
-			return nil, "", fmt.Errorf("%w: invalid proxy reference for %s", core.ErrConflict, key)
+			return nil, nil, fmt.Errorf("%w: invalid proxy reference for %s", core.ErrConflict, key)
 		}
 		name := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(value, "${proxy:"), "}"))
 		contract, ok := proxyContract(name)
 		if !ok || key != contract.credentialEnv {
-			return nil, "", fmt.Errorf("%w: proxy reference is not supported for %s", core.ErrConflict, key)
+			return nil, nil, fmt.Errorf("%w: proxy reference is not supported for %s", core.ErrConflict, key)
 		}
-		if serviceName != "" && serviceName != name {
-			return nil, "", fmt.Errorf("%w: one proxy service may be configured per sandbox", core.ErrConflict)
+		serviceNames[name] = struct{}{}
+		if len(serviceNames) > proxyMaxRoutes {
+			return nil, nil, fmt.Errorf("%w: too many proxy services configured", core.ErrConflict)
 		}
-		serviceName = name
 	}
-	if serviceName != "" {
+	names := make([]string, 0, len(serviceNames))
+	for name := range serviceNames {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, serviceName := range names {
 		contract, _ := proxyContract(serviceName)
 		if _, exists := keys[contract.baseURLEnv]; exists {
-			return nil, "", fmt.Errorf("%w: %s is managed by the service proxy", core.ErrConflict, contract.baseURLEnv)
+			return nil, nil, fmt.Errorf("%w: %s is managed by the service proxy", core.ErrConflict, contract.baseURLEnv)
 		}
 	}
-	return filtered, serviceName, nil
+	return filtered, names, nil
 }
 
 func proxyServiceSettingKey(id string) string { return proxySettingPrefix + id }
 
-func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, serviceName string) (proxyRuntimeConfig, error) {
-	contract, ok := proxyContract(serviceName)
-	if !ok || s.secretProxies == nil || s.serviceSecrets == nil {
+func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, serviceNames []string) (proxyRuntimeConfig, error) {
+	if !validProxyServiceNames(serviceNames) || s.secretProxies == nil || s.serviceSecrets == nil {
 		return proxyRuntimeConfig{}, fmt.Errorf("%w: service proxy is unavailable", core.ErrConflict)
 	}
 	if err := validateProxyHelperBinary(s.proxyHelperPath); err != nil {
@@ -129,16 +151,10 @@ func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, se
 	}
 	dir := proxySocketDirectory(s.proxyTempDir, sb.ID)
 	socketPath := filepath.Join(dir, "p.sock")
-	if s.secretProxies.Has(sb.Name, serviceName) {
-		return proxyRuntimeConfig{
-			port: proxySocketPort, socketPath: socketPath,
-			helperPath: s.proxyHelperPath, guestPort: proxyGuestListenPort, serviceHost: contract.upstreamHost,
-		}, nil
-	}
 	if err := secretproxy.EnsurePrivateDir(dir); err != nil {
 		return proxyRuntimeConfig{}, fmt.Errorf("prepare proxy socket directory: %w", err)
 	}
-	if !s.secretProxies.Has(sb.Name, serviceName) {
+	if !s.proxyRoutesActive(sb.Name, serviceNames) {
 		if err := secretproxy.RemoveStaleSocket(filepath.Join(dir, "p.sock")); err != nil {
 			return proxyRuntimeConfig{}, fmt.Errorf("recover proxy socket: %w", err)
 		}
@@ -149,21 +165,87 @@ func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, se
 			_ = secretproxy.RemovePrivateDir(dir)
 		}
 	}()
-	secret, scope, err := s.loadServiceProxySecret(ctx, serviceName, sb.Name)
+	routes, runtimeRoutes, err := s.buildProxyRoutes(ctx, sb, serviceNames)
 	if err != nil {
 		return proxyRuntimeConfig{}, err
 	}
-	defer clear(secret)
+	if _, err := s.secretProxies.StartUnixRoutes(ctx, sb.Name, routes, socketPath); err != nil {
+		clearRouteSecrets(routes)
+		return proxyRuntimeConfig{}, fmt.Errorf("start host service proxy: %w", err)
+	}
+	clearRouteSecrets(routes)
+	prepared = true
+	return proxyRuntimeConfig{port: proxySocketPort, socketPath: socketPath, helperPath: s.proxyHelperPath, routes: runtimeRoutes}, nil
+}
+
+func validProxyServiceNames(names []string) bool {
+	if len(names) == 0 || len(names) > proxyMaxRoutes {
+		return false
+	}
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if !proxyRouteConfigured(name) {
+			return false
+		}
+		if _, exists := seen[name]; exists {
+			return false
+		}
+		seen[name] = struct{}{}
+	}
+	return true
+}
+
+func (s *Service) proxyRoutesActive(sandboxName string, names []string) bool {
+	for _, name := range names {
+		if s.secretProxies.Has(sandboxName, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) buildProxyRoutes(ctx context.Context, sb sandbox.Sandbox, serviceNames []string) (map[string]secretproxy.RouteConfig, []string, error) {
+	routes := make(map[string]secretproxy.RouteConfig, len(serviceNames))
+	runtimeRoutes := make([]string, 0, len(serviceNames))
+	for _, serviceName := range serviceNames {
+		route, runtimeRoute, err := s.buildProxyRoute(ctx, sb, serviceName)
+		if err != nil {
+			clearRouteSecrets(routes)
+			return nil, nil, err
+		}
+		routes[serviceName] = route
+		runtimeRoutes = append(runtimeRoutes, runtimeRoute)
+	}
+	return routes, runtimeRoutes, nil
+}
+
+func (s *Service) buildProxyRoute(ctx context.Context, sb sandbox.Sandbox, name string) (secretproxy.RouteConfig, string, error) {
+	contract, ok := proxyContract(name)
+	if !ok {
+		return secretproxy.RouteConfig{}, "", fmt.Errorf("%w: unsupported service proxy route", core.ErrConflict)
+	}
+	secret, scope, err := s.loadServiceProxySecret(ctx, name, sb.Name)
+	if err != nil {
+		return secretproxy.RouteConfig{}, "", err
+	}
 	var randomToken [32]byte
 	if _, err := rand.Read(randomToken[:]); err != nil {
-		return proxyRuntimeConfig{}, fmt.Errorf("generate per-sandbox proxy token: %w", err)
+		clear(secret)
+		clear(randomToken[:])
+		return secretproxy.RouteConfig{}, "", fmt.Errorf("generate per-sandbox proxy token: %w", err)
 	}
 	token := hex.EncodeToString(randomToken[:])
 	clear(randomToken[:])
-	brokerService := contractService(serviceName)
-	brokerService.CredentialScope = string(scope)
-	brokerService.Authorize = func(ctx context.Context) error {
-		decision, err := s.CheckPolicy(ctx, sb.ID, tcpProtocol, "", contract.upstreamHost, 443)
+	service := contractService(name)
+	service.CredentialScope = string(scope)
+	service.Authorize = s.proxyPolicyAuthorizer(sb.ID, contract.upstreamHost)
+	return secretproxy.RouteConfig{Service: service, Secret: secret, Token: token},
+		fmt.Sprintf("%s=%s:%d", name, contract.upstreamHost, contract.guestPort), nil
+}
+
+func (s *Service) proxyPolicyAuthorizer(sandboxID, host string) func(context.Context) error {
+	return func(ctx context.Context) error {
+		decision, err := s.CheckPolicy(ctx, sandboxID, tcpProtocol, "", host, 443)
 		if err != nil {
 			return err
 		}
@@ -172,25 +254,46 @@ func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, se
 		}
 		return nil
 	}
-	if _, err := s.secretProxies.StartUnix(ctx, sb.Name, serviceName, brokerService, secret, socketPath, token); err != nil {
-		return proxyRuntimeConfig{}, fmt.Errorf("start host service proxy: %w", err)
+}
+
+func decodeProxyServices(value string) []string {
+	if value == "" {
+		return nil
 	}
-	prepared = true
-	return proxyRuntimeConfig{
-		port: proxySocketPort, socketPath: socketPath,
-		helperPath: s.proxyHelperPath, guestPort: proxyGuestListenPort, serviceHost: contract.upstreamHost,
-	}, nil
+	services := strings.Split(value, ",")
+	for i := range services {
+		services[i] = strings.TrimSpace(services[i])
+	}
+	sort.Strings(services)
+	return services
+}
+
+func encodeProxyServices(services []string) string {
+	ordered := append([]string(nil), services...)
+	sort.Strings(ordered)
+	return strings.Join(ordered, ",")
+}
+
+func proxyRouteConfigured(service string) bool {
+	_, ok := proxyContract(service)
+	return ok
+}
+
+func clearRouteSecrets(routes map[string]secretproxy.RouteConfig) {
+	for _, route := range routes {
+		clear(route.Secret)
+	}
 }
 
 func (s *Service) prepareStoredProxy(ctx context.Context, sb sandbox.Sandbox) error {
-	serviceName, err := s.store.GetSetting(ctx, proxyServiceSettingKey(sb.ID))
+	serviceSetting, err := s.store.GetSetting(ctx, proxyServiceSettingKey(sb.ID))
 	if errors.Is(err, core.ErrNotFound) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("load sandbox proxy configuration: %w", err)
 	}
-	_, err = s.proxyChannelConfig(ctx, sb, serviceName)
+	_, err = s.proxyChannelConfig(ctx, sb, decodeProxyServices(serviceSetting))
 	return err
 }
 

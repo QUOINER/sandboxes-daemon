@@ -187,31 +187,31 @@ const (
 // never written to SQLite or sandbox metadata. Sandbox scope wins over global.
 func (s *Service) resolveSecretEnv(ctx context.Context, sb sandbox.Sandbox, env []string) ([]string, error) {
 	out := make([]string, 0, len(env)+1)
-	proxyService := ""
+	proxyServices := make([]string, 0)
 	for _, entry := range env {
 		key, value, found := strings.Cut(entry, "=")
 		if !found {
 			out = append(out, entry)
 			continue
 		}
-		resolved, serviceName, err := s.resolveEnvEntry(ctx, sb, key, value, proxyService)
+		resolved, serviceName, err := s.resolveEnvEntry(ctx, sb, key, value)
 		if err != nil {
 			return nil, err
 		}
 		if serviceName != "" {
-			proxyService = serviceName
+			proxyServices = appendUniqueString(proxyServices, serviceName)
 		}
 		out = append(out, resolved)
 	}
-	if proxyService == "" {
+	if len(proxyServices) == 0 {
 		return out, nil
 	}
-	return s.finishProxyEnv(ctx, sb, env, out, proxyService)
+	return s.finishProxyEnv(ctx, sb, env, out, proxyServices)
 }
 
-func (s *Service) resolveEnvEntry(ctx context.Context, sb sandbox.Sandbox, key, value, currentProxy string) (string, string, error) {
+func (s *Service) resolveEnvEntry(ctx context.Context, sb sandbox.Sandbox, key, value string) (string, string, error) {
 	if strings.Contains(value, proxyRefPrefix) {
-		return s.resolveProxyEnvEntry(ctx, sb, key, value, currentProxy)
+		return s.resolveProxyEnvEntry(ctx, sb, key, value)
 	}
 	if strings.HasPrefix(value, secretRefPrefix) {
 		resolved, err := s.resolveSecretReference(ctx, sb, key, value)
@@ -220,21 +220,18 @@ func (s *Service) resolveEnvEntry(ctx context.Context, sb sandbox.Sandbox, key, 
 	return key + "=" + value, "", nil
 }
 
-func (s *Service) resolveProxyEnvEntry(ctx context.Context, sb sandbox.Sandbox, key, value, current string) (string, string, error) {
+func (s *Service) resolveProxyEnvEntry(ctx context.Context, sb sandbox.Sandbox, key, value string) (string, string, error) {
 	if !strings.HasPrefix(value, proxyRefPrefix) || !strings.HasSuffix(value, "}") || strings.Count(value, proxyRefPrefix) != 1 {
-		return "", current, fmt.Errorf("%w: invalid proxy reference for %s", core.ErrConflict, key)
+		return "", "", fmt.Errorf("%w: invalid proxy reference for %s", core.ErrConflict, key)
 	}
 	name := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(value, proxyRefPrefix), "}"))
 	contract, ok := proxyContract(name)
 	if !ok || key != contract.credentialEnv {
-		return "", current, fmt.Errorf("%w: proxy reference is not supported for %s", core.ErrConflict, key)
+		return "", "", fmt.Errorf("%w: proxy reference is not supported for %s", core.ErrConflict, key)
 	}
-	if current != "" && current != name {
-		return "", current, fmt.Errorf("%w: one proxy service may be used per exec", core.ErrConflict)
-	}
-	configured, err := s.store.GetSetting(ctx, proxyServiceSettingKey(sb.ID))
-	if err != nil || configured != name {
-		return "", current, fmt.Errorf("%w: sandbox was not created with the %s proxy channel", core.ErrConflict, name)
+	configuredValue, err := s.store.GetSetting(ctx, proxyServiceSettingKey(sb.ID))
+	if err != nil || !containsString(decodeProxyServices(configuredValue), name) {
+		return "", "", fmt.Errorf("%w: sandbox was not created with the %s proxy channel", core.ErrConflict, name)
 	}
 	return key + "=rheic-proxy-placeholder", name, nil
 }
@@ -261,18 +258,43 @@ func (s *Service) resolveSecretReference(ctx context.Context, sb sandbox.Sandbox
 	return key + "=" + string(secret), nil
 }
 
-func (s *Service) finishProxyEnv(ctx context.Context, sb sandbox.Sandbox, env, out []string, proxyService string) ([]string, error) {
-	contract, _ := proxyContract(proxyService)
-	for _, entry := range env {
-		key, _, _ := strings.Cut(entry, "=")
-		if key == contract.baseURLEnv {
-			return nil, fmt.Errorf("%w: %s is managed by the service proxy", core.ErrConflict, contract.baseURLEnv)
+func (s *Service) finishProxyEnv(ctx context.Context, sb sandbox.Sandbox, env, out, proxyServices []string) ([]string, error) {
+	for _, serviceName := range proxyServices {
+		contract, ok := proxyContract(serviceName)
+		if !ok {
+			return nil, fmt.Errorf("%w: unsupported service proxy route", core.ErrConflict)
+		}
+		for _, entry := range env {
+			key, _, _ := strings.Cut(entry, "=")
+			if key == contract.baseURLEnv {
+				return nil, fmt.Errorf("%w: %s is managed by the service proxy", core.ErrConflict, contract.baseURLEnv)
+			}
 		}
 	}
 	if err := s.prepareStoredProxy(ctx, sb); err != nil {
 		return nil, err
 	}
-	return append(out, contract.baseURLEnv+"="+contract.baseURL), nil
+	for _, serviceName := range proxyServices {
+		contract, _ := proxyContract(serviceName)
+		out = append(out, contract.baseURLEnv+"="+contract.baseURL)
+	}
+	return out, nil
+}
+
+func appendUniqueString(values []string, value string) []string {
+	if containsString(values, value) {
+		return values
+	}
+	return append(values, value)
+}
+
+func containsString(values []string, value string) bool {
+	for _, current := range values {
+		if current == value {
+			return true
+		}
+	}
+	return false
 }
 
 // cancelExecSessions is called with the sandbox lifecycle gate held.

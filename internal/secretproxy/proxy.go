@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,9 @@ const (
 	authHeader      = "Authorization"
 	bearerPrefix    = "Bearer "
 	tokenPath       = "/__rheic/proxy/token" //nolint:gosec // internal route path, not a credential
+	tokenPathPrefix = tokenPath + "/"
+	// ServiceHeader identifies a host-configured route on the private proxy channel.
+	ServiceHeader   = "X-Rheic-Proxy-Service"
 	maxRequestBody  = 64 << 20
 	maxResponseBody = 64 << 20
 )
@@ -89,10 +93,23 @@ type proxy struct {
 	url      string
 	mu       sync.RWMutex
 	path     string
+	routes   map[string]*proxyRoute
+}
+
+type proxyRoute struct {
 	upstream string
 	service  Service
 	secret   []byte
 	token    []byte
+	reverse  *httputil.ReverseProxy
+}
+
+// RouteConfig binds one fixed host service to credentials and an unguessable
+// per-sandbox helper token. Secret values remain host-side.
+type RouteConfig struct {
+	Service Service
+	Secret  []byte
+	Token   string
 }
 
 // TokenHeader carries the per-VM bearer sent by the guest proxy helper. It is
@@ -121,46 +138,63 @@ func (m *Manager) Has(sandbox, service string) bool {
 // carry the per-VM token; the socket is private (0600) and owned by the run
 // directory, so the token is defense in depth rather than the only control.
 func (m *Manager) StartUnix(ctx context.Context, sandbox, service string, cfg Service, secret []byte, socketPath, token string) (string, error) {
-	if err := validUnixStart(ctx, sandbox, service, secret, socketPath, token); err != nil {
+	return m.StartUnixRoutes(ctx, sandbox, map[string]RouteConfig{service: {Service: cfg, Secret: secret, Token: token}}, socketPath)
+}
+
+// StartUnixRoutes starts one per-sandbox channel with fixed upstream routes.
+// Each route has an independent secret and token; request metadata can select
+// only a route that the host configured for this sandbox.
+func (m *Manager) StartUnixRoutes(ctx context.Context, sandbox string, routes map[string]RouteConfig, socketPath string) (string, error) {
+	if err := validateRouteConfigs(ctx, sandbox, routes, socketPath); err != nil {
 		return "", err
 	}
-	upstream, err := parseUpstream(cfg.Upstream)
-	if err != nil {
-		return "", err
+	preparedRoutes := make(map[string]*proxyRoute, len(routes))
+	for name, route := range routes {
+		upstream, err := parseUpstream(route.Service.Upstream)
+		if err != nil {
+			clearPreparedRoutes(preparedRoutes)
+			return "", err
+		}
+		reverse := httputil.NewSingleHostReverseProxy(upstream)
+		reverse.Transport = outboundTransport(upstream.Scheme == "https", m.dialContext)
+		reverse.ModifyResponse = enforceResponseLimit
+		reverse.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
+			http.Error(w, "proxy upstream unavailable", http.StatusBadGateway)
+		}
+		preparedRoutes[name] = &proxyRoute{upstream: upstream.String(), service: route.Service,
+			secret: append([]byte(nil), route.Secret...), token: []byte(route.Token), reverse: reverse}
 	}
-	key := sandbox + "/" + service
+	key := sandbox + "/" + firstRouteName(preparedRoutes)
 	m.mu.Lock()
-	if existing := m.proxies[key]; existing != nil {
-		m.mu.Unlock()
-		return existing.update(socketPath, upstream.String(), cfg, secret, token)
-	}
+	existing := m.proxies[key]
 	m.mu.Unlock()
+	if existing != nil {
+		return existing.updateRoutes(socketPath, preparedRoutes)
+	}
 	listener, err := listenPrivateUnix(socketPath)
 	if err != nil {
 		m.mu.Lock()
-		existing := m.proxies[key]
+		existing = m.proxies[key]
 		m.mu.Unlock()
 		if existing != nil {
-			return existing.update(socketPath, upstream.String(), cfg, secret, token)
+			return existing.updateRoutes(socketPath, preparedRoutes)
 		}
+		clearPreparedRoutes(preparedRoutes)
 		return "", err
 	}
-	reverse := httputil.NewSingleHostReverseProxy(upstream)
-	reverse.Transport = outboundTransport(upstream.Scheme == "https", m.dialContext)
-	reverse.ModifyResponse = enforceResponseLimit
-	reverse.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
-		http.Error(w, "proxy upstream unavailable", http.StatusBadGateway)
-	}
-	p := &proxy{path: socketPath, upstream: upstream.String(), service: cfg, secret: append([]byte(nil), secret...), token: []byte(token), url: "unix:" + socketPath}
-	srv := &http.Server{Handler: proxyHandler(service, p, reverse), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 64 << 10}
+	p := &proxy{path: socketPath, routes: preparedRoutes, url: "unix:" + socketPath}
+	srv := &http.Server{Handler: proxyHandler(p), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 64 << 10}
 	p.server, p.listener = srv, listener
 	m.mu.Lock()
-	if existing := m.proxies[key]; existing != nil {
+	if existing = m.proxies[key]; existing != nil {
 		m.mu.Unlock()
 		_ = listener.Close()
-		return existing.update(socketPath, upstream.String(), cfg, secret, token)
+		clearPreparedRoutes(preparedRoutes)
+		return existing.updateRoutes(socketPath, preparedRoutes)
 	}
-	m.proxies[key] = p
+	for name := range preparedRoutes {
+		m.proxies[sandbox+"/"+name] = p
+	}
 	m.mu.Unlock()
 	go func() { _ = srv.Serve(listener) }()
 	return p.url, nil
@@ -176,90 +210,231 @@ func enforceResponseLimit(response *http.Response) error {
 	return nil
 }
 
-func proxyHandler(service string, p *proxy, reverse *httputil.ReverseProxy) http.Handler {
+func proxyHandler(p *proxy) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == tokenPath {
-			if r.Method != http.MethodGet || r.URL.RawQuery != "" || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
-				http.Error(w, "invalid proxy bootstrap request", http.StatusBadRequest)
-				return
-			}
-			w.Header().Set("Cache-Control", "no-store")
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(p.currentToken()))
+		if r.URL.Path == tokenPath || strings.HasPrefix(r.URL.Path, tokenPathPrefix) {
+			serveProxyToken(w, r, p)
 			return
 		}
-		got := r.Header.Get(TokenHeader)
-		cfg, secret, token := p.snapshot()
-		defer clear(secret)
-		defer clear(token)
-		if len(got) != len(token) || subtle.ConstantTimeCompare([]byte(got), token) != 1 {
-			http.Error(w, "proxy channel unauthorized", http.StatusForbidden)
-			return
-		}
-		if cfg.Authorize != nil {
-			if err := cfg.Authorize(r.Context()); err != nil {
-				http.Error(w, "proxy request denied by sandbox policy", http.StatusForbidden)
-				return
-			}
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
-		r.Header.Del(TokenHeader)
-		r.Header.Del("Authorization")
-		r.Header.Del("X-Api-Key")
-		if cfg.Header != "" {
-			r.Header.Set(cfg.Header, cfg.Prefix+string(secret))
-		}
-		r.Header.Set("X-Rheic-Secret-Proxy", service)
-		reverse.ServeHTTP(w, r)
+		serveProxyRequest(w, r, p)
 	})
 }
 
-func (p *proxy) currentToken() string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return string(p.token)
+func serveProxyToken(w http.ResponseWriter, r *http.Request, p *proxy) {
+	if r.Method != http.MethodGet || r.URL.RawQuery != "" || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		http.Error(w, "invalid proxy bootstrap request", http.StatusBadRequest)
+		return
+	}
+	service := strings.TrimPrefix(r.URL.Path, tokenPathPrefix)
+	if service == r.URL.Path {
+		service = p.onlyRoute()
+	}
+	token, ok := p.tokenSnapshot(service)
+	if !ok {
+		http.Error(w, "proxy bootstrap denied", http.StatusForbidden)
+		return
+	}
+	defer clear(token)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(token)
 }
 
-func (p *proxy) snapshot() (Service, []byte, []byte) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.service, append([]byte(nil), p.secret...), append([]byte(nil), p.token...)
+func serveProxyRequest(w http.ResponseWriter, r *http.Request, p *proxy) {
+	service := r.Header.Get(ServiceHeader)
+	if service == "" {
+		service = p.onlyRoute()
+	}
+	cfg, secret, token, reverse, ok := p.snapshot(service)
+	defer clear(secret)
+	defer clear(token)
+	if !ok || !validProxyToken(r.Header.Get(TokenHeader), token) {
+		http.Error(w, "proxy channel unauthorized", http.StatusForbidden)
+		return
+	}
+	if cfg.Authorize != nil {
+		if err := cfg.Authorize(r.Context()); err != nil {
+			http.Error(w, "proxy request denied by sandbox policy", http.StatusForbidden)
+			return
+		}
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	r.Header.Del(TokenHeader)
+	r.Header.Del(ServiceHeader)
+	r.Header.Del("Authorization")
+	r.Header.Del("X-Api-Key")
+	if cfg.Header != "" {
+		r.Header.Set(cfg.Header, cfg.Prefix+string(secret))
+	}
+	r.Header.Set("X-Rheic-Secret-Proxy", service)
+	reverse.ServeHTTP(w, r)
 }
 
-func (p *proxy) update(socketPath, upstream string, cfg Service, secret []byte, token string) (string, error) {
+func validProxyToken(received string, expected []byte) bool {
+	return len(received) == len(expected) && subtle.ConstantTimeCompare([]byte(received), expected) == 1
+}
+
+func (p *proxy) onlyRoute() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.routes) != 1 {
+		return ""
+	}
+	for service := range p.routes {
+		return service
+	}
+	return ""
+}
+
+func (p *proxy) snapshot(name string) (Service, []byte, []byte, *httputil.ReverseProxy, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	route := p.routes[name]
+	if route == nil {
+		return Service{}, nil, nil, nil, false
+	}
+	return route.service, append([]byte(nil), route.secret...), append([]byte(nil), route.token...), route.reverse, true
+}
+
+func (p *proxy) tokenSnapshot(name string) ([]byte, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	route := p.routes[name]
+	if route == nil {
+		return nil, false
+	}
+	return append([]byte(nil), route.token...), true
+}
+
+func (p *proxy) updateRoutes(socketPath string, routes map[string]*proxyRoute) (string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.path != socketPath || p.upstream != upstream {
+	if p.path != socketPath || len(p.routes) != len(routes) {
+		clearPreparedRoutes(routes)
 		return "", errors.New("proxy channel configuration changed; sandbox restart is required")
 	}
-	clear(p.secret)
-	clear(p.token)
-	p.service, p.secret, p.token = cfg, append([]byte(nil), secret...), []byte(token)
+	for name, next := range routes {
+		current := p.routes[name]
+		if current == nil || current.upstream != next.upstream {
+			clearPreparedRoutes(routes)
+			return "", errors.New("proxy channel configuration changed; sandbox restart is required")
+		}
+	}
+	for name, next := range routes {
+		current := p.routes[name]
+		clear(current.secret)
+		clear(current.token)
+		current.service = next.service
+		current.secret = next.secret
+		current.token = next.token
+		next.secret, next.token = nil, nil
+	}
 	return p.url, nil
 }
 
-func (p *proxy) refreshSecret(secret []byte) {
+func (p *proxy) refreshSecret(service string, secret []byte) {
 	p.mu.Lock()
-	clear(p.secret)
-	p.secret = append([]byte(nil), secret...)
+	if route := p.routes[service]; route != nil {
+		clear(route.secret)
+		route.secret = append([]byte(nil), secret...)
+	}
+	p.mu.Unlock()
+}
+
+func (p *proxy) clearRoute(service string) {
+	p.mu.Lock()
+	if route := p.routes[service]; route != nil {
+		clear(route.secret)
+		clear(route.token)
+		route.secret, route.token = nil, nil
+		route.service.Authorize = nil
+		delete(p.routes, service)
+	}
 	p.mu.Unlock()
 }
 
 func (p *proxy) clearCredentials() {
 	p.mu.Lock()
-	clear(p.secret)
-	clear(p.token)
-	p.secret, p.token = nil, nil
-	p.service.Authorize = nil
+	for _, route := range p.routes {
+		clear(route.secret)
+		clear(route.token)
+		route.secret, route.token = nil, nil
+		route.service.Authorize = nil
+	}
+	p.routes = make(map[string]*proxyRoute)
 	p.mu.Unlock()
+}
+
+func (p *proxy) routeScope(service string) (string, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	route := p.routes[service]
+	if route == nil {
+		return "", false
+	}
+	return route.service.CredentialScope, true
+}
+
+func (p *proxy) routeCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.routes)
+}
+
+func validateRouteConfigs(ctx context.Context, sandbox string, routes map[string]RouteConfig, socketPath string) error {
+	if sandbox == "" || len(routes) == 0 || len(routes) > 32 {
+		return errors.New("sandbox and one to 32 service routes are required")
+	}
+	for name, route := range routes {
+		if !validRouteName(name) || route.Secret == nil {
+			return errors.New("invalid proxy service route")
+		}
+		if err := validUnixStart(ctx, sandbox, name, route.Secret, socketPath, route.Token); err != nil {
+			return err
+		}
+		if _, err := parseUpstream(route.Service.Upstream); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validRouteName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for _, char := range name {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func firstRouteName(routes map[string]*proxyRoute) string {
+	names := make([]string, 0, len(routes))
+	for name := range routes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names[0]
+}
+
+func clearPreparedRoutes(routes map[string]*proxyRoute) {
+	for _, route := range routes {
+		clear(route.secret)
+		clear(route.token)
+		route.secret, route.token = nil, nil
+	}
 }
 
 // RefreshSecret replaces the in-memory secret for active channels whose
 // service/scope matches. It never persists the value.
 func (m *Manager) RefreshSecret(service, sandboxName, scope string, secret []byte) {
 	m.mu.Lock()
-	selected := make([]*proxy, 0)
+	selected := make(map[*proxy]struct{})
 	for key, current := range m.proxies {
 		if sandboxName != "" && key != sandboxName+"/"+service {
 			continue
@@ -267,21 +442,25 @@ func (m *Manager) RefreshSecret(service, sandboxName, scope string, secret []byt
 		if sandboxName == "" && !strings.HasSuffix(key, "/"+service) {
 			continue
 		}
-		cfg, _, _ := current.snapshot()
-		if sandboxName != "" || cfg.CredentialScope == scope {
-			selected = append(selected, current)
+		currentScope, exists := current.routeScope(service)
+		if exists && (sandboxName != "" || currentScope == scope) {
+			selected[current] = struct{}{}
 		}
 	}
 	m.mu.Unlock()
-	for _, current := range selected {
-		current.refreshSecret(secret)
+	for current := range selected {
+		current.refreshSecret(service, secret)
 	}
 }
 
 // RevokeSecret closes active channels backed by the removed secret scope.
 func (m *Manager) RevokeSecret(service, sandboxName, scope string) error {
 	m.mu.Lock()
-	selected := make([]*proxy, 0)
+	type routeRef struct {
+		proxy   *proxy
+		service string
+	}
+	selected := make([]routeRef, 0)
 	for key, current := range m.proxies {
 		if sandboxName != "" && key != sandboxName+"/"+service {
 			continue
@@ -289,18 +468,26 @@ func (m *Manager) RevokeSecret(service, sandboxName, scope string) error {
 		if sandboxName == "" && !strings.HasSuffix(key, "/"+service) {
 			continue
 		}
-		cfg, _, _ := current.snapshot()
-		if cfg.CredentialScope == scope {
-			selected = append(selected, current)
+		currentScope, exists := current.routeScope(service)
+		if exists && currentScope == scope {
+			selected = append(selected, routeRef{proxy: current, service: service})
 			delete(m.proxies, key)
 		}
 	}
 	m.mu.Unlock()
 	var failures []error
-	for _, current := range selected {
-		current.clearCredentials()
-		if err := closeProxy(current); err != nil {
-			failures = append(failures, err)
+	closed := make(map[*proxy]struct{})
+	for _, selectedRoute := range selected {
+		current := selectedRoute.proxy
+		current.clearRoute(selectedRoute.service)
+		if current.routeCount() == 0 {
+			if _, alreadyClosed := closed[current]; alreadyClosed {
+				continue
+			}
+			closed[current] = struct{}{}
+			if err := closeProxy(current); err != nil {
+				failures = append(failures, err)
+			}
 		}
 	}
 	return errors.Join(failures...)
@@ -553,16 +740,16 @@ func ownedByCurrentUser(info os.FileInfo) bool {
 // StopSandbox closes every proxy owned by a sandbox.
 func (m *Manager) StopSandbox(sandbox string) error {
 	m.mu.Lock()
-	var selected []*proxy
+	selected := make(map[*proxy]struct{})
 	for key, p := range m.proxies {
 		if strings.HasPrefix(key, sandbox+"/") {
-			selected = append(selected, p)
+			selected[p] = struct{}{}
 			delete(m.proxies, key)
 		}
 	}
 	m.mu.Unlock()
 	var failures []error
-	for _, p := range selected {
+	for p := range selected {
 		p.clearCredentials()
 		if err := closeProxy(p); err != nil {
 			failures = append(failures, err)
@@ -574,14 +761,14 @@ func (m *Manager) StopSandbox(sandbox string) error {
 // Close closes every proxy.
 func (m *Manager) Close() error {
 	m.mu.Lock()
-	all := make([]*proxy, 0, len(m.proxies))
+	unique := make(map[*proxy]struct{}, len(m.proxies))
 	for key, p := range m.proxies {
-		all = append(all, p)
+		unique[p] = struct{}{}
 		delete(m.proxies, key)
 	}
 	m.mu.Unlock()
 	var failures []error
-	for _, p := range all {
+	for p := range unique {
 		p.clearCredentials()
 		if err := closeProxy(p); err != nil {
 			failures = append(failures, err)

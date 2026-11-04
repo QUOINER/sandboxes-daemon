@@ -29,9 +29,25 @@ import (
 )
 
 const (
-	tokenHeader = "X-Rheic-Proxy-Token" //nolint:gosec // HTTP header name, not a credential.
-	afVsock     = 40
+	tokenHeader   = "X-Rheic-Proxy-Token"   //nolint:gosec // HTTP header name, not a credential.
+	serviceHeader = "X-Rheic-Proxy-Service" //nolint:gosec // route metadata, not a credential.
+	afVsock       = 40
 )
+
+type proxyRoute struct {
+	service string
+	host    string
+	port    uint16
+}
+
+type routeFlags []string
+
+func (r *routeFlags) String() string { return strings.Join(*r, ",") }
+
+func (r *routeFlags) Set(value string) error {
+	*r = append(*r, value)
+	return nil
+}
 
 type sockaddrVM struct {
 	Family    uint16
@@ -73,10 +89,9 @@ func main() {
 	port := flag.Int("port", 1027, "host vsock port")
 	unixSocket := flag.String("unix-socket", "", "host unix socket (test/preview transport)")
 	serviceHost := flag.String("service-host", "", "upstream host the broker authorizes")
+	var routes routeFlags
+	flag.Var(&routes, "route", "service=upstream-host:guest-port (repeat for multiple fixed services)")
 	flag.Parse()
-	if *serviceHost == "" {
-		log.Fatal("service-host is required")
-	}
 	dial := func(ctx context.Context) (net.Conn, error) {
 		if *unixSocket != "" {
 			var d net.Dialer
@@ -87,19 +102,107 @@ func main() {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
 	}
-	handler := newHandler(*serviceHost, transport)
-	server := newHTTPServer(*listen, handler)
-	log.Printf("proxy helper listening on %s for %s", *listen, *serviceHost)
-	listener, err := net.Listen("tcp", *listen)
-	if err != nil {
-		log.Fatal(err)
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	err = serve(ctx, listener, server)
+	err := serveConfigured(ctx, *listen, *serviceHost, routes, transport)
 	stop()
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+func serveConfigured(ctx context.Context, listen, serviceHost string, routes []string, transport http.RoundTripper) error {
+	if len(routes) == 0 {
+		if serviceHost == "" {
+			return errors.New("service-host is required when no routes are configured")
+		}
+		return runSingle(ctx, listen, serviceHost, transport)
+	}
+	if serviceHost != "" || listen != "127.0.0.1:0" || len(routes) < 2 || len(routes) > 32 {
+		return errors.New("multi-route mode requires two to 32 routes and no legacy listener or service host")
+	}
+	parsed, err := parseProxyRoutes(routes)
+	if err != nil {
+		return err
+	}
+	servers := make([]proxyServer, 0, len(parsed))
+	ports := make(map[uint16]struct{}, len(parsed))
+	for _, route := range parsed {
+		if _, exists := ports[route.port]; exists {
+			closeProxyServers(servers)
+			return errors.New("proxy routes contain a duplicate guest port")
+		}
+		ports[route.port] = struct{}{}
+		listener, listenErr := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(route.port))))
+		if listenErr != nil {
+			closeProxyServers(servers)
+			return fmt.Errorf("listen for proxy route: %w", listenErr)
+		}
+		server := newHTTPServer(listener.Addr().String(), newRouteHandler(route.service, route.host, transport))
+		servers = append(servers, proxyServer{listener: listener, server: server})
+		log.Printf("proxy helper listening on %s for configured service", listener.Addr())
+	}
+	return serveAll(ctx, servers)
+}
+
+func runSingle(ctx context.Context, listen, serviceHost string, transport http.RoundTripper) error {
+	listener, err := net.Listen("tcp", listen)
+	if err != nil {
+		return err
+	}
+	log.Printf("proxy helper listening on %s for %s", listener.Addr(), serviceHost)
+	return serve(ctx, listener, newHTTPServer(listen, newHandler(serviceHost, transport)))
+}
+
+func parseProxyRoutes(values []string) ([]proxyRoute, error) {
+	routes := make([]proxyRoute, 0, len(values))
+	services := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		service, target, ok := strings.Cut(value, "=")
+		if !ok || !validRouteService(service) {
+			return nil, errors.New("invalid proxy route service")
+		}
+		host, portString, ok := strings.Cut(target, ":")
+		if !ok || !validServiceHost(host) || strings.Contains(portString, ":") {
+			return nil, errors.New("invalid proxy route host or port")
+		}
+		port, err := strconv.ParseUint(portString, 10, 16)
+		if err != nil || port < 1024 {
+			return nil, errors.New("proxy route port must be between 1024 and 65535")
+		}
+		if _, exists := services[service]; exists {
+			return nil, errors.New("duplicate proxy route service")
+		}
+		services[service] = struct{}{}
+		routes = append(routes, proxyRoute{service: service, host: host, port: uint16(port)})
+	}
+	return routes, nil
+}
+
+func validRouteService(service string) bool {
+	if service == "" || len(service) > 64 {
+		return false
+	}
+	for _, char := range service {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validServiceHost(host string) bool {
+	if host == "" || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") {
+		return false
+	}
+	for _, char := range host {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '.' || char == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func newHTTPServer(listen string, handler http.Handler) *http.Server {
@@ -107,10 +210,26 @@ func newHTTPServer(listen string, handler http.Handler) *http.Server {
 }
 
 func serve(ctx context.Context, listener net.Listener, server *http.Server) error {
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- server.Serve(listener) }()
+	return serveAll(ctx, []proxyServer{{listener: listener, server: server}})
+}
+
+type proxyServer struct {
+	listener net.Listener
+	server   *http.Server
+}
+
+func serveAll(ctx context.Context, servers []proxyServer) error {
+	if len(servers) == 0 {
+		return errors.New("proxy helper has no listeners")
+	}
+	serveErr := make(chan error, len(servers))
+	for _, current := range servers {
+		current := current
+		go func() { serveErr <- current.server.Serve(current.listener) }()
+	}
 	select {
 	case err := <-serveErr:
+		closeProxyServers(servers)
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
@@ -118,20 +237,43 @@ func serve(ctx context.Context, listener net.Listener, server *http.Server) erro
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			_ = server.Close()
-			return fmt.Errorf("stop proxy helper: %w", err)
+		var failures []error
+		for _, current := range servers {
+			if err := current.server.Shutdown(shutdownCtx); err != nil {
+				failures = append(failures, err)
+				_ = current.server.Close()
+			}
 		}
-		err := <-serveErr
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
+		for range servers {
+			err := <-serveErr
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				failures = append(failures, err)
+			}
 		}
-		return nil
+		return errors.Join(failures...)
+	}
+}
+
+func closeProxyServers(servers []proxyServer) {
+	for _, current := range servers {
+		_ = current.server.Close()
+		_ = current.listener.Close()
 	}
 }
 
 func fetchToken(ctx context.Context, transport http.RoundTripper) (string, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://broker/__rheic/proxy/token", http.NoBody)
+	return fetchTokenForService(ctx, transport, "")
+}
+
+func fetchTokenForService(ctx context.Context, transport http.RoundTripper, service string) (string, error) {
+	path := "/__rheic/proxy/token"
+	if service != "" {
+		if !validRouteService(service) {
+			return "", errors.New("invalid proxy service")
+		}
+		path += "/" + service
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://broker"+path, http.NoBody)
 	if err != nil {
 		return "", err
 	}
@@ -155,6 +297,10 @@ func fetchToken(ctx context.Context, transport http.RoundTripper) (string, error
 }
 
 func newHandler(serviceHost string, transport http.RoundTripper) http.Handler {
+	return newRouteHandler("", serviceHost, transport)
+}
+
+func newRouteHandler(service, serviceHost string, transport http.RoundTripper) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
 			http.Error(w, "connect tunnels are not supported", http.StatusMethodNotAllowed)
@@ -165,12 +311,16 @@ func newHandler(serviceHost string, transport http.RoundTripper) http.Handler {
 		out.URL.Scheme = "http"
 		out.URL.Host = serviceHost
 		out.Host = serviceHost
-		token, err := fetchToken(r.Context(), transport)
+		token, err := fetchTokenForService(r.Context(), transport, service)
 		if err != nil {
 			http.Error(w, "proxy bootstrap unavailable", http.StatusBadGateway)
 			return
 		}
 		out.Header.Set(tokenHeader, token)
+		out.Header.Del(serviceHeader)
+		if service != "" {
+			out.Header.Set(serviceHeader, service)
+		}
 		out.Header.Del("Proxy-Connection")
 		out.Header.Del("Proxy-Authorization")
 		resp, err := transport.RoundTrip(out)
