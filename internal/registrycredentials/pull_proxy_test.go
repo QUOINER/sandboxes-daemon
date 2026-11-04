@@ -179,6 +179,12 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	bodyRequest := httptest.NewRequest(http.MethodGet, "http://guest/v2/demo/manifests/latest", strings.NewReader("synthetic request body"))
+	bodyResponse := httptest.NewRecorder()
+	proxy.ServeHTTP(bodyResponse, bodyRequest)
+	if bodyResponse.Code != http.StatusBadRequest || registryRequests != 0 {
+		t.Fatalf("registry pull body status=%d upstream_requests=%d", bodyResponse.Code, registryRequests)
+	}
 	for range cap(proxy.inflight) {
 		proxy.inflight <- struct{}{}
 	}

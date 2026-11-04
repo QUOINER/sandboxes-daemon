@@ -98,6 +98,10 @@ func validPullProxyConfig(store *Store, cfg PullProxyConfig) bool {
 // ServeHTTP accepts only read-only registry pull requests and does not forward
 // guest-provided authorization headers. It never returns the upstream token.
 func (p *PullProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		http.Error(w, "registry pull request body is unsupported", http.StatusBadRequest)
+		return
+	}
 	endpoint := &url.URL{Scheme: "https", Host: p.authority, Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery, ForceQuery: r.URL.ForceQuery}
 	probe := endpoint.Path == "/v2/" && endpoint.RawPath == "" && endpoint.RawQuery == "" && !endpoint.ForceQuery && r.URL.Fragment == "" && r.URL.Opaque == "" &&
 		(r.Method == http.MethodGet || r.Method == http.MethodHead)
