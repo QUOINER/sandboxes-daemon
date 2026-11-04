@@ -155,6 +155,7 @@ func (s *Service) buildDockerHubProxy(_ context.Context, sb sandbox.Sandbox, sco
 		CredentialScope: scope, Service: dockerHubTokenService,
 		Realms:           []registryauth.Realm{{Host: dockerHubAuthHost, Path: "/token"}},
 		TransportFactory: sandboxRegistryTransportFactory{service: s, sandboxID: sb.ID},
+		Limiter:          s.registryPullLimiter,
 		MaxBytes:         16 << 30,
 	})
 	if err != nil {

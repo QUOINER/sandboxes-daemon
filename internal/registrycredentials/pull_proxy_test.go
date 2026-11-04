@@ -168,7 +168,7 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := PullProxyConfig{Registry: registryURL.Host, SandboxName: "one", CredentialScope: ScopeSandbox, Service: "registry.fixture", Realms: []registryauth.Realm{realm}, RegistryTransport: registryTransport, TokenTransport: tokenTransport, MaxBytes: 1024}
+	cfg := PullProxyConfig{Registry: registryURL.Host, SandboxName: "one", CredentialScope: ScopeSandbox, Service: "registry.fixture", Realms: []registryauth.Realm{realm}, RegistryTransport: registryTransport, TokenTransport: tokenTransport, Limiter: NewPullLimiter(), MaxBytes: 1024}
 	proxy, err := NewPullProxy(store, cfg)
 	if err != nil {
 		t.Fatal(err)

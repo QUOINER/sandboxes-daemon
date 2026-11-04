@@ -28,6 +28,7 @@ type PullProxy struct {
 	registryTransport *registryauth.RegistryTransport
 	tokenTransport    *registryauth.TokenTransport
 	transportFactory  PullProxyTransportFactory
+	limiter           *PullLimiter
 	maxBytes          int64
 	inflight          chan struct{}
 }
@@ -53,6 +54,7 @@ type PullProxyConfig struct {
 	RegistryTransport *registryauth.RegistryTransport
 	TokenTransport    *registryauth.TokenTransport
 	TransportFactory  PullProxyTransportFactory
+	Limiter           *PullLimiter
 	MaxBytes          int64
 }
 
@@ -80,13 +82,14 @@ func NewPullProxy(store *Store, cfg PullProxyConfig) (*PullProxy, error) {
 	}
 	return &PullProxy{store: store, registry: registry, authority: authority, sandboxName: cfg.SandboxName, credentialScope: cfg.CredentialScope,
 		service: cfg.Service, realms: append([]registryauth.Realm(nil), cfg.Realms...), registryTransport: cfg.RegistryTransport,
-		tokenTransport: cfg.TokenTransport, transportFactory: cfg.TransportFactory,
+		tokenTransport: cfg.TokenTransport, transportFactory: cfg.TransportFactory, limiter: cfg.Limiter,
 		maxBytes: cfg.MaxBytes, inflight: make(chan struct{}, 4)}, nil
 }
 
 func validPullProxyConfig(store *Store, cfg PullProxyConfig) bool {
 	return store != nil && cfg.SandboxName != "" && cfg.Service != "" && len(cfg.Realms) != 0 &&
 		(cfg.TransportFactory != nil || (cfg.RegistryTransport != nil && cfg.TokenTransport != nil)) &&
+		cfg.Limiter != nil &&
 		cfg.MaxBytes > 0 && cfg.MaxBytes <= maxPullResponseBytes &&
 		(cfg.CredentialScope == ScopeSandbox || cfg.CredentialScope == ScopeAllSandboxes)
 }
@@ -113,6 +116,10 @@ func (p *PullProxy) serveAllowed(w http.ResponseWriter, r *http.Request, endpoin
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
+	if !p.limiter.acquire(ctx) {
+		return
+	}
+	defer p.limiter.release()
 	if probe {
 		if err := p.probe(ctx, r, endpoint); err != nil {
 			http.Error(w, "registry request failed", http.StatusBadGateway)

@@ -53,6 +53,7 @@ type Service struct {
 	journal              *operation.Journal
 	backend              runtime.Backend
 	registryCredentials  *registrycredentials.Store
+	registryPullLimiter  *registrycredentials.PullLimiter
 	serviceSecrets       *servicesecrets.Store
 	secretProxies        *secretproxy.Manager
 	proxyHelperPath      string
@@ -804,14 +805,15 @@ func registryGateKey(registry string) string {
 func New(st *store.Store, backend runtime.Backend) *Service {
 	cpus, memoryMiB := hostResourceDefaults()
 	s := &Service{
-		store:            st,
-		journal:          operation.NewJournal(st.Operations()),
-		backend:          backend,
-		DefaultImage:     "alpine:3.22",
-		DefaultCPUs:      cpus,
-		DefaultMemoryMiB: memoryMiB,
-		now:              time.Now,
-		dockerHubAuth:    oauthsession.NewDockerHubAuthTransport(),
+		store:               st,
+		journal:             operation.NewJournal(st.Operations()),
+		backend:             backend,
+		registryPullLimiter: registrycredentials.NewPullLimiter(),
+		DefaultImage:        "alpine:3.22",
+		DefaultCPUs:         cpus,
+		DefaultMemoryMiB:    memoryMiB,
+		now:                 time.Now,
+		dockerHubAuth:       oauthsession.NewDockerHubAuthTransport(),
 	}
 	for i := range s.createGates {
 		s.createGates[i] = make(chan struct{}, 1)
