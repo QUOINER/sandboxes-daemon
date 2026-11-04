@@ -102,6 +102,16 @@ type proxyRoute struct {
 	secret   []byte
 	token    []byte
 	reverse  *httputil.ReverseProxy
+	ctx      context.Context
+	cancel   context.CancelFunc
+}
+
+type proxySnapshot struct {
+	service Service
+	secret  []byte
+	token   []byte
+	reverse *httputil.ReverseProxy
+	ctx     context.Context
 }
 
 // RouteConfig binds one fixed host service to credentials and an unguessable
@@ -161,8 +171,9 @@ func (m *Manager) StartUnixRoutes(ctx context.Context, sandbox string, routes ma
 		reverse.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 			http.Error(w, "proxy upstream unavailable", http.StatusBadGateway)
 		}
+		routeCtx, cancel := context.WithCancel(context.Background())
 		preparedRoutes[name] = &proxyRoute{upstream: upstream.String(), service: route.Service,
-			secret: append([]byte(nil), route.Secret...), token: []byte(route.Token), reverse: reverse}
+			secret: append([]byte(nil), route.Secret...), token: []byte(route.Token), reverse: reverse, ctx: routeCtx, cancel: cancel}
 	}
 	key := sandbox + "/" + firstRouteName(preparedRoutes)
 	m.mu.Lock()
@@ -246,15 +257,22 @@ func serveProxyRequest(w http.ResponseWriter, r *http.Request, p *proxy) {
 	if service == "" {
 		service = p.onlyRoute()
 	}
-	cfg, secret, token, reverse, ok := p.snapshot(service)
-	defer clear(secret)
-	defer clear(token)
-	if !ok || !validProxyToken(r.Header.Get(TokenHeader), token) {
+	snapshot, ok := p.snapshot(service)
+	defer clear(snapshot.secret)
+	defer clear(snapshot.token)
+	if !ok || !validProxyToken(r.Header.Get(TokenHeader), snapshot.token) {
 		http.Error(w, "proxy channel unauthorized", http.StatusForbidden)
 		return
 	}
-	if cfg.Authorize != nil {
-		if err := cfg.Authorize(r.Context()); err != nil {
+	requestCtx, cancel := context.WithCancel(r.Context())
+	stopRouteWatch := context.AfterFunc(snapshot.ctx, cancel)
+	defer func() {
+		stopRouteWatch()
+		cancel()
+	}()
+	r = r.WithContext(requestCtx)
+	if snapshot.service.Authorize != nil {
+		if err := snapshot.service.Authorize(r.Context()); err != nil {
 			http.Error(w, "proxy request denied by sandbox policy", http.StatusForbidden)
 			return
 		}
@@ -264,11 +282,11 @@ func serveProxyRequest(w http.ResponseWriter, r *http.Request, p *proxy) {
 	r.Header.Del(ServiceHeader)
 	r.Header.Del("Authorization")
 	r.Header.Del("X-Api-Key")
-	if cfg.Header != "" {
-		r.Header.Set(cfg.Header, cfg.Prefix+string(secret))
+	if snapshot.service.Header != "" {
+		r.Header.Set(snapshot.service.Header, snapshot.service.Prefix+string(snapshot.secret))
 	}
 	r.Header.Set("X-Rheic-Secret-Proxy", service)
-	reverse.ServeHTTP(w, r)
+	snapshot.reverse.ServeHTTP(w, r)
 }
 
 func validProxyToken(received string, expected []byte) bool {
@@ -287,14 +305,15 @@ func (p *proxy) onlyRoute() string {
 	return ""
 }
 
-func (p *proxy) snapshot(name string) (Service, []byte, []byte, *httputil.ReverseProxy, bool) {
+func (p *proxy) snapshot(name string) (proxySnapshot, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	route := p.routes[name]
 	if route == nil {
-		return Service{}, nil, nil, nil, false
+		return proxySnapshot{}, false
 	}
-	return route.service, append([]byte(nil), route.secret...), append([]byte(nil), route.token...), route.reverse, true
+	return proxySnapshot{service: route.service, secret: append([]byte(nil), route.secret...),
+		token: append([]byte(nil), route.token...), reverse: route.reverse, ctx: route.ctx}, true
 }
 
 func (p *proxy) tokenSnapshot(name string) ([]byte, bool) {
@@ -345,6 +364,7 @@ func (p *proxy) refreshSecret(service string, secret []byte) {
 func (p *proxy) clearRoute(service string) {
 	p.mu.Lock()
 	if route := p.routes[service]; route != nil {
+		route.cancel()
 		clear(route.secret)
 		clear(route.token)
 		route.secret, route.token = nil, nil
@@ -357,6 +377,7 @@ func (p *proxy) clearRoute(service string) {
 func (p *proxy) clearCredentials() {
 	p.mu.Lock()
 	for _, route := range p.routes {
+		route.cancel()
 		clear(route.secret)
 		clear(route.token)
 		route.secret, route.token = nil, nil
@@ -424,6 +445,7 @@ func firstRouteName(routes map[string]*proxyRoute) string {
 
 func clearPreparedRoutes(routes map[string]*proxyRoute) {
 	for _, route := range routes {
+		route.cancel()
 		clear(route.secret)
 		clear(route.token)
 		route.secret, route.token = nil, nil
