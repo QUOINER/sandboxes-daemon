@@ -3,7 +3,9 @@ package registrycredentials
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -161,10 +163,16 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	if large.Code != http.StatusBadGateway || strings.Contains(large.Body.String(), "public") {
 		t.Fatal("oversized response reached guest")
 	}
-	truncated := httptest.NewRecorder()
-	proxy.ServeHTTP(truncated, httptest.NewRequest(http.MethodGet, "http://guest/v2/truncated/manifests/latest", http.NoBody))
-	if truncated.Code != http.StatusBadGateway || strings.Contains(truncated.Body.String(), "short") {
-		t.Fatal("truncated upstream response was reported as success")
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+	truncated, err := proxyServer.Client().Get(proxyServer.URL + "/v2/truncated/manifests/latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, readErr := io.ReadAll(truncated.Body)
+	_ = truncated.Body.Close()
+	if truncated.StatusCode != http.StatusOK || !errors.Is(readErr, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated upstream response status=%d read_err=%v", truncated.StatusCode, readErr)
 	}
 	hostCfg := cfg
 	hostCfg.CredentialScope = ScopeHostOnly
@@ -189,5 +197,90 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	proxy.ServeHTTP(afterLogout, httptest.NewRequest(http.MethodGet, "http://guest/v2/demo/manifests/latest", http.NoBody))
 	if afterLogout.Code != http.StatusBadGateway || tokenRequests != 2 {
 		t.Fatal("pull obtained new token after logout")
+	}
+}
+
+type countingPullResponseWriter struct {
+	header   http.Header
+	status   int
+	written  int64
+	maxWrite int
+	sample   []byte
+}
+
+func (w *countingPullResponseWriter) Header() http.Header { return w.header }
+
+func (w *countingPullResponseWriter) WriteHeader(status int) { w.status = status }
+
+func (w *countingPullResponseWriter) Write(data []byte) (int, error) {
+	if len(data) > w.maxWrite {
+		w.maxWrite = len(data)
+	}
+	w.written += int64(len(data))
+	if len(w.sample) < 128 {
+		remaining := 128 - len(w.sample)
+		if len(data) < remaining {
+			remaining = len(data)
+		}
+		w.sample = append(w.sample, data[:remaining]...)
+	}
+	return len(data), nil
+}
+
+type repeatedPullResponseReader struct{ remaining int64 }
+
+func (r *repeatedPullResponseReader) Read(data []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := int64(len(data))
+	if n > r.remaining {
+		n = r.remaining
+	}
+	clear(data[:int(n)])
+	r.remaining -= n
+	return int(n), nil
+}
+
+func TestPullProxyStreamsLargeResponseWithBoundedWrites(t *testing.T) {
+	const responseSize = (32 << 20) + 1
+	proxy := &PullProxy{maxBytes: responseSize}
+	response := &http.Response{
+		StatusCode: http.StatusOK, ContentLength: responseSize,
+		Header: make(http.Header), Body: io.NopCloser(&repeatedPullResponseReader{remaining: responseSize}),
+	}
+	writer := &countingPullResponseWriter{header: make(http.Header)}
+	if err := proxy.writeResponse(writer, http.MethodGet, response); err != nil {
+		t.Fatal(err)
+	}
+	if writer.status != http.StatusOK || writer.written != responseSize || writer.maxWrite > 32<<10 ||
+		writer.header.Get("Content-Length") != fmt.Sprint(responseSize) {
+		t.Fatalf("stream result status=%d bytes=%d max_write=%d content_length=%q", writer.status, writer.written, writer.maxWrite, writer.header.Get("Content-Length"))
+	}
+}
+
+func TestPullProxyRejectsUnknownOrOversizedLengthBeforeWriting(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		contentLength int64
+		maxBytes      int64
+	}{
+		{name: "unknown", contentLength: -1, maxBytes: 1024},
+		{name: "oversized", contentLength: 1025, maxBytes: 1024},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proxy := &PullProxy{maxBytes: tc.maxBytes}
+			response := &http.Response{
+				StatusCode: http.StatusOK, ContentLength: tc.contentLength,
+				Header: make(http.Header), Body: io.NopCloser(strings.NewReader("synthetic")),
+			}
+			writer := &countingPullResponseWriter{header: make(http.Header)}
+			if err := proxy.writeResponse(writer, http.MethodGet, response); err == nil {
+				t.Fatal("writeResponse() accepted an unknown or oversized body")
+			}
+			if writer.status != http.StatusBadGateway || strings.Contains(string(writer.sample), "synthetic") {
+				t.Fatalf("rejected response status=%d bytes=%d", writer.status, writer.written)
+			}
+		})
 	}
 }

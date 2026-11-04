@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,7 +30,7 @@ type PullProxy struct {
 	inflight          chan struct{}
 }
 
-const maxBufferedPullBytes = 32 << 20
+const maxPullResponseBytes = 16 << 30
 
 // PullProxyConfig is trusted host configuration, never a guest request.
 type PullProxyConfig struct {
@@ -51,7 +52,7 @@ func NewPullProxy(store *Store, cfg PullProxyConfig) (*PullProxy, error) {
 		return nil, err
 	}
 	if store == nil || cfg.SandboxName == "" || cfg.Service == "" || len(cfg.Realms) == 0 ||
-		cfg.RegistryTransport == nil || cfg.TokenTransport == nil || cfg.MaxBytes <= 0 || cfg.MaxBytes > maxBufferedPullBytes ||
+		cfg.RegistryTransport == nil || cfg.TokenTransport == nil || cfg.MaxBytes <= 0 || cfg.MaxBytes > maxPullResponseBytes ||
 		(cfg.CredentialScope != ScopeSandbox && cfg.CredentialScope != ScopeAllSandboxes) {
 		return nil, errors.New("invalid pull proxy configuration")
 	}
@@ -73,6 +74,10 @@ func (p *PullProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported registry request", http.StatusForbidden)
 		return
 	}
+	p.serveAllowed(w, r, endpoint, probe)
+}
+
+func (p *PullProxy) serveAllowed(w http.ResponseWriter, r *http.Request, endpoint *url.URL, probe bool) {
 	select {
 	case p.inflight <- struct{}{}:
 		defer func() { <-p.inflight }()
@@ -96,7 +101,9 @@ func (p *PullProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
-	p.writeResponse(w, r.Method, resp)
+	if err := p.writeResponse(w, r.Method, resp); err != nil {
+		return
+	}
 }
 
 func (p *PullProxy) probe(ctx context.Context, incoming *http.Request, endpoint *url.URL) error {
@@ -120,31 +127,31 @@ func (p *PullProxy) probe(ctx context.Context, incoming *http.Request, endpoint 
 	return nil
 }
 
-func (p *PullProxy) writeResponse(w http.ResponseWriter, method string, resp *http.Response) {
+func (p *PullProxy) writeResponse(w http.ResponseWriter, method string, resp *http.Response) error {
 	if !allowedPullStatus(resp.StatusCode) {
 		http.Error(w, "registry request failed", http.StatusBadGateway)
-		return
+		return errors.New("registry returned an unsupported status")
 	}
 	if method != http.MethodHead && resp.StatusCode != http.StatusNotModified && (resp.ContentLength < 0 || resp.ContentLength > p.maxBytes) {
 		http.Error(w, "registry response exceeds supported limits", http.StatusBadGateway)
-		return
-	}
-	var body []byte
-	if method != http.MethodHead && resp.StatusCode != http.StatusNotModified {
-		var err error
-		body, err = io.ReadAll(io.LimitReader(resp.Body, p.maxBytes+1))
-		if err != nil || int64(len(body)) != resp.ContentLength || int64(len(body)) > p.maxBytes {
-			clear(body)
-			http.Error(w, "invalid registry response", http.StatusBadGateway)
-			return
-		}
-		defer clear(body)
+		return errors.New("registry response length is unknown or exceeds the configured limit")
 	}
 	copyPullResponseHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	if len(body) != 0 {
-		_, _ = w.Write(body)
+	if resp.ContentLength >= 0 && (method == http.MethodHead || resp.StatusCode != http.StatusNotModified) {
+		w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
 	}
+	w.WriteHeader(resp.StatusCode)
+	if method == http.MethodHead || resp.StatusCode == http.StatusNotModified {
+		return nil
+	}
+	written, err := io.CopyN(w, resp.Body, resp.ContentLength)
+	if err != nil {
+		return fmt.Errorf("stream registry response: %w", err)
+	}
+	if written != resp.ContentLength {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
 }
 
 func allowedPullStatus(code int) bool {
