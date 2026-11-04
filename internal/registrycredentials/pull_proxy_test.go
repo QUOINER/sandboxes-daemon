@@ -422,16 +422,22 @@ func TestPullProxyStreamsLargeResponseWithBoundedWrites(t *testing.T) {
 func TestPullProxyRejectsUnknownOrOversizedLengthBeforeWriting(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
+		status        int
 		contentLength int64
 		maxBytes      int64
 	}{
 		{name: "unknown", contentLength: -1, maxBytes: 1024},
 		{name: "oversized", contentLength: 1025, maxBytes: 1024},
+		{name: "oversized error", status: http.StatusNotFound, contentLength: maxPullErrorResponseBytes + 1, maxBytes: maxPullResponseBytes},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			proxy := &PullProxy{maxBytes: tc.maxBytes}
+			status := tc.status
+			if status == 0 {
+				status = http.StatusOK
+			}
 			response := &http.Response{
-				StatusCode: http.StatusOK, ContentLength: tc.contentLength,
+				StatusCode: status, ContentLength: tc.contentLength,
 				Header: make(http.Header), Body: io.NopCloser(strings.NewReader("synthetic")),
 			}
 			writer := &countingPullResponseWriter{header: make(http.Header)}

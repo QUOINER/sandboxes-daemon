@@ -42,6 +42,7 @@ type PullProxyTransportFactory interface {
 }
 
 const maxPullResponseBytes = 16 << 30
+const maxPullErrorResponseBytes = 64 << 10
 
 // PullProxyConfig is trusted host configuration, never a guest request.
 type PullProxyConfig struct {
@@ -182,7 +183,11 @@ func (p *PullProxy) writeResponse(w http.ResponseWriter, method string, resp *ht
 		http.Error(w, "registry request failed", http.StatusBadGateway)
 		return errors.New("registry returned an unsupported status")
 	}
-	if method != http.MethodHead && resp.StatusCode != http.StatusNotModified && (resp.ContentLength < 0 || resp.ContentLength > p.maxBytes) {
+	maxBytes := p.maxBytes
+	if resp.StatusCode == http.StatusNotFound && maxBytes > maxPullErrorResponseBytes {
+		maxBytes = maxPullErrorResponseBytes
+	}
+	if method != http.MethodHead && resp.StatusCode != http.StatusNotModified && (resp.ContentLength < 0 || resp.ContentLength > maxBytes) {
 		http.Error(w, "registry response exceeds supported limits", http.StatusBadGateway)
 		return errors.New("registry response length is unknown or exceeds the configured limit")
 	}
