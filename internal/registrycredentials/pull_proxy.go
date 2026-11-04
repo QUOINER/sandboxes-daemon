@@ -113,6 +113,9 @@ func (p *PullProxy) serveAllowed(w http.ResponseWriter, r *http.Request, endpoin
 		defer func() { <-p.inflight }()
 	case <-r.Context().Done():
 		return
+	default:
+		writeRegistryBusy(w)
+		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
@@ -120,8 +123,7 @@ func (p *PullProxy) serveAllowed(w http.ResponseWriter, r *http.Request, endpoin
 		if r.Context().Err() != nil {
 			return
 		}
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "registry proxy is busy", http.StatusServiceUnavailable)
+		writeRegistryBusy(w)
 		return
 	}
 	defer p.limiter.release()
@@ -143,6 +145,11 @@ func (p *PullProxy) serveAllowed(w http.ResponseWriter, r *http.Request, endpoin
 	if err := p.writeResponse(w, r.Method, resp); err != nil {
 		return
 	}
+}
+
+func writeRegistryBusy(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, "registry proxy is busy", http.StatusServiceUnavailable)
 }
 
 func (p *PullProxy) probe(ctx context.Context, incoming *http.Request, endpoint *url.URL) error {

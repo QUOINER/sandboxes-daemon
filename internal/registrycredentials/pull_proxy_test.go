@@ -173,6 +173,17 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for range cap(proxy.inflight) {
+		proxy.inflight <- struct{}{}
+	}
+	perSandboxOverload := httptest.NewRecorder()
+	proxy.ServeHTTP(perSandboxOverload, httptest.NewRequest(http.MethodGet, "http://guest/v2/demo/manifests/latest", http.NoBody))
+	if perSandboxOverload.Code != http.StatusServiceUnavailable || perSandboxOverload.Header().Get("Retry-After") != "1" {
+		t.Fatalf("per-sandbox overload status=%d headers=%v", perSandboxOverload.Code, perSandboxOverload.Header())
+	}
+	for range cap(proxy.inflight) {
+		<-proxy.inflight
+	}
 	for range maxQueuedRegistryPulls {
 		proxy.limiter.queued <- struct{}{}
 	}
