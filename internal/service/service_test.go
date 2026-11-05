@@ -1647,6 +1647,36 @@ func TestSetAndRemoveServiceSecretShareCanonicalCredentialGate(t *testing.T) {
 	}
 }
 
+func TestRemoveServiceSecretCleansStaleIndexWithCanonicalScope(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "service-secret-remove-index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &fakeServiceSecretVault{items: make(map[string]string)}
+	secretStore, err := servicesecrets.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(st, nil)
+	svc.SetServiceSecretStore(secretStore)
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("synthetic-key")); err != nil {
+		t.Fatal(err)
+	}
+	if err := vault.Delete(ctx, "com.rheic.service-secrets.v1", "openai/global"); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := svc.RemoveServiceSecret(ctx, " OPENAI ", "", " ")
+	if err != nil || removed {
+		t.Fatalf("stale-entry cleanup returned removed=%t err=%v", removed, err)
+	}
+	entries, err := svc.ListServiceSecrets(ctx)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("stale secret index remains: entries=%+v err=%v", entries, err)
+	}
+}
+
 func TestSetServiceSecretRollsBackVaultWhenIndexWriteFails(t *testing.T) {
 	for _, hadPrevious := range []bool{false, true} {
 		t.Run(fmt.Sprintf("previous=%t", hadPrevious), func(t *testing.T) {

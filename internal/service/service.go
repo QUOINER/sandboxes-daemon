@@ -615,24 +615,29 @@ func (s *Service) RemoveServiceSecret(ctx context.Context, service string, scope
 	if s.serviceSecrets == nil {
 		return false, errors.New("service secret store is unavailable")
 	}
+	service = strings.ToLower(strings.TrimSpace(service))
+	if scope == "" {
+		scope = servicesecrets.ScopeGlobal
+	}
+	sandboxName = strings.TrimSpace(sandboxName)
 	release, err := s.acquireCredentialGate(ctx, serviceSecretGateKey(service, scope, sandboxName))
 	if err != nil {
 		return false, err
 	}
 	defer release()
 	removed, err := s.serviceSecrets.Delete(ctx, service, scope, sandboxName)
-	if err != nil || !removed {
+	if err != nil {
 		return removed, err
 	}
 	if s.secretProxies != nil {
-		if err := s.secretProxies.RevokeSecret(strings.ToLower(strings.TrimSpace(service)), sandboxName, string(scope)); err != nil {
-			return true, fmt.Errorf("revoke active service proxy: %w", err)
+		if err := s.secretProxies.RevokeSecret(service, sandboxName, string(scope)); err != nil {
+			return removed, fmt.Errorf("revoke active service proxy: %w", err)
 		}
 	}
-	if err := s.store.DeleteServiceSecretIndex(ctx, strings.ToLower(strings.TrimSpace(service)), string(scope), sandboxName); err != nil {
-		return true, err
+	if err := s.store.DeleteServiceSecretIndex(ctx, service, string(scope), sandboxName); err != nil {
+		return removed, err
 	}
-	return true, nil
+	return removed, nil
 }
 
 func serviceSecretGateKey(service string, scope servicesecrets.Scope, sandboxName string) string {
