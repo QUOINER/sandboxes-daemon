@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -319,6 +320,7 @@ func (s *Service) buildProxyRoute(ctx context.Context, sb sandbox.Sandbox, name 
 	service := contractService(name)
 	service.CredentialScope = string(scope)
 	service.Authorize = s.proxyPolicyAuthorizer(sb.ID, contract.upstreamHost)
+	service.AuthorizeAddress = s.proxyAddressAuthorizer(sb.ID, contract.upstreamHost)
 	return secretproxy.RouteConfig{Service: service, Secret: secret, Token: token},
 		fmt.Sprintf("%s=%s:%d", name, contract.upstreamHost, contract.guestPort), nil
 }
@@ -353,6 +355,7 @@ func (s *Service) buildOAuthProxyRoute(ctx context.Context, sb sandbox.Sandbox, 
 		return []byte(accessToken), nil
 	}
 	service.Authorize = s.proxyPolicyAuthorizer(sb.ID, contract.upstreamHost)
+	service.AuthorizeAddress = s.proxyAddressAuthorizer(sb.ID, contract.upstreamHost)
 	return secretproxy.RouteConfig{Service: service, Token: token},
 		fmt.Sprintf("%s=%s:%d", openAIOAuthRoute, contract.upstreamHost, contract.guestPort), nil
 }
@@ -378,6 +381,16 @@ func (s *Service) proxyPolicyAuthorizer(sandboxID, host string) func(context.Con
 			return errors.New("sandbox policy denied service proxy request")
 		}
 		return nil
+	}
+}
+
+func (s *Service) proxyAddressAuthorizer(sandboxID, host string) func(context.Context, netip.Addr) (bool, error) {
+	return func(ctx context.Context, address netip.Addr) (bool, error) {
+		decision, err := s.checkResolvedEgress(ctx, sandboxID, host, address)
+		if err != nil {
+			return false, err
+		}
+		return decision.Allowed, nil
 	}
 }
 

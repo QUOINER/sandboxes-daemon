@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -827,6 +828,48 @@ func TestDialPublicUnicastPinsCheckedDNSAnswers(t *testing.T) {
 		return nil, errors.New("synthetic resolver failure")
 	}, dial); err == nil || dialCalls != 1 {
 		t.Fatalf("resolver failure was not denied before dial: calls=%d err=%v", dialCalls, err)
+	}
+}
+
+func TestDialPublicUnicastEnforcesResolvedAddressPolicy(t *testing.T) {
+	ctx := context.Background()
+	var dialCalls int
+	lookup := func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("8.8.8.8")}}, nil
+	}
+	dial := func(context.Context, string, string) (net.Conn, error) {
+		dialCalls++
+		conn, peer := net.Pipe()
+		_ = peer.Close()
+		return conn, nil
+	}
+	deny := func(_ context.Context, address netip.Addr) (bool, error) {
+		if address != netip.MustParseAddr("8.8.8.8") {
+			t.Fatalf("policy checked unexpected address %s", address)
+		}
+		return false, nil
+	}
+	if _, err := dialPublicUnicastWithPolicy(ctx, "tcp", "api.example.test:443", lookup, dial, deny); err == nil {
+		t.Fatal("dial accepted an address denied by sandbox CIDR policy")
+	}
+	if dialCalls != 0 {
+		t.Fatalf("dial ran %d times after policy denial", dialCalls)
+	}
+
+	allow := func(context.Context, netip.Addr) (bool, error) { return true, nil }
+	conn, err := dialPublicUnicastWithPolicy(ctx, "tcp", "api.example.test:443", lookup, dial, allow)
+	if err != nil {
+		t.Fatalf("public policy-allowed positive control failed: %v", err)
+	}
+	_ = conn.Close()
+	if dialCalls != 1 {
+		t.Fatalf("positive control dial calls = %d, want 1", dialCalls)
+	}
+
+	transport := outboundTransportWithPolicy(true, nil, allow)
+	defer transport.CloseIdleConnections()
+	if !transport.DisableKeepAlives {
+		t.Fatal("policy-aware transport may reuse a connection after policy changes")
 	}
 }
 

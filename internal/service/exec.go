@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -12,8 +11,6 @@ import (
 	"github.com/rheic/sandboxes-core/operation"
 	"github.com/rheic/sandboxes-core/sandbox"
 	runtime "github.com/rheic/sandboxes-runtime"
-
-	"github.com/rheic/sandboxes-daemon/internal/servicesecrets"
 )
 
 type execSession struct {
@@ -183,9 +180,8 @@ const (
 	oauthRefPrefix  = "${oauth:"
 )
 
-// resolveSecretEnv expands whole-value "${secret:service}" references from the
-// host vault at exec time. Only the selected process receives the value; it is
-// never written to SQLite or sandbox metadata. Sandbox scope wins over global.
+// resolveSecretEnv refuses guest-visible secret references. Provider credentials
+// stay on the host and are available only through a supported host proxy route.
 func (s *Service) resolveSecretEnv(ctx context.Context, sb sandbox.Sandbox, env []string) ([]string, error) {
 	out := make([]string, 0, len(env)+1)
 	proxyServices := make([]string, 0)
@@ -211,12 +207,11 @@ func (s *Service) resolveSecretEnv(ctx context.Context, sb sandbox.Sandbox, env 
 }
 
 func (s *Service) resolveEnvEntry(ctx context.Context, sb sandbox.Sandbox, key, value string) (string, string, error) {
+	if strings.Contains(value, secretRefPrefix) {
+		return "", "", fmt.Errorf("%w: secret environment references expose credentials to guest processes; use a supported host proxy route", core.ErrConflict)
+	}
 	if strings.Contains(value, proxyRefPrefix) || strings.Contains(value, oauthRefPrefix) {
 		return s.resolveProxyEnvEntry(ctx, sb, key, value)
-	}
-	if strings.HasPrefix(value, secretRefPrefix) {
-		resolved, err := s.resolveSecretReference(ctx, sb, key, value)
-		return resolved, "", err
 	}
 	return key + "=" + value, "", nil
 }
@@ -238,28 +233,6 @@ func (s *Service) resolveProxyEnvEntry(ctx context.Context, sb sandbox.Sandbox, 
 		return "", "", fmt.Errorf("%w: sandbox was not created with the %s proxy channel", core.ErrConflict, name)
 	}
 	return key + "=rheic-proxy-placeholder", name, nil
-}
-
-func (s *Service) resolveSecretReference(ctx context.Context, sb sandbox.Sandbox, key, value string) (string, error) {
-	if !strings.HasSuffix(value, "}") || strings.Count(value, secretRefPrefix) != 1 {
-		return "", fmt.Errorf("%w: invalid secret reference for %s", core.ErrConflict, key)
-	}
-	if s.serviceSecrets == nil {
-		return "", fmt.Errorf("%w: service secret store is unavailable", core.ErrConflict)
-	}
-	service := strings.TrimSuffix(strings.TrimPrefix(value, secretRefPrefix), "}")
-	if service == "" || strings.ContainsAny(service, "/\\\x00\r\n") {
-		return "", fmt.Errorf("%w: invalid secret reference for %s", core.ErrConflict, key)
-	}
-	secret, err := s.serviceSecrets.Load(ctx, service, servicesecrets.ScopeSandbox, sb.Name)
-	if errors.Is(err, servicesecrets.ErrNotFound) {
-		secret, err = s.serviceSecrets.Load(ctx, service, servicesecrets.ScopeGlobal, "")
-	}
-	if err != nil {
-		return "", fmt.Errorf("%w: secret %q is unavailable", core.ErrConflict, service)
-	}
-	defer clear(secret)
-	return key + "=" + string(secret), nil
 }
 
 func (s *Service) finishProxyEnv(ctx context.Context, sb sandbox.Sandbox, env, out, proxyServices []string) ([]string, error) {

@@ -310,7 +310,7 @@ func TestOpenAIOAuthProxyUsesHostTokenManager(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clear(route.Secret)
-	if runtimeRoute != "openai-oauth=api.openai.com:3128" || route.Service.Credential == nil || route.Secret != nil {
+	if runtimeRoute != "openai-oauth=api.openai.com:3128" || route.Service.Credential == nil || route.Service.AuthorizeAddress == nil || route.Secret != nil {
 		t.Fatalf("OAuth route=%+v runtime=%q", route, runtimeRoute)
 	}
 	credential, err := route.Service.Credential(ctx)

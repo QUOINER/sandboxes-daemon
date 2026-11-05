@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -105,14 +107,19 @@ func TestCreateBakesValidatedEnv(t *testing.T) {
 	if got := strings.Join(backend.lastConfig.Env, ","); got != "A=1,B=2" {
 		t.Fatalf("env = %q", got)
 	}
-	for _, env := range []map[string]string{
+	created := backend.created
+	for i, env := range []map[string]string{
 		{"BAD-NAME": "x"},
 		{"A": "x\x00y"},
 		{strings.Repeat("K", 256): "x"},
+		{"OPENAI_API_KEY": "${secret:openai}"},
 	} {
-		if _, err := svc.Create(ctx, CreateRequest{Name: "env-bad", Env: env}); err == nil {
+		if _, err := svc.Create(ctx, CreateRequest{Name: fmt.Sprintf("env-bad-%d", i), Env: env}); err == nil {
 			t.Fatalf("invalid env accepted: %v", env)
 		}
+	}
+	if backend.created != created {
+		t.Fatalf("invalid env reached runtime: created=%d want %d", backend.created, created)
 	}
 }
 
@@ -1330,6 +1337,55 @@ func TestResolvedRegistryEgressAppliesDomainAndCIDRDenyRules(t *testing.T) {
 	}
 }
 
+func TestServiceProxyAddressAuthorizerAppliesCIDRDenyRules(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "service-proxy-policy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	op, err := svc.Create(ctx, CreateRequest{Name: "service-proxy-policy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.MutatePolicy(ctx, op.SandboxID, "allow", sandbox.NetworkRule{Protocol: "tcp", Domain: "api.openai.com", Port: 443}); err != nil {
+		t.Fatal(err)
+	}
+	vault, err := servicesecrets.NewStore(&fakeServiceSecretVault{items: make(map[string]string)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetServiceSecretStore(vault)
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("synthetic-key")); err != nil {
+		t.Fatal(err)
+	}
+	sandboxRecord, err := st.Get(ctx, op.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, _, err := svc.buildProxyRoute(ctx, sandboxRecord, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(route.Secret)
+	if route.Service.AuthorizeAddress == nil {
+		t.Fatal("service secret proxy omitted resolved-address policy authorization")
+	}
+	address := netip.MustParseAddr("8.8.8.8")
+	allowed, err := route.Service.AuthorizeAddress(ctx, address)
+	if err != nil || !allowed {
+		t.Fatalf("domain allow positive control: allowed=%t err=%v", allowed, err)
+	}
+	if _, err := svc.MutatePolicy(ctx, op.SandboxID, "deny", sandbox.NetworkRule{Protocol: "tcp", CIDR: "8.8.8.0/24", Port: 443}); err != nil {
+		t.Fatal(err)
+	}
+	allowed, err = route.Service.AuthorizeAddress(ctx, address)
+	if err != nil || allowed {
+		t.Fatalf("CIDR deny negative control: allowed=%t err=%v", allowed, err)
+	}
+}
+
 func TestCreatePassesPrivileged(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "priv.db"))
@@ -1464,13 +1520,21 @@ func TestGlobalPolicyMergesIntoNewSandboxes(t *testing.T) {
 }
 
 type fakeServiceSecretVault struct {
-	mu    sync.Mutex
-	items map[string]string
+	mu        sync.Mutex
+	items     map[string]string
+	deleteErr error
+	setErr    error
+	setErrAt  int
+	setCalls  int
 }
 
 func (f *fakeServiceSecretVault) Set(_ context.Context, service, account, secret string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.setCalls++
+	if f.setErr != nil && f.setCalls == f.setErrAt {
+		return f.setErr
+	}
 	f.items[service+"/"+account] = secret
 	return nil
 }
@@ -1488,12 +1552,347 @@ func (f *fakeServiceSecretVault) Get(_ context.Context, service, account string)
 func (f *fakeServiceSecretVault) Delete(_ context.Context, service, account string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	key := service + "/" + account
 	if _, ok := f.items[key]; !ok {
 		return servicesecrets.ErrNotFound
 	}
 	delete(f.items, key)
 	return nil
+}
+
+type blockingServiceSecretVault struct {
+	fakeServiceSecretVault
+	entered      chan struct{}
+	deleteCalled chan struct{}
+	release      chan struct{}
+	block        sync.Once
+}
+
+func (f *blockingServiceSecretVault) Set(ctx context.Context, service, account, secret string) error {
+	f.block.Do(func() {
+		close(f.entered)
+		select {
+		case <-f.release:
+		case <-ctx.Done():
+		}
+	})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.fakeServiceSecretVault.Set(ctx, service, account, secret)
+}
+
+func (f *blockingServiceSecretVault) Delete(ctx context.Context, service, account string) error {
+	select {
+	case f.deleteCalled <- struct{}{}:
+	default:
+	}
+	return f.fakeServiceSecretVault.Delete(ctx, service, account)
+}
+
+func TestSetAndRemoveServiceSecretShareCanonicalCredentialGate(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "service-secret-set-remove.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &blockingServiceSecretVault{
+		fakeServiceSecretVault: fakeServiceSecretVault{items: make(map[string]string)},
+		entered:                make(chan struct{}),
+		deleteCalled:           make(chan struct{}, 1),
+		release:                make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	releaseSet := func() { releaseOnce.Do(func() { close(vault.release) }) }
+	t.Cleanup(releaseSet)
+	secretStore, err := servicesecrets.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(st, nil)
+	svc.SetServiceSecretStore(secretStore)
+	setDone := make(chan error, 1)
+	go func() {
+		_, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("synthetic-key"))
+		setDone <- err
+	}()
+	<-vault.entered
+	removeDone := make(chan error, 1)
+	removeStarted := make(chan struct{})
+	go func() {
+		close(removeStarted)
+		removed, err := svc.RemoveServiceSecret(ctx, " OPENAI ", servicesecrets.ScopeGlobal, "")
+		if err == nil && !removed {
+			err = errors.New("remove did not observe the completed set")
+		}
+		removeDone <- err
+	}()
+	<-removeStarted
+	select {
+	case <-vault.deleteCalled:
+		t.Fatal("canonical alias removal reached the vault while the set held its gate")
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseSet()
+	if err := <-setDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-vault.deleteCalled:
+	case <-time.After(time.Second):
+		t.Fatal("serialized removal never reached the vault")
+	}
+	if err := <-removeDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secretStore.Load(ctx, "openai", servicesecrets.ScopeGlobal, ""); !errors.Is(err, servicesecrets.ErrNotFound) {
+		t.Fatalf("secret remains after serialized set/remove: %v", err)
+	}
+	entries, err := svc.ListServiceSecrets(ctx)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("secret index after serialized set/remove=%+v err=%v", entries, err)
+	}
+}
+
+func TestRemoveServiceSecretCleansStaleIndexWithCanonicalScope(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "service-secret-remove-index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &fakeServiceSecretVault{items: make(map[string]string)}
+	secretStore, err := servicesecrets.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(st, nil)
+	svc.SetServiceSecretStore(secretStore)
+	var manager *secretproxy.Manager
+	if goruntime.GOOS != "windows" {
+		manager = secretproxy.New()
+		svc.SetSecretProxyManager(manager)
+		t.Cleanup(func() { _ = manager.Close() })
+	}
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("synthetic-key")); err != nil {
+		t.Fatal(err)
+	}
+	if manager != nil {
+		if _, err := manager.StartUnix(ctx, "dev", "openai", secretproxy.Service{
+			Upstream: "http://127.0.0.1:1", Header: "Authorization", CredentialScope: "global",
+		}, []byte("synthetic-key"), shortTestProxySocketPath(t), strings.Repeat("a", 64)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := vault.Delete(ctx, "com.rheic.service-secrets.v1", "openai/global"); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := svc.RemoveServiceSecret(ctx, " OPENAI ", "", " ")
+	if err != nil || removed {
+		t.Fatalf("stale-entry cleanup returned removed=%t err=%v", removed, err)
+	}
+	if manager != nil && manager.Has("dev", "openai") {
+		t.Fatal("canonical global removal left an active proxy route")
+	}
+	entries, err := svc.ListServiceSecrets(ctx)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("stale secret index remains: entries=%+v err=%v", entries, err)
+	}
+}
+
+func TestRemoveServiceSecretRevokesProxyBeforeVaultDelete(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("service proxy lifecycle requires Unix sockets")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "service-secret-remove-failure.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &fakeServiceSecretVault{items: make(map[string]string)}
+	secretStore, err := servicesecrets.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(st, nil)
+	svc.SetServiceSecretStore(secretStore)
+	manager := secretproxy.New()
+	svc.SetSecretProxyManager(manager)
+	t.Cleanup(func() { _ = manager.Close() })
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("synthetic-key")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.StartUnix(ctx, "dev", "openai", secretproxy.Service{
+		Upstream: "http://127.0.0.1:1", Header: "Authorization", CredentialScope: "global",
+	}, []byte("synthetic-key"), shortTestProxySocketPath(t), strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	deleteErr := errors.New("synthetic keychain delete failure")
+	vault.mu.Lock()
+	vault.deleteErr = deleteErr
+	vault.mu.Unlock()
+	removed, err := svc.RemoveServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "")
+	if removed || !errors.Is(err, deleteErr) {
+		t.Fatalf("failed vault deletion returned removed=%t err=%v", removed, err)
+	}
+	if manager.Has("dev", "openai") {
+		t.Fatal("active proxy remained usable after a failed secret removal")
+	}
+	entries, err := svc.ListServiceSecrets(ctx)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("metadata should remain for retry: entries=%+v err=%v", entries, err)
+	}
+	vault.mu.Lock()
+	vault.deleteErr = nil
+	vault.mu.Unlock()
+	removed, err = svc.RemoveServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "")
+	if !removed || err != nil {
+		t.Fatalf("retry returned removed=%t err=%v", removed, err)
+	}
+	entries, err = svc.ListServiceSecrets(ctx)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("retry left metadata: entries=%+v err=%v", entries, err)
+	}
+}
+
+func shortTestProxySocketPath(t *testing.T) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("/tmp", "rheic-rm-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	return filepath.Join(directory, "proxy.sock")
+}
+
+func TestSetServiceSecretRollsBackVaultWhenIndexWriteFails(t *testing.T) {
+	for _, hadPrevious := range []bool{false, true} {
+		t.Run(fmt.Sprintf("previous=%t", hadPrevious), func(t *testing.T) {
+			testSetServiceSecretIndexFailureRollback(t, hadPrevious)
+		})
+	}
+}
+
+func TestSetServiceSecretRollbackFailureDeletesCredentialAndRevokesProxy(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("service proxy lifecycle requires Unix sockets")
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "service-secret-rollback-failure.db")
+	st, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &fakeServiceSecretVault{items: make(map[string]string)}
+	secretStore, err := servicesecrets.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(st, nil)
+	svc.SetServiceSecretStore(secretStore)
+	manager := secretproxy.New()
+	svc.SetSecretProxyManager(manager)
+	t.Cleanup(func() { _ = manager.Close() })
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("old-synthetic-value")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.StartUnix(ctx, "dev", "openai", secretproxy.Service{
+		Upstream: "http://127.0.0.1:1", Header: "Authorization", CredentialScope: "global",
+	}, []byte("old-synthetic-value"), shortTestProxySocketPath(t), strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.ExecContext(ctx, `CREATE TRIGGER fail_service_secret_index BEFORE INSERT ON service_secret_index BEGIN SELECT RAISE(ABORT, 'synthetic index failure'); END`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	vault.mu.Lock()
+	vault.setErrAt = 3 // old save, failed replacement write, then failed restore
+	vault.setErr = errors.New("synthetic vault restore failure")
+	vault.mu.Unlock()
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("new-synthetic-value")); err == nil {
+		t.Fatal("set succeeded despite index and rollback failures")
+	}
+	if manager.Has("dev", "openai") {
+		t.Fatal("proxy route remained active after rollback failure")
+	}
+	if _, err := secretStore.Load(ctx, "openai", servicesecrets.ScopeGlobal, ""); !errors.Is(err, servicesecrets.ErrNotFound) {
+		t.Fatalf("credential remained after rollback failure cleanup: %v", err)
+	}
+	entries, err := svc.ListServiceSecrets(ctx)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("index remained after rollback failure cleanup: entries=%+v err=%v", entries, err)
+	}
+}
+
+func testSetServiceSecretIndexFailureRollback(t *testing.T, hadPrevious bool) {
+	t.Helper()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "service-secret-index-failure.db")
+	st, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &fakeServiceSecretVault{items: make(map[string]string)}
+	secretStore, err := servicesecrets.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(st, nil)
+	svc.SetServiceSecretStore(secretStore)
+	if hadPrevious {
+		if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("old-synthetic-value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.ExecContext(ctx, `CREATE TRIGGER fail_service_secret_index BEFORE INSERT ON service_secret_index BEGIN SELECT RAISE(ABORT, 'synthetic index failure'); END`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("new-synthetic-value")); err == nil {
+		t.Fatal("set succeeded despite injected index failure")
+	}
+	value, err := secretStore.Load(ctx, "openai", servicesecrets.ScopeGlobal, "")
+	if hadPrevious {
+		if err != nil || string(value) != "old-synthetic-value" {
+			t.Fatalf("previous vault value not restored: value=%q err=%v", value, err)
+		}
+		clear(value)
+		entries, err := svc.ListServiceSecrets(ctx)
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("existing index entry lost: entries=%+v err=%v", entries, err)
+		}
+		return
+	}
+	if !errors.Is(err, servicesecrets.ErrNotFound) {
+		t.Fatalf("new vault value remained after rollback: value=%q err=%v", value, err)
+	}
+	entries, err := svc.ListServiceSecrets(ctx)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("index entry remained after rollback: entries=%+v err=%v", entries, err)
+	}
 }
 
 func TestCreateServiceSecretIsAtomicForConcurrentWriters(t *testing.T) {
@@ -1662,7 +2061,7 @@ func TestServiceSecretNeverPersistsValue(t *testing.T) {
 	}
 }
 
-func TestResolveSecretEnvFailsClosedAndScopes(t *testing.T) {
+func TestResolveSecretEnvRejectsGuestVisibleReferences(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -1670,23 +2069,21 @@ func TestResolveSecretEnvFailsClosedAndScopes(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 	svc := New(st, nil)
-	secretStore, err := servicesecrets.NewStore(&fakeServiceSecretVault{items: make(map[string]string)})
-	if err != nil {
-		t.Fatal(err)
+	for _, entry := range []string{
+		"OPENAI_API_KEY=${secret:openai}",
+		"VALUE=prefix-${secret:openai}-suffix",
+	} {
+		env, err := svc.resolveSecretEnv(ctx, sandbox.Sandbox{Name: "dev"}, []string{entry, "PLAIN=value"})
+		if !errors.Is(err, core.ErrConflict) || len(env) != 0 {
+			t.Fatalf("secret reference was not rejected before exec: env=%q err=%v", env, err)
+		}
+		if strings.Contains(err.Error(), "synthetic-secret") {
+			t.Fatalf("error leaked a secret value: %v", err)
+		}
 	}
-	svc.SetServiceSecretStore(secretStore)
-	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("global-value")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeSandbox, "dev", []byte("sandbox-value")); err != nil {
-		t.Fatal(err)
-	}
-	env, err := svc.resolveSecretEnv(ctx, sandbox.Sandbox{Name: "dev"}, []string{"OPENAI_API_KEY=${secret:openai}", "PLAIN=value"})
-	if err != nil || len(env) != 2 || env[0] != "OPENAI_API_KEY=sandbox-value" || env[1] != "PLAIN=value" {
-		t.Fatalf("env=%q err=%v", env, err)
-	}
-	if _, err := svc.resolveSecretEnv(ctx, sandbox.Sandbox{Name: "other"}, []string{"KEY=${secret:missing}"}); err == nil {
-		t.Fatal("missing secret did not fail closed")
+	env, err := svc.resolveSecretEnv(ctx, sandbox.Sandbox{Name: "dev"}, []string{"PLAIN=value"})
+	if err != nil || len(env) != 1 || env[0] != "PLAIN=value" {
+		t.Fatalf("ordinary environment variable rejected: env=%q err=%v", env, err)
 	}
 }
 

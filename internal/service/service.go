@@ -535,20 +535,19 @@ func (s *Service) storeServiceSecret(ctx context.Context, service string, scope 
 		scope = servicesecrets.ScopeGlobal
 	}
 	sandboxName = strings.TrimSpace(sandboxName)
-	release, err := s.acquireCredentialGate(ctx, "service-secret/"+service+"/"+string(scope)+"/"+sandboxName)
+	release, err := s.acquireCredentialGate(ctx, serviceSecretGateKey(service, scope, sandboxName))
 	if err != nil {
 		return servicesecrets.Summary{}, err
 	}
 	defer release()
-	if createOnly {
-		existing, loadErr := s.serviceSecrets.Load(ctx, service, scope, sandboxName)
-		if loadErr == nil {
-			clear(existing)
-			return servicesecrets.Summary{}, servicesecrets.ErrExists
-		}
-		if !errors.Is(loadErr, servicesecrets.ErrNotFound) {
-			return servicesecrets.Summary{}, fmt.Errorf("check existing service secret: %w", loadErr)
-		}
+	previous, loadErr := s.serviceSecrets.Load(ctx, service, scope, sandboxName)
+	hadPrevious := loadErr == nil
+	if loadErr != nil && !errors.Is(loadErr, servicesecrets.ErrNotFound) {
+		return servicesecrets.Summary{}, fmt.Errorf("check existing service secret: %w", loadErr)
+	}
+	defer clear(previous)
+	if createOnly && hadPrevious {
+		return servicesecrets.Summary{}, servicesecrets.ErrExists
 	}
 	summary, err := s.serviceSecrets.Save(ctx, service, scope, sandboxName, value)
 	if err != nil {
@@ -557,13 +556,53 @@ func (s *Service) storeServiceSecret(ctx context.Context, service string, scope 
 	if err := s.store.UpsertServiceSecretIndex(ctx, store.ServiceSecretIndex{
 		Service: summary.Service, Scope: string(summary.Scope), SandboxName: summary.SandboxName,
 	}); err != nil {
-		_, _ = s.serviceSecrets.Delete(ctx, summary.Service, summary.Scope, summary.SandboxName)
-		return servicesecrets.Summary{}, err
+		return servicesecrets.Summary{}, errors.Join(err, s.rollbackServiceSecretAfterIndexFailure(ctx, summary, previous, hadPrevious))
 	}
 	if s.secretProxies != nil {
 		s.secretProxies.RefreshSecret(summary.Service, summary.SandboxName, string(summary.Scope), value)
 	}
 	return summary, nil
+}
+
+func (s *Service) rollbackServiceSecretAfterIndexFailure(ctx context.Context, summary servicesecrets.Summary, previous []byte, hadPrevious bool) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	var rollbackErr error
+	if hadPrevious {
+		_, rollbackErr = s.serviceSecrets.Save(rollbackCtx, summary.Service, summary.Scope, summary.SandboxName, previous)
+	} else {
+		_, rollbackErr = s.serviceSecrets.Delete(rollbackCtx, summary.Service, summary.Scope, summary.SandboxName)
+	}
+	if rollbackErr != nil {
+		return s.cleanupFailedServiceSecretRollback(rollbackCtx, summary, rollbackErr)
+	}
+	if s.secretProxies == nil {
+		return nil
+	}
+	if hadPrevious {
+		s.secretProxies.RefreshSecret(summary.Service, summary.SandboxName, string(summary.Scope), previous)
+		return nil
+	}
+	if err := s.secretProxies.RevokeSecret(summary.Service, summary.SandboxName, string(summary.Scope)); err != nil {
+		return fmt.Errorf("revoke active service proxy after failed secret write: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) cleanupFailedServiceSecretRollback(ctx context.Context, summary servicesecrets.Summary, rollbackErr error) error {
+	errs := []error{fmt.Errorf("rollback service secret after index failure: %w", rollbackErr)}
+	_, deleteErr := s.serviceSecrets.Delete(ctx, summary.Service, summary.Scope, summary.SandboxName)
+	if deleteErr != nil && !errors.Is(deleteErr, servicesecrets.ErrNotFound) {
+		errs = append(errs, fmt.Errorf("remove service secret after rollback failure: %w", deleteErr))
+	} else if indexErr := s.store.DeleteServiceSecretIndex(ctx, summary.Service, string(summary.Scope), summary.SandboxName); indexErr != nil {
+		errs = append(errs, fmt.Errorf("remove service secret index after rollback failure: %w", indexErr))
+	}
+	if s.secretProxies != nil {
+		if revokeErr := s.secretProxies.RevokeSecret(summary.Service, summary.SandboxName, string(summary.Scope)); revokeErr != nil {
+			errs = append(errs, fmt.Errorf("revoke active service proxy after rollback failure: %w", revokeErr))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // ListServiceSecrets returns non-secret summaries.
@@ -583,22 +622,44 @@ func (s *Service) ListServiceSecrets(ctx context.Context) ([]servicesecrets.Summ
 
 // RemoveServiceSecret deletes one service secret from the host keychain.
 func (s *Service) RemoveServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string) (bool, error) {
-	if s.serviceSecrets == nil {
-		return false, errors.New("service secret store is unavailable")
+	service = strings.ToLower(strings.TrimSpace(service))
+	if scope == "" {
+		scope = servicesecrets.ScopeGlobal
 	}
-	removed, err := s.serviceSecrets.Delete(ctx, service, scope, sandboxName)
-	if err != nil || !removed {
-		return removed, err
+	sandboxName = strings.TrimSpace(sandboxName)
+	release, err := s.acquireCredentialGate(ctx, serviceSecretGateKey(service, scope, sandboxName))
+	if err != nil {
+		return false, err
 	}
+	defer release()
+	var failures []error
 	if s.secretProxies != nil {
-		if err := s.secretProxies.RevokeSecret(strings.ToLower(strings.TrimSpace(service)), sandboxName, string(scope)); err != nil {
-			return true, fmt.Errorf("revoke active service proxy: %w", err)
+		if err := s.secretProxies.RevokeSecret(service, sandboxName, string(scope)); err != nil {
+			failures = append(failures, fmt.Errorf("revoke active service proxy: %w", err))
 		}
 	}
-	if err := s.store.DeleteServiceSecretIndex(ctx, strings.ToLower(strings.TrimSpace(service)), string(scope), sandboxName); err != nil {
-		return true, err
+	if s.serviceSecrets == nil {
+		failures = append(failures, errors.New("service secret store is unavailable"))
+		return false, errors.Join(failures...)
 	}
-	return true, nil
+	removed, err := s.serviceSecrets.Delete(ctx, service, scope, sandboxName)
+	if err != nil {
+		failures = append(failures, err)
+		return removed, errors.Join(failures...)
+	}
+	if err := s.store.DeleteServiceSecretIndex(ctx, service, string(scope), sandboxName); err != nil {
+		failures = append(failures, err)
+	}
+	return removed, errors.Join(failures...)
+}
+
+func serviceSecretGateKey(service string, scope servicesecrets.Scope, sandboxName string) string {
+	service = strings.ToLower(strings.TrimSpace(service))
+	if scope == "" {
+		scope = servicesecrets.ScopeGlobal
+	}
+	sandboxName = strings.TrimSpace(sandboxName)
+	return "service-secret/" + service + "/" + string(scope) + "/" + sandboxName
 }
 
 // PolicyDecision is the gateway-consistent result of a policy check.
@@ -1644,6 +1705,9 @@ func normalizeCreateEnv(input map[string]string) ([]string, error) {
 		value := input[key]
 		if !validCreateEnvName(key) {
 			return nil, fmt.Errorf("%w: invalid environment name", core.ErrConflict)
+		}
+		if strings.Contains(value, secretRefPrefix) {
+			return nil, fmt.Errorf("%w: secret environment references expose credentials to guest processes; use a supported host proxy route", core.ErrConflict)
 		}
 		if strings.ContainsRune(value, '\x00') {
 			return nil, fmt.Errorf("%w: environment value contains NUL", core.ErrConflict)
