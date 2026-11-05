@@ -574,13 +574,7 @@ func (s *Service) rollbackServiceSecretAfterIndexFailure(ctx context.Context, su
 		_, rollbackErr = s.serviceSecrets.Delete(rollbackCtx, summary.Service, summary.Scope, summary.SandboxName)
 	}
 	if rollbackErr != nil {
-		errs := []error{fmt.Errorf("rollback service secret after index failure: %w", rollbackErr)}
-		if s.secretProxies != nil {
-			if revokeErr := s.secretProxies.RevokeSecret(summary.Service, summary.SandboxName, string(summary.Scope)); revokeErr != nil {
-				errs = append(errs, fmt.Errorf("revoke active service proxy after rollback failure: %w", revokeErr))
-			}
-		}
-		return errors.Join(errs...)
+		return s.cleanupFailedServiceSecretRollback(rollbackCtx, summary, rollbackErr)
 	}
 	if s.secretProxies == nil {
 		return nil
@@ -593,6 +587,22 @@ func (s *Service) rollbackServiceSecretAfterIndexFailure(ctx context.Context, su
 		return fmt.Errorf("revoke active service proxy after failed secret write: %w", err)
 	}
 	return nil
+}
+
+func (s *Service) cleanupFailedServiceSecretRollback(ctx context.Context, summary servicesecrets.Summary, rollbackErr error) error {
+	errs := []error{fmt.Errorf("rollback service secret after index failure: %w", rollbackErr)}
+	_, deleteErr := s.serviceSecrets.Delete(ctx, summary.Service, summary.Scope, summary.SandboxName)
+	if deleteErr != nil && !errors.Is(deleteErr, servicesecrets.ErrNotFound) {
+		errs = append(errs, fmt.Errorf("remove service secret after rollback failure: %w", deleteErr))
+	} else if indexErr := s.store.DeleteServiceSecretIndex(ctx, summary.Service, string(summary.Scope), summary.SandboxName); indexErr != nil {
+		errs = append(errs, fmt.Errorf("remove service secret index after rollback failure: %w", indexErr))
+	}
+	if s.secretProxies != nil {
+		if revokeErr := s.secretProxies.RevokeSecret(summary.Service, summary.SandboxName, string(summary.Scope)); revokeErr != nil {
+			errs = append(errs, fmt.Errorf("revoke active service proxy after rollback failure: %w", revokeErr))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // ListServiceSecrets returns non-secret summaries.

@@ -1523,11 +1523,18 @@ type fakeServiceSecretVault struct {
 	mu        sync.Mutex
 	items     map[string]string
 	deleteErr error
+	setErr    error
+	setErrAt  int
+	setCalls  int
 }
 
 func (f *fakeServiceSecretVault) Set(_ context.Context, service, account, secret string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.setCalls++
+	if f.setErr != nil && f.setCalls == f.setErrAt {
+		return f.setErr
+	}
 	f.items[service+"/"+account] = secret
 	return nil
 }
@@ -1768,6 +1775,66 @@ func TestSetServiceSecretRollsBackVaultWhenIndexWriteFails(t *testing.T) {
 		t.Run(fmt.Sprintf("previous=%t", hadPrevious), func(t *testing.T) {
 			testSetServiceSecretIndexFailureRollback(t, hadPrevious)
 		})
+	}
+}
+
+func TestSetServiceSecretRollbackFailureDeletesCredentialAndRevokesProxy(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("service proxy lifecycle requires Unix sockets")
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "service-secret-rollback-failure.db")
+	st, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &fakeServiceSecretVault{items: make(map[string]string)}
+	secretStore, err := servicesecrets.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(st, nil)
+	svc.SetServiceSecretStore(secretStore)
+	manager := secretproxy.New()
+	svc.SetSecretProxyManager(manager)
+	t.Cleanup(func() { _ = manager.Close() })
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("old-synthetic-value")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.StartUnix(ctx, "dev", "openai", secretproxy.Service{
+		Upstream: "http://127.0.0.1:1", Header: "Authorization", CredentialScope: "global",
+	}, []byte("old-synthetic-value"), shortTestProxySocketPath(t), strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.ExecContext(ctx, `CREATE TRIGGER fail_service_secret_index BEFORE INSERT ON service_secret_index BEGIN SELECT RAISE(ABORT, 'synthetic index failure'); END`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	vault.mu.Lock()
+	vault.setErrAt = 3 // old save, failed replacement write, then failed restore
+	vault.setErr = errors.New("synthetic vault restore failure")
+	vault.mu.Unlock()
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("new-synthetic-value")); err == nil {
+		t.Fatal("set succeeded despite index and rollback failures")
+	}
+	if manager.Has("dev", "openai") {
+		t.Fatal("proxy route remained active after rollback failure")
+	}
+	if _, err := secretStore.Load(ctx, "openai", servicesecrets.ScopeGlobal, ""); !errors.Is(err, servicesecrets.ErrNotFound) {
+		t.Fatalf("credential remained after rollback failure cleanup: %v", err)
+	}
+	entries, err := svc.ListServiceSecrets(ctx)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("index remained after rollback failure cleanup: entries=%+v err=%v", entries, err)
 	}
 }
 
