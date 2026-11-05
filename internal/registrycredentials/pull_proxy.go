@@ -2,46 +2,93 @@ package registrycredentials
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rheic/sandboxes-gateway/registryauth"
 )
 
-// PullProxy is a host-side, read-only registry handler bound to an identity
-// selected by trusted host code. It must not be exposed until the listener is
-// securely bound to that sandbox and its network policy is enforced.
+// PullProxy is a host-side Docker Hub registry handler bound to an identity
+// selected by trusted host code. Its forward path supports scoped pull and push
+// through TLS interception; it must only be exposed to its bound sandbox.
 type PullProxy struct {
 	store             *Store
 	registry          string
+	authority         string
 	sandboxName       string
 	credentialScope   Scope
 	service           string
 	realms            []registryauth.Realm
-	registryTransport *registryauth.RegistryTransport
-	tokenTransport    *registryauth.TokenTransport
+	registryTransport http.RoundTripper
+	tokenTransport    http.RoundTripper
+	transportFactory  PullProxyTransportFactory
+	limiter           *PullLimiter
 	maxBytes          int64
 	inflight          chan struct{}
+	tlsAuthority      *ProxyAuthority
+	tunnelSlots       chan struct{}
+	stateMu           sync.Mutex
+	tokens            map[string]tokenGrant
+	uploads           map[string]uploadSession
+	blobRedirects     map[string]blobRedirectSession
+}
+
+type tokenGrant struct {
+	repository string
+	actions    map[string]struct{}
+	expiresAt  time.Time
+}
+
+type uploadSession struct {
+	registryHost string
+	repository   string
+	id           string
+	location     *url.URL
+	expiresAt    time.Time
+}
+
+// blobRedirectSession binds guest CDN requests to a URL returned by the
+// trusted registry. A small use budget permits Docker range retries while
+// preventing the CDN endpoint from becoming a general-purpose proxy.
+type blobRedirectSession struct {
+	usesLeft  int
+	expiresAt time.Time
+}
+
+// PullProxyTransportFactory creates host-only HTTPS transports for the
+// configured registry and a realm already accepted by the trusted allowlist.
+type PullProxyTransportFactory interface {
+	Registry(context.Context, string) (http.RoundTripper, error)
+	Token(context.Context, registryauth.Realm) (http.RoundTripper, error)
+	Redirect(context.Context, string) (http.RoundTripper, error)
 }
 
 const maxPullResponseBytes = 16 << 30
+const maxPullErrorResponseBytes = 64 << 10
 
 // PullProxyConfig is trusted host configuration, never a guest request.
 type PullProxyConfig struct {
 	Registry          string
+	Authority         string
 	SandboxName       string
 	CredentialScope   Scope
 	Service           string
 	Realms            []registryauth.Realm
-	RegistryTransport *registryauth.RegistryTransport
-	TokenTransport    *registryauth.TokenTransport
+	RegistryTransport http.RoundTripper
+	TokenTransport    http.RoundTripper
+	TransportFactory  PullProxyTransportFactory
+	Limiter           *PullLimiter
 	MaxBytes          int64
+	TLSAuthority      *ProxyAuthority
 }
 
 // NewPullProxy requires a sandbox-scoped or all-sandboxes credential; host-only
@@ -51,26 +98,56 @@ func NewPullProxy(store *Store, cfg PullProxyConfig) (*PullProxy, error) {
 	if err != nil {
 		return nil, err
 	}
-	if store == nil || cfg.SandboxName == "" || cfg.Service == "" || len(cfg.Realms) == 0 ||
-		cfg.RegistryTransport == nil || cfg.TokenTransport == nil || cfg.MaxBytes <= 0 || cfg.MaxBytes > maxPullResponseBytes ||
-		(cfg.CredentialScope != ScopeSandbox && cfg.CredentialScope != ScopeAllSandboxes) {
+	authority := cfg.Authority
+	if authority == "" {
+		authority = registry
+	}
+	parsedAuthority, authorityErr := url.Parse("https://" + authority)
+	if authorityErr != nil || parsedAuthority.Host != authority || parsedAuthority.Hostname() == "" || parsedAuthority.User != nil ||
+		parsedAuthority.Path != "" || parsedAuthority.RawQuery != "" || parsedAuthority.Fragment != "" {
+		return nil, errors.New("invalid pull proxy authority")
+	}
+	if !validPullProxyConfig(store, cfg) {
 		return nil, errors.New("invalid pull proxy configuration")
 	}
 	if _, _, err := validateScope(ScopeSandbox, cfg.SandboxName); err != nil {
 		return nil, errors.New("invalid pull proxy sandbox identity")
 	}
-	return &PullProxy{store: store, registry: registry, sandboxName: cfg.SandboxName, credentialScope: cfg.CredentialScope,
+	return &PullProxy{store: store, registry: registry, authority: authority, sandboxName: cfg.SandboxName, credentialScope: cfg.CredentialScope,
 		service: cfg.Service, realms: append([]registryauth.Realm(nil), cfg.Realms...), registryTransport: cfg.RegistryTransport,
-		tokenTransport: cfg.TokenTransport, maxBytes: cfg.MaxBytes, inflight: make(chan struct{}, 4)}, nil
+		tokenTransport: cfg.TokenTransport, transportFactory: cfg.TransportFactory, limiter: cfg.Limiter,
+		maxBytes: cfg.MaxBytes, inflight: make(chan struct{}, 4), tlsAuthority: cfg.TLSAuthority,
+		tunnelSlots: make(chan struct{}, 8), tokens: make(map[string]tokenGrant), uploads: make(map[string]uploadSession),
+		blobRedirects: make(map[string]blobRedirectSession)}, nil
 }
 
-// ServeHTTP accepts only read-only registry pull requests and does not forward
-// guest-provided authorization headers. It never returns the upstream token.
+func validPullProxyConfig(store *Store, cfg PullProxyConfig) bool {
+	return store != nil && cfg.SandboxName != "" && cfg.Service != "" && len(cfg.Realms) != 0 &&
+		(cfg.TransportFactory != nil || (cfg.RegistryTransport != nil && cfg.TokenTransport != nil)) &&
+		cfg.Limiter != nil &&
+		cfg.MaxBytes > 0 && cfg.MaxBytes <= maxPullResponseBytes &&
+		(cfg.CredentialScope == ScopeSandbox || cfg.CredentialScope == ScopeAllSandboxes)
+}
+
+// ServeHTTP accepts either unauthenticated loopback-mirror pulls or requests
+// inside a verified Docker Hub TLS tunnel. It never returns a host bearer.
 func (p *PullProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	endpoint := &url.URL{Scheme: "https", Host: p.registry, Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery, ForceQuery: r.URL.ForceQuery}
-	probe := endpoint.Path == "/v2/" && endpoint.RawPath == "" && endpoint.RawQuery == "" && !endpoint.ForceQuery && r.URL.Fragment == "" && r.URL.Opaque == "" &&
+	if r.Method == http.MethodConnect {
+		p.serveConnect(w, r)
+		return
+	}
+	if r.TLS != nil {
+		p.serveForwardRequest(w, r)
+		return
+	}
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		http.Error(w, "registry pull request body is unsupported", http.StatusBadRequest)
+		return
+	}
+	endpoint := &url.URL{Scheme: registryHTTPScheme, Host: p.authority, Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery, ForceQuery: r.URL.ForceQuery}
+	probe := endpoint.Path == registryV2Path && endpoint.RawPath == "" && endpoint.RawQuery == "" && !endpoint.ForceQuery && r.URL.Fragment == "" && r.URL.Opaque == "" &&
 		(r.Method == http.MethodGet || r.Method == http.MethodHead)
-	if _, err := registryauth.PullScope(r.Method, endpoint, p.registry); err != nil && !probe {
+	if _, err := registryauth.PullScope(r.Method, endpoint, p.authority); err != nil && !probe {
 		http.Error(w, "unsupported registry request", http.StatusForbidden)
 		return
 	}
@@ -83,9 +160,20 @@ func (p *PullProxy) serveAllowed(w http.ResponseWriter, r *http.Request, endpoin
 		defer func() { <-p.inflight }()
 	case <-r.Context().Done():
 		return
+	default:
+		writeRegistryBusy(w)
+		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
+	if !p.limiter.acquire(ctx) {
+		if r.Context().Err() != nil {
+			return
+		}
+		writeRegistryBusy(w)
+		return
+	}
+	defer p.limiter.release()
 	if probe {
 		if err := p.probe(ctx, r, endpoint); err != nil {
 			http.Error(w, "registry request failed", http.StatusBadGateway)
@@ -106,8 +194,17 @@ func (p *PullProxy) serveAllowed(w http.ResponseWriter, r *http.Request, endpoin
 	}
 }
 
+func writeRegistryBusy(w http.ResponseWriter) {
+	w.Header().Set("Retry-After", "1")
+	http.Error(w, "registry proxy is busy", http.StatusServiceUnavailable)
+}
+
 func (p *PullProxy) probe(ctx context.Context, incoming *http.Request, endpoint *url.URL) error {
-	client := &http.Client{Transport: p.registryTransport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	transport, err := p.registryTransportFor(ctx)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := p.registryRequest(ctx, client, incoming, endpoint, "")
 	if err != nil {
 		return err
@@ -132,7 +229,11 @@ func (p *PullProxy) writeResponse(w http.ResponseWriter, method string, resp *ht
 		http.Error(w, "registry request failed", http.StatusBadGateway)
 		return errors.New("registry returned an unsupported status")
 	}
-	if method != http.MethodHead && resp.StatusCode != http.StatusNotModified && (resp.ContentLength < 0 || resp.ContentLength > p.maxBytes) {
+	maxBytes := p.maxBytes
+	if resp.StatusCode == http.StatusNotFound && maxBytes > maxPullErrorResponseBytes {
+		maxBytes = maxPullErrorResponseBytes
+	}
+	if method != http.MethodHead && resp.StatusCode != http.StatusNotModified && (resp.ContentLength < 0 || resp.ContentLength > maxBytes) {
 		http.Error(w, "registry response exceeds supported limits", http.StatusBadGateway)
 		return errors.New("registry response length is unknown or exceeds the configured limit")
 	}
@@ -155,11 +256,15 @@ func (p *PullProxy) writeResponse(w http.ResponseWriter, method string, resp *ht
 }
 
 func allowedPullStatus(code int) bool {
-	return code == http.StatusOK || code == http.StatusPartialContent || code == http.StatusNotModified
+	return code == http.StatusOK || code == http.StatusPartialContent || code == http.StatusNotModified || code == http.StatusNotFound
 }
 
 func (p *PullProxy) pull(ctx context.Context, incoming *http.Request, endpoint *url.URL) (*http.Response, error) {
-	client := &http.Client{Transport: p.registryTransport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	registryTransport, err := p.registryTransportFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Transport: registryTransport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := p.registryRequest(ctx, client, incoming, endpoint, "")
 	if err != nil || resp.StatusCode != http.StatusUnauthorized {
 		return resp, err
@@ -169,16 +274,103 @@ func (p *PullProxy) pull(ctx context.Context, incoming *http.Request, endpoint *
 	if len(challenges) != 1 {
 		return nil, errors.New("registry returned an invalid challenge")
 	}
+	challenge, err := registryauth.ParseBearerChallenge(challenges[0], p.realms)
+	if err != nil || challenge.Service != p.service {
+		return nil, errors.New("registry returned an untrusted challenge")
+	}
+	tokenTransport, err := p.tokenTransportFor(ctx, registryauth.Realm{Host: challenge.Realm.Host, Path: challenge.Realm.EscapedPath()})
+	if err != nil {
+		return nil, err
+	}
 	name := ""
 	if p.credentialScope == ScopeSandbox {
 		name = p.sandboxName
 	}
-	token, err := p.store.ExchangePullToken(ctx, p.tokenTransport, PullRequest{Registry: p.registry, Scope: p.credentialScope,
+	token, err := p.store.ExchangePullToken(ctx, tokenTransport, PullRequest{Registry: p.registry, Authority: p.authority, Scope: p.credentialScope,
 		SandboxName: name, Method: incoming.Method, URL: endpoint, Challenge: challenges[0], Realms: p.realms, Service: p.service})
 	if err != nil {
 		return nil, err
 	}
-	return p.registryRequest(ctx, client, incoming, endpoint, token)
+	return p.followPullRedirects(ctx, client, incoming, endpoint, token)
+}
+
+func (p *PullProxy) followPullRedirects(ctx context.Context, registryClient *http.Client, incoming *http.Request, endpoint *url.URL, token string) (*http.Response, error) {
+	current := endpoint
+	for redirects := 0; ; redirects++ {
+		client, requestToken, err := p.redirectClient(ctx, registryClient, current, token, redirects)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := p.registryRequest(ctx, client, incoming, current, requestToken)
+		if err != nil || !isPullRedirectStatus(resp.StatusCode) {
+			return resp, err
+		}
+		if redirects >= 5 {
+			_ = resp.Body.Close()
+			return nil, errors.New("too many registry redirects")
+		}
+		location := resp.Header.Get("Location")
+		_ = resp.Body.Close()
+		current, err = validatePullRedirect(current, location, p.authority)
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
+func isPullRedirectStatus(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *PullProxy) redirectClient(ctx context.Context, registryClient *http.Client, current *url.URL, token string, redirects int) (*http.Client, string, error) {
+	if strings.EqualFold(current.Host, p.authority) {
+		return registryClient, token, nil
+	}
+	if redirects == 0 || p.transportFactory == nil || redirects > 5 {
+		return nil, "", errors.New("registry redirect is not supported")
+	}
+	transport, err := p.transportFactory.Redirect(ctx, current.Host)
+	if err != nil {
+		return nil, "", err
+	}
+	return &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, "", nil
+}
+
+func validatePullRedirect(current *url.URL, location, registryAuthority string) (*url.URL, error) {
+	if strings.TrimSpace(location) == "" {
+		return nil, errors.New("registry redirect location is empty")
+	}
+	next, err := current.Parse(location)
+	if err != nil || next.Scheme != registryHTTPScheme || next.User != nil || next.Fragment != "" || next.Opaque != "" || next.Hostname() == "" {
+		return nil, errors.New("invalid registry redirect")
+	}
+	if !strings.EqualFold(next.Host, registryAuthority) && !trustedPullRedirectHost(next.Host) {
+		return nil, errors.New("untrusted registry redirect authority")
+	}
+	return next, nil
+}
+
+func trustedPullRedirectHost(host string) bool {
+	return strings.EqualFold(host, "production.cloudfront.docker.com")
+}
+
+func (p *PullProxy) registryTransportFor(ctx context.Context) (http.RoundTripper, error) {
+	if p.transportFactory == nil {
+		return p.registryTransport, nil
+	}
+	return p.transportFactory.Registry(ctx, p.authority)
+}
+
+func (p *PullProxy) tokenTransportFor(ctx context.Context, realm registryauth.Realm) (http.RoundTripper, error) {
+	if p.transportFactory == nil {
+		return p.tokenTransport, nil
+	}
+	return p.transportFactory.Token(ctx, realm)
 }
 
 func (p *PullProxy) registryRequest(ctx context.Context, client *http.Client, incoming *http.Request, endpoint *url.URL, token string) (*http.Response, error) {
@@ -191,6 +383,9 @@ func (p *PullProxy) registryRequest(ctx context.Context, client *http.Client, in
 			req.Header.Add(key, value)
 		}
 	}
+	// Prevent net/http's implicit gzip negotiation and decompression from
+	// hiding the upstream wire length from the bounded streaming path.
+	req.Header.Set("Accept-Encoding", "identity")
 	if token != "" {
 		if strings.ContainsAny(token, "\r\n") {
 			return nil, errors.New("invalid registry token")
@@ -201,9 +396,132 @@ func (p *PullProxy) registryRequest(ctx context.Context, client *http.Client, in
 }
 
 func copyPullResponseHeaders(dst, src http.Header) {
-	for _, key := range []string{"Content-Type", "Content-Length", "Content-Range", "Docker-Content-Digest", "Docker-Distribution-Api-Version", "ETag", "Last-Modified"} {
+	for _, key := range []string{"Content-Type", "Content-Encoding", "Content-Length", "Content-Range", "Docker-Content-Digest", "Docker-Distribution-Api-Version", "ETag", "Last-Modified"} {
 		for _, value := range src.Values(key) {
 			dst.Add(key, value)
 		}
 	}
+}
+
+func (p *PullProxy) serveConnect(w http.ResponseWriter, r *http.Request) {
+	host, valid := p.connectHost(r)
+	if !valid {
+		http.Error(w, "registry CONNECT is unsupported", http.StatusForbidden)
+		return
+	}
+	select {
+	case p.tunnelSlots <- struct{}{}:
+		defer func() { <-p.tunnelSlots }()
+	case <-r.Context().Done():
+		return
+	default:
+		writeRegistryBusy(w)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "registry CONNECT is unavailable", http.StatusInternalServerError)
+		return
+	}
+	conn, _, err := hijacker.Hijack()
+	if err != nil {
+		return
+	}
+	defer func() { _ = conn.Close() }()
+	p.serveTLSConnection(ctx, conn, host)
+}
+
+func (p *PullProxy) connectHost(r *http.Request) (string, bool) {
+	if p.tlsAuthority == nil || r == nil || r.URL == nil ||
+		(r.URL.Opaque != "" && r.URL.Opaque != r.Host) || (r.URL.Host != "" && r.URL.Host != r.Host) ||
+		r.URL.Path != "" || r.URL.RawQuery != "" || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		return "", false
+	}
+	host, port, err := net.SplitHostPort(r.Host)
+	return host, err == nil && port == "443" && p.allowedConnectHost(host)
+}
+
+func (p *PullProxy) serveTLSConnection(ctx context.Context, conn net.Conn, host string) {
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
+	if _, err := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		return
+	}
+	serverTLS := tls.Server(conn, &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if !strings.EqualFold(hello.ServerName, host) {
+				return nil, errors.New("registry TLS SNI does not match CONNECT target")
+			}
+			certificate, err := p.tlsAuthority.Leaf(host, time.Now())
+			return &certificate, err
+		},
+	})
+	if err := serverTLS.HandshakeContext(ctx); err != nil {
+		return
+	}
+	_ = serverTLS.SetDeadline(time.Time{})
+	listener := newSingleConnListener(serverTLS)
+	server := &http.Server{
+		Handler: p, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second,
+		MaxHeaderBytes: 64 << 10, BaseContext: func(net.Listener) context.Context { return ctx },
+	}
+	_ = server.Serve(listener)
+}
+
+func (p *PullProxy) allowedConnectHost(host string) bool {
+	if strings.EqualFold(host, p.authority) || strings.EqualFold(host, "auth.docker.io") {
+		return true
+	}
+	return strings.EqualFold(host, "production.cloudfront.docker.com")
+}
+
+type singleConnListener struct {
+	conn      net.Conn
+	once      bool
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func newSingleConnListener(conn net.Conn) *singleConnListener {
+	return &singleConnListener{conn: conn, done: make(chan struct{})}
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	if !l.once {
+		l.once = true
+		return &singleListenerConn{Conn: l.conn, listener: l}, nil
+	}
+	<-l.done
+	return nil, net.ErrClosed
+}
+
+func (l *singleConnListener) Close() error {
+	l.signal()
+	return l.conn.Close()
+}
+
+func (l *singleConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
+
+func (l *singleConnListener) signal() { l.closeOnce.Do(func() { close(l.done) }) }
+
+type singleListenerConn struct {
+	net.Conn
+	listener *singleConnListener
+}
+
+func (c *singleListenerConn) ConnectionState() tls.ConnectionState {
+	stateful, ok := c.Conn.(interface{ ConnectionState() tls.ConnectionState })
+	if !ok {
+		return tls.ConnectionState{}
+	}
+	return stateful.ConnectionState()
+}
+
+func (c *singleListenerConn) Close() error {
+	c.listener.signal()
+	return c.Conn.Close()
 }

@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +19,7 @@ import (
 	runtime "github.com/rheic/sandboxes-runtime"
 
 	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
+	"github.com/rheic/sandboxes-daemon/internal/secretproxy"
 	"github.com/rheic/sandboxes-daemon/internal/servicesecrets"
 	"github.com/rheic/sandboxes-daemon/internal/store"
 )
@@ -1189,6 +1192,140 @@ func TestPolicyProfileGlobalAndMetadata(t *testing.T) {
 	}
 	if _, err := svc.SetPolicyProfile(ctx, "unknown"); err == nil {
 		t.Fatal("unknown profile accepted")
+	}
+}
+
+func TestStartDockerProfileEnablesOnlyConfiguredRegistryMirror(t *testing.T) {
+	backend := &fakeRuntime{}
+	svc := &Service{backend: backend}
+	handle := runtime.Handle{ID: "owned"}
+	if err := svc.startDockerProfile(context.Background(), handle, false); err != nil {
+		t.Fatal(err)
+	}
+	withoutMirror := strings.Join(backend.lastExec.Argv, " ")
+	if strings.Contains(withoutMirror, "--registry-mirror=") {
+		t.Fatal("registry mirror enabled without a scoped credential route")
+	}
+	if err := svc.startDockerProfile(context.Background(), handle, true); err != nil {
+		t.Fatal(err)
+	}
+	withMirror := strings.Join(backend.lastExec.Argv, " ")
+	if !strings.Contains(withMirror, "--registry-mirror="+registryMirrorURL) {
+		t.Fatalf("configured registry mirror missing from dockerd command: %s", withMirror)
+	}
+}
+
+func TestCreateWiresScopedDockerHubPullBrokerIntoGuest(t *testing.T) {
+	if goruntime.GOOS == "windows" || !dockerVolumeSecuritySupported() {
+		t.Skip("guest Docker profile requires supported Unix sockets and private volume semantics")
+	}
+	ctx := context.Background()
+	stateDir := t.TempDir()
+	st, err := store.Open(ctx, filepath.Join(stateDir, "registry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	backend := &fakeRuntime{}
+	svc := New(st, backend)
+	registryStore, err := registrycredentials.NewStore(&mapVault{items: make(map[string]string)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetRegistryCredentialStore(registryStore)
+	if _, err := registryStore.Save(ctx, registrycredentials.Credential{
+		Registry: dockerHubRegistry, Username: "host-only-user", Password: []byte("host-only-pat"),
+		Scope: registrycredentials.ScopeHostOnly,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registryStore.Save(ctx, registrycredentials.Credential{
+		Registry: dockerHubRegistry, Username: "synthetic-user", Password: []byte("synthetic-pat"),
+		Scope: registrycredentials.ScopeSandbox, SandboxName: "registry-pull",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager := secretproxy.New()
+	svc.SetSecretProxyManager(manager)
+	helperPath := writeStaticProxyHelperFixture(t)
+	proxyRoot, err := os.MkdirTemp("/tmp", "kq-reg-pull-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(proxyRoot) })
+	svc.SetSecretProxyRuntime(helperPath, proxyRoot)
+	svc.DockerVolumeDir = filepath.Join(stateDir, "docker-volumes")
+	if err := os.Mkdir(svc.DockerVolumeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	svc.DockerVolumeSize = "512m"
+	svc.MkfsExt4 = "true"
+	sandboxID := ""
+	t.Cleanup(func() {
+		_ = manager.Close()
+		if sandboxID != "" {
+			_ = secretproxy.RemovePrivateDir(proxySocketDirectory(proxyRoot, sandboxID))
+		}
+	})
+
+	op, err := svc.Create(ctx, CreateRequest{Name: "registry-pull", Image: "alpine:3.22", Privileged: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxID = op.SandboxID
+	if backend.proxyGuestPort != dockerHubGuestPort || backend.proxyServiceHost != dockerHubRegistryHost {
+		t.Fatalf("guest registry route = %s:%d", backend.proxyServiceHost, backend.proxyGuestPort)
+	}
+	if !strings.Contains(strings.Join(backend.lastExec.Argv, " "), "--registry-mirror="+registryMirrorURL) {
+		t.Fatal("guest dockerd did not receive the pull mirror")
+	}
+	services, err := st.GetSetting(ctx, proxyServiceSettingKey(sandboxID))
+	if err != nil || services != dockerHubProxyService {
+		t.Fatalf("persisted proxy services=%q err=%v", services, err)
+	}
+	if !manager.Has("registry-pull", dockerHubProxyService) {
+		t.Fatal("sandbox Docker Hub broker route was not kept active")
+	}
+	if scope, err := st.GetSetting(ctx, registryProxySettingKey(sandboxID)); err != nil || scope != string(registrycredentials.ScopeSandbox) {
+		t.Fatalf("persisted registry scope=%q err=%v", scope, err)
+	}
+	if got, err := svc.availableDockerHubScope(ctx, "registry-pull", false); err != nil || got != registrycredentials.ScopeSandbox {
+		t.Fatalf("selected registry scope=%q err=%v", got, err)
+	}
+	if _, err := registryStore.Delete(ctx, dockerHubRegistry, registrycredentials.ScopeSandbox, "registry-pull"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := svc.availableDockerHubScope(ctx, "registry-pull", true); err != nil || got != "" {
+		t.Fatalf("host-only credential was exposed to guest pulls: scope=%q err=%v", got, err)
+	}
+}
+
+func TestResolvedRegistryEgressAppliesDomainAndCIDRDenyRules(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "registry-policy.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	op, err := svc.Create(ctx, CreateRequest{Name: "registry-policy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.MutatePolicy(ctx, op.SandboxID, "allow", sandbox.NetworkRule{Protocol: "tcp", Domain: "auth.docker.io", Port: 443}); err != nil {
+		t.Fatal(err)
+	}
+	address := netip.MustParseAddr("8.8.8.8")
+	decision, err := svc.checkResolvedEgress(ctx, op.SandboxID, "auth.docker.io", address)
+	if err != nil || !decision.Allowed {
+		t.Fatalf("domain allow decision=%+v err=%v", decision, err)
+	}
+	if _, err := svc.MutatePolicy(ctx, op.SandboxID, "deny", sandbox.NetworkRule{Protocol: "tcp", CIDR: "8.8.8.0/24", Port: 443}); err != nil {
+		t.Fatal(err)
+	}
+	decision, err = svc.checkResolvedEgress(ctx, op.SandboxID, "auth.docker.io", address)
+	if err != nil || decision.Allowed {
+		t.Fatalf("CIDR deny decision=%+v err=%v", decision, err)
 	}
 }
 

@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	daemonnetwork "github.com/rheic/sandboxes-daemon/internal/network"
 )
 
 // Service describes one supported upstream and its auth header.
@@ -37,6 +39,7 @@ const (
 	bearerPrefix    = "Bearer "
 	tokenPath       = "/__rheic/proxy/token" //nolint:gosec // internal route path, not a credential
 	tokenPathPrefix = tokenPath + "/"
+	caPath          = "/__rheic/proxy/ca/"
 	// ServiceHeader identifies a host-configured route on the private proxy channel.
 	ServiceHeader   = "X-Rheic-Proxy-Service"
 	maxRequestBody  = 64 << 20
@@ -97,21 +100,27 @@ type proxy struct {
 }
 
 type proxyRoute struct {
-	upstream string
-	service  Service
-	secret   []byte
-	token    []byte
-	reverse  *httputil.ReverseProxy
-	ctx      context.Context
-	cancel   context.CancelFunc
+	upstream       string
+	service        Service
+	secret         []byte
+	token          []byte
+	caCert         []byte
+	maxRequestBody int64
+	reverse        *httputil.ReverseProxy
+	handler        http.Handler
+	ctx            context.Context
+	cancel         context.CancelFunc
 }
 
 type proxySnapshot struct {
-	service Service
-	secret  []byte
-	token   []byte
-	reverse *httputil.ReverseProxy
-	ctx     context.Context
+	service        Service
+	secret         []byte
+	token          []byte
+	caCert         []byte
+	maxRequestBody int64
+	reverse        *httputil.ReverseProxy
+	handler        http.Handler
+	ctx            context.Context
 }
 
 // RouteConfig binds one fixed host service to credentials and an unguessable
@@ -120,6 +129,12 @@ type RouteConfig struct {
 	Service Service
 	Secret  []byte
 	Token   string
+	Handler http.Handler
+	// CACert is public trust material; its signing key must remain host-side.
+	CACert []byte
+	// MaxRequestBody overrides the conservative service default for a trusted
+	// streaming handler. Zero selects maxRequestBody.
+	MaxRequestBody int64
 }
 
 // TokenHeader carries the per-VM bearer sent by the guest proxy helper. It is
@@ -159,7 +174,8 @@ func (m *Manager) StartUnixRoutes(ctx context.Context, sandbox string, routes ma
 		return "", err
 	}
 	preparedRoutes := make(map[string]*proxyRoute, len(routes))
-	for name, route := range routes {
+	for name := range routes {
+		route := routes[name]
 		upstream, err := parseUpstream(route.Service.Upstream)
 		if err != nil {
 			clearPreparedRoutes(preparedRoutes)
@@ -173,7 +189,8 @@ func (m *Manager) StartUnixRoutes(ctx context.Context, sandbox string, routes ma
 		}
 		routeCtx, cancel := context.WithCancel(context.Background())
 		preparedRoutes[name] = &proxyRoute{upstream: upstream.String(), service: route.Service,
-			secret: append([]byte(nil), route.Secret...), token: []byte(route.Token), reverse: reverse, ctx: routeCtx, cancel: cancel}
+			secret: append([]byte(nil), route.Secret...), token: []byte(route.Token), caCert: append([]byte(nil), route.CACert...), maxRequestBody: route.MaxRequestBody, reverse: reverse,
+			handler: route.Handler, ctx: routeCtx, cancel: cancel}
 	}
 	key := sandbox + "/" + firstRouteName(preparedRoutes)
 	m.mu.Lock()
@@ -223,12 +240,45 @@ func enforceResponseLimit(response *http.Response) error {
 
 func proxyHandler(p *proxy) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == strings.TrimSuffix(caPath, "/") || strings.HasPrefix(r.URL.Path, caPath) {
+			serveProxyCA(w, r, p)
+			return
+		}
 		if r.URL.Path == tokenPath || strings.HasPrefix(r.URL.Path, tokenPathPrefix) {
 			serveProxyToken(w, r, p)
 			return
 		}
 		serveProxyRequest(w, r, p)
 	})
+}
+
+func serveProxyCA(w http.ResponseWriter, r *http.Request, p *proxy) {
+	if r.Method != http.MethodGet || r.URL.RawQuery != "" || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		http.Error(w, "invalid proxy CA request", http.StatusBadRequest)
+		return
+	}
+	service := strings.TrimPrefix(r.URL.Path, caPath)
+	if service == r.URL.Path || service == "" {
+		service = p.onlyRoute()
+	}
+	if !validRouteName(service) {
+		http.Error(w, "proxy CA unavailable", http.StatusNotFound)
+		return
+	}
+	snapshot, ok := p.snapshot(service)
+	defer clear(snapshot.token)
+	if !ok || !validProxyToken(r.Header.Get(TokenHeader), snapshot.token) {
+		http.Error(w, "proxy CA unavailable", http.StatusForbidden)
+		return
+	}
+	if len(snapshot.caCert) == 0 {
+		http.Error(w, "proxy CA unavailable", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(snapshot.caCert)
 }
 
 func serveProxyToken(w http.ResponseWriter, r *http.Request, p *proxy) {
@@ -277,15 +327,24 @@ func serveProxyRequest(w http.ResponseWriter, r *http.Request, p *proxy) {
 			return
 		}
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	limit := snapshot.maxRequestBody
+	if limit == 0 {
+		limit = maxRequestBody
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	r.Header.Del(TokenHeader)
 	r.Header.Del(ServiceHeader)
+	r.Header.Del("Proxy-Authorization")
 	r.Header.Del("Authorization")
 	r.Header.Del("X-Api-Key")
 	if snapshot.service.Header != "" {
 		r.Header.Set(snapshot.service.Header, snapshot.service.Prefix+string(snapshot.secret))
 	}
 	r.Header.Set("X-Rheic-Secret-Proxy", service)
+	if snapshot.handler != nil {
+		snapshot.handler.ServeHTTP(w, r)
+		return
+	}
 	snapshot.reverse.ServeHTTP(w, r)
 }
 
@@ -313,7 +372,7 @@ func (p *proxy) snapshot(name string) (proxySnapshot, bool) {
 		return proxySnapshot{}, false
 	}
 	return proxySnapshot{service: route.service, secret: append([]byte(nil), route.secret...),
-		token: append([]byte(nil), route.token...), reverse: route.reverse, ctx: route.ctx}, true
+		token: append([]byte(nil), route.token...), caCert: append([]byte(nil), route.caCert...), maxRequestBody: route.maxRequestBody, reverse: route.reverse, handler: route.handler, ctx: route.ctx}, true
 }
 
 func (p *proxy) tokenSnapshot(name string) ([]byte, bool) {
@@ -344,10 +403,14 @@ func (p *proxy) updateRoutes(socketPath string, routes map[string]*proxyRoute) (
 		current := p.routes[name]
 		clear(current.secret)
 		clear(current.token)
+		clear(current.caCert)
 		current.service = next.service
+		current.handler = next.handler
+		current.maxRequestBody = next.maxRequestBody
 		current.secret = next.secret
 		current.token = next.token
-		next.secret, next.token = nil, nil
+		current.caCert = next.caCert
+		next.secret, next.token, next.caCert = nil, nil, nil
 	}
 	return p.url, nil
 }
@@ -367,7 +430,8 @@ func (p *proxy) clearRoute(service string) {
 		route.cancel()
 		clear(route.secret)
 		clear(route.token)
-		route.secret, route.token = nil, nil
+		clear(route.caCert)
+		route.secret, route.token, route.caCert = nil, nil, nil
 		route.service.Authorize = nil
 		delete(p.routes, service)
 	}
@@ -380,7 +444,8 @@ func (p *proxy) clearCredentials() {
 		route.cancel()
 		clear(route.secret)
 		clear(route.token)
-		route.secret, route.token = nil, nil
+		clear(route.caCert)
+		route.secret, route.token, route.caCert = nil, nil, nil
 		route.service.Authorize = nil
 	}
 	p.routes = make(map[string]*proxyRoute)
@@ -407,11 +472,12 @@ func validateRouteConfigs(ctx context.Context, sandbox string, routes map[string
 	if sandbox == "" || len(routes) == 0 || len(routes) > 32 {
 		return errors.New("sandbox and one to 32 service routes are required")
 	}
-	for name, route := range routes {
-		if !validRouteName(name) || route.Secret == nil {
+	for name := range routes {
+		route := routes[name]
+		if !validRouteConfig(name, route) {
 			return errors.New("invalid proxy service route")
 		}
-		if err := validUnixStart(ctx, sandbox, name, route.Secret, socketPath, route.Token); err != nil {
+		if err := validUnixStart(ctx, sandbox, name, route.Secret, socketPath, route.Token, route.Handler != nil); err != nil {
 			return err
 		}
 		if _, err := parseUpstream(route.Service.Upstream); err != nil {
@@ -419,6 +485,19 @@ func validateRouteConfigs(ctx context.Context, sandbox string, routes map[string
 		}
 	}
 	return nil
+}
+
+func validRouteConfig(name string, route RouteConfig) bool {
+	if !validRouteName(name) || (route.Secret == nil && route.Handler == nil) || len(route.CACert) > 16<<10 {
+		return false
+	}
+	if len(route.CACert) != 0 && route.Handler == nil {
+		return false
+	}
+	if route.MaxRequestBody < 0 || route.MaxRequestBody > 16<<30 {
+		return false
+	}
+	return route.MaxRequestBody <= maxRequestBody || route.Handler != nil
 }
 
 func validRouteName(name string) bool {
@@ -553,66 +632,25 @@ func dialPublicUnicast(
 		return nil, errors.New("proxy upstream DNS resolution failed")
 	}
 	for _, answer := range ips {
-		if !isPublicUnicast(answer.IP) {
+		ip, ok := netip.AddrFromSlice(answer.IP)
+		if !ok || !daemonnetwork.IsPublicUnicast(ip) {
 			return nil, errors.New("proxy upstream resolved to a non-public address")
 		}
 	}
 	return dial(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
 }
 
-var (
-	publicIPv6Unicast = netip.MustParsePrefix("2000::/3")
-	nonPublicPrefixes = [...]netip.Prefix{
-		netip.MustParsePrefix("0.0.0.0/8"),
-		netip.MustParsePrefix("100.64.0.0/10"),
-		netip.MustParsePrefix("192.0.0.0/24"),
-		netip.MustParsePrefix("192.0.2.0/24"),
-		netip.MustParsePrefix("192.88.99.0/24"),
-		netip.MustParsePrefix("198.18.0.0/15"),
-		netip.MustParsePrefix("198.51.100.0/24"),
-		netip.MustParsePrefix("203.0.113.0/24"),
-		netip.MustParsePrefix("224.0.0.0/4"),
-		netip.MustParsePrefix("240.0.0.0/4"),
-		netip.MustParsePrefix("64:ff9b::/96"),
-		netip.MustParsePrefix("64:ff9b:1::/48"),
-		netip.MustParsePrefix("100::/64"),
-		netip.MustParsePrefix("2001::/23"),
-		netip.MustParsePrefix("2001:db8::/32"),
-		netip.MustParsePrefix("2002::/16"),
-		netip.MustParsePrefix("3fff::/20"),
-	}
-)
-
 func isPublicUnicast(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
 	address, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return false
-	}
-	address = address.Unmap()
-	if !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() ||
-		address.IsLinkLocalUnicast() || address.IsMulticast() || address.IsUnspecified() {
-		return false
-	}
-	if address.Is6() && !publicIPv6Unicast.Contains(address) {
-		return false
-	}
-	for _, prefix := range &nonPublicPrefixes {
-		if prefix.Contains(address) {
-			return false
-		}
-	}
-	return true
+	return ok && daemonnetwork.IsPublicUnicast(address)
 }
 
-func validUnixStart(ctx context.Context, sandbox, service string, secret []byte, socketPath, token string) error {
+func validUnixStart(ctx context.Context, sandbox, service string, secret []byte, socketPath, token string, allowEmptySecret bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if sandbox == "" || service == "" || len(secret) == 0 || socketPath == "" || len(token) != 64 {
-		return errors.New("sandbox, service, secret, socket path and a 32-byte hex token are required")
+	if sandbox == "" || service == "" || (len(secret) == 0 && !allowEmptySecret) || socketPath == "" || len(token) != 64 {
+		return errors.New("sandbox, service, socket path and a 32-byte hex token are required")
 	}
 	decoded := make([]byte, hex.DecodedLen(len(token)))
 	if _, err := hex.Decode(decoded, []byte(token)); err != nil {

@@ -426,6 +426,43 @@ func TestUnixProxyRevokeCancelsOnlyRevokedRoute(t *testing.T) {
 	}
 }
 
+func TestUnixProxyCustomHandlerDoesNotRequireSecretBytes(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "kqproxy-custom-handler")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "proxy.sock")
+	manager := New()
+	_, err = manager.StartUnixRoutes(context.Background(), "custom-handler", map[string]RouteConfig{
+		"docker-hub": {
+			Service: Service{Upstream: "https://registry-1.docker.io"},
+			Token:   strings.Repeat("c", 64),
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+		},
+	}, socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	}}}
+	request, err := http.NewRequest(http.MethodGet, "http://broker/v2/", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(TokenHeader, strings.Repeat("c", 64))
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("custom handler status = %d", response.StatusCode)
+	}
+}
+
 func TestUnixProxyBrokerProcessDeathCancelsAndRecovers(t *testing.T) {
 	const (
 		childFlag = "RHEIC_P04_BROKER_CHILD"

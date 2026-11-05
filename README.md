@@ -70,8 +70,15 @@ exec/PTY still remain unsupported.
 `RegistryCredentialService` stores registry login entries in macOS Keychain,
 Windows Credential Manager, or Linux Secret Service. It fails closed when the
 native vault is unavailable and has no plaintext fallback. Credential scopes
-are persisted separately. Authentication verification and use by guest image
-pulls are not wired yet.
+are persisted separately. Saving a credential does not verify it with the
+registry. A scoped host broker routes private Docker Hub pulls and pushes from
+guest Docker through a per-sandbox TLS forward proxy; host-only entries are
+excluded. The guest receives only a synthetic, repository/action-scoped token.
+The real registry token is acquired by the host for each request and is never
+forwarded to the guest. Upload cancellation is allowed only for a session
+created through that proxy; manifest/blob deletion and cross-host upload
+locations are denied. Other registries and live VM pull/push acceptance remain
+unsupported or unverified.
 
 `SecretService` stores service API keys (`openai`, `anthropic`, `github`, ...)
 in the host vault, scoped globally or to one sandbox. Values are held in memory

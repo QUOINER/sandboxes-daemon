@@ -1,11 +1,16 @@
 package registrycredentials
 
 import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -15,6 +20,139 @@ import (
 
 	"github.com/rheic/sandboxes-gateway/registryauth"
 )
+
+type pullRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f pullRoundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type pullRedirectFactory struct{ redirect http.RoundTripper }
+
+func (pullRedirectFactory) Registry(context.Context, string) (http.RoundTripper, error) {
+	return nil, errors.New("unused")
+}
+
+func TestForwardProxyConnectTerminatesTLSForBoundHostOnly(t *testing.T) {
+	authority, err := generateProxyAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := &PullProxy{authority: "registry-1.docker.io", tlsAuthority: authority, tunnelSlots: make(chan struct{}, 8)}
+	server := httptest.NewServer(proxy)
+	defer server.Close()
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(authority.Certificate()) {
+		t.Fatal("failed to load test proxy CA")
+	}
+
+	connect := func(serverName string) (net.Conn, error) {
+		conn, err := net.Dial("tcp", server.Listener.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		if _, err := fmt.Fprintf(conn, "CONNECT registry-1.docker.io:443 HTTP/1.1\r\nHost: registry-1.docker.io:443\r\n\r\n"); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		if response.StatusCode != http.StatusOK {
+			_ = conn.Close()
+			return nil, fmt.Errorf("CONNECT status %d", response.StatusCode)
+		}
+		tlsConn := tls.Client(conn, &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: serverName})
+		if err := tlsConn.Handshake(); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+
+	conn, err := connect("registry-1.docker.io")
+	if err != nil {
+		t.Fatalf("trusted CONNECT failed: %v", err)
+	}
+	if _, err := fmt.Fprint(conn, "GET /v2/ HTTP/1.1\r\nHost: registry-1.docker.io\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	_ = conn.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("registry probe status=%d body=%q headers=%v", response.StatusCode, body, response.Header)
+	}
+
+	mismatchedHost, err := connect("registry-1.docker.io")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprint(mismatchedHost, "GET /token?service=registry.docker.io&scope=repository:team/image:pull HTTP/1.1\r\nHost: auth.docker.io\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	mismatchResponse, err := http.ReadResponse(bufio.NewReader(mismatchedHost), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = mismatchResponse.Body.Close()
+	_ = mismatchedHost.Close()
+	if mismatchResponse.StatusCode != http.StatusMisdirectedRequest {
+		t.Fatalf("mismatched CONNECT/SNI/Host status=%d", mismatchResponse.StatusCode)
+	}
+
+	wrongSNI, err := connect("auth.docker.io")
+	if err == nil {
+		_ = wrongSNI.Close()
+		t.Fatal("CONNECT target accepted a mismatched TLS SNI")
+	}
+}
+func (pullRedirectFactory) Token(context.Context, registryauth.Realm) (http.RoundTripper, error) {
+	return nil, errors.New("unused")
+}
+func (f pullRedirectFactory) Redirect(_ context.Context, authority string) (http.RoundTripper, error) {
+	if authority != "production.cloudfront.docker.com" {
+		return nil, errors.New("unexpected redirect authority")
+	}
+	return f.redirect, nil
+}
+
+func TestPullProxyRedirectDropsBearerAndRejectsUntrustedAuthority(t *testing.T) {
+	registryRequests, blobRequests := 0, 0
+	registryTransport := pullRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		registryRequests++
+		if got := r.Header.Get("Authorization"); got != "Bearer registry-token" {
+			t.Fatalf("registry authorization = %q", got)
+		}
+		return &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: http.Header{"Location": []string{"https://production.cloudfront.docker.com/blob?sig=synthetic"}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	blobTransport := pullRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		blobRequests++
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("registry bearer crossed origin: %q", got)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Length": []string{"4"}}, Body: io.NopCloser(strings.NewReader("blob")), ContentLength: 4}, nil
+	})
+	p := &PullProxy{authority: "registry-1.docker.io", transportFactory: pullRedirectFactory{redirect: blobTransport}, maxBytes: 8}
+	client := &http.Client{Transport: registryTransport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	endpoint, _ := url.Parse("https://registry-1.docker.io/v2/library/test/blobs/sha256:abcd")
+	resp, err := p.followPullRedirects(context.Background(), client, httptest.NewRequest(http.MethodGet, "http://guest/v2/library/test/blobs/sha256:abcd", http.NoBody), endpoint, "registry-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != "blob" || registryRequests != 1 || blobRequests != 1 {
+		t.Fatalf("redirect result body=%q err=%v registry=%d blob=%d", body, err, registryRequests, blobRequests)
+	}
+	if trustedPullRedirectHost("attacker.example") || trustedPullRedirectHost("production.cloudfront.docker.com:444") {
+		t.Fatal("untrusted pull redirect host accepted")
+	}
+}
 
 func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	tokenRequests, registryRequests := 0, 0
@@ -46,6 +184,32 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 		}
 		if r.URL.Path == "/v2/public/manifests/latest" {
 			_, _ = fmt.Fprint(w, `{"public":true}`)
+			return
+		}
+		if r.URL.Path == "/v2/missing/manifests/latest" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = fmt.Fprint(w, `{"errors":[{"code":"MANIFEST_UNKNOWN"}]}`)
+			return
+		}
+		if r.URL.Path == "/v2/public-gzip/manifests/latest" {
+			if r.Header.Get("Accept-Encoding") != "identity" {
+				t.Errorf("upstream Accept-Encoding = %q, want identity", r.Header.Get("Accept-Encoding"))
+			}
+			var encoded bytes.Buffer
+			compressor := gzip.NewWriter(&encoded)
+			if _, err := compressor.Write([]byte(`{"compressed":true}`)); err != nil {
+				t.Errorf("compress fixture: %v", err)
+				return
+			}
+			if err := compressor.Close(); err != nil {
+				t.Errorf("close compressed fixture: %v", err)
+				return
+			}
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Length", fmt.Sprint(encoded.Len()))
+			_, _ = w.Write(encoded.Bytes())
 			return
 		}
 		if strings.Contains(r.Header.Get("Authorization"), "guest-secret") {
@@ -94,10 +258,38 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := PullProxyConfig{Registry: registryURL.Host, SandboxName: "one", CredentialScope: ScopeSandbox, Service: "registry.fixture", Realms: []registryauth.Realm{realm}, RegistryTransport: registryTransport, TokenTransport: tokenTransport, MaxBytes: 1024}
+	cfg := PullProxyConfig{Registry: registryURL.Host, SandboxName: "one", CredentialScope: ScopeSandbox, Service: "registry.fixture", Realms: []registryauth.Realm{realm}, RegistryTransport: registryTransport, TokenTransport: tokenTransport, Limiter: NewPullLimiter(), MaxBytes: 1024}
 	proxy, err := NewPullProxy(store, cfg)
 	if err != nil {
 		t.Fatal(err)
+	}
+	bodyRequest := httptest.NewRequest(http.MethodGet, "http://guest/v2/demo/manifests/latest", strings.NewReader("synthetic request body"))
+	bodyResponse := httptest.NewRecorder()
+	proxy.ServeHTTP(bodyResponse, bodyRequest)
+	if bodyResponse.Code != http.StatusBadRequest || registryRequests != 0 {
+		t.Fatalf("registry pull body status=%d upstream_requests=%d", bodyResponse.Code, registryRequests)
+	}
+	for range cap(proxy.inflight) {
+		proxy.inflight <- struct{}{}
+	}
+	perSandboxOverload := httptest.NewRecorder()
+	proxy.ServeHTTP(perSandboxOverload, httptest.NewRequest(http.MethodGet, "http://guest/v2/demo/manifests/latest", http.NoBody))
+	if perSandboxOverload.Code != http.StatusServiceUnavailable || perSandboxOverload.Header().Get("Retry-After") != "1" {
+		t.Fatalf("per-sandbox overload status=%d headers=%v", perSandboxOverload.Code, perSandboxOverload.Header())
+	}
+	for range cap(proxy.inflight) {
+		<-proxy.inflight
+	}
+	for range maxQueuedRegistryPulls {
+		proxy.limiter.queued <- struct{}{}
+	}
+	overloaded := httptest.NewRecorder()
+	proxy.ServeHTTP(overloaded, httptest.NewRequest(http.MethodGet, "http://guest/v2/demo/manifests/latest", http.NoBody))
+	if overloaded.Code != http.StatusServiceUnavailable || overloaded.Header().Get("Retry-After") != "1" {
+		t.Fatalf("overloaded registry request status=%d headers=%v", overloaded.Code, overloaded.Header())
+	}
+	for range maxQueuedRegistryPulls {
+		<-proxy.limiter.queued
 	}
 	request := httptest.NewRequest(http.MethodGet, "http://guest/v2/demo/manifests/latest", http.NoBody)
 	request.Header.Set("Authorization", "Bearer guest-secret")
@@ -118,6 +310,25 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	proxy.ServeHTTP(public, httptest.NewRequest(http.MethodGet, "http://guest/v2/public/manifests/latest", http.NoBody))
 	if public.Code != http.StatusOK || public.Body.String() != `{"public":true}` || tokenRequests != 2 {
 		t.Fatal("public pull did not succeed without a token exchange")
+	}
+	missing := httptest.NewRecorder()
+	proxy.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "http://guest/v2/missing/manifests/latest", http.NoBody))
+	if missing.Code != http.StatusNotFound || !strings.Contains(missing.Body.String(), "MANIFEST_UNKNOWN") || tokenRequests != 2 {
+		t.Fatalf("missing manifest response status=%d body=%q tokens=%d", missing.Code, missing.Body.String(), tokenRequests)
+	}
+	compressed := httptest.NewRecorder()
+	proxy.ServeHTTP(compressed, httptest.NewRequest(http.MethodGet, "http://guest/v2/public-gzip/manifests/latest", http.NoBody))
+	if compressed.Code != http.StatusOK || compressed.Header().Get("Content-Encoding") != "gzip" || compressed.Header().Get("Content-Length") == "" {
+		t.Fatalf("compressed manifest metadata was not preserved: status=%d headers=%v", compressed.Code, compressed.Header())
+	}
+	decoder, err := gzip.NewReader(bytes.NewReader(compressed.Body.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := io.ReadAll(decoder)
+	_ = decoder.Close()
+	if err != nil || string(decoded) != `{"compressed":true}` {
+		t.Fatalf("compressed manifest body = %q, error = %v", decoded, err)
 	}
 	probe := httptest.NewRecorder()
 	proxy.ServeHTTP(probe, httptest.NewRequest(http.MethodGet, "http://guest/v2/", http.NoBody))
@@ -200,6 +411,45 @@ func TestPullProxyUsesHostCredentialsAndIsolatesSandboxes(t *testing.T) {
 	}
 }
 
+func TestPullProxyPreservesNotModifiedResponse(t *testing.T) {
+	transport := pullRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("ETag", "\"fixture\"")
+		return &http.Response{StatusCode: http.StatusNotModified, Header: header, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	proxy := &PullProxy{authority: "registry-1.docker.io"}
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	endpoint, _ := url.Parse("https://registry-1.docker.io/v2/library/test/manifests/latest")
+	response, err := proxy.followPullRedirects(context.Background(), client, httptest.NewRequest(http.MethodGet, "http://guest/v2/library/test/manifests/latest", http.NoBody), endpoint, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNotModified || response.Header.Get("ETag") != "\"fixture\"" {
+		t.Fatalf("not-modified response = status %d, ETag %q", response.StatusCode, response.Header.Get("ETag"))
+	}
+}
+
+func TestValidatePullRedirectRejectsUnsafeTargets(t *testing.T) {
+	current, _ := url.Parse("https://registry-1.docker.io/v2/library/test/blobs/sha256:abcd")
+	for _, location := range []string{
+		"",
+		"http://production.cloudfront.docker.com/blob",
+		"https://user@production.cloudfront.docker.com/blob",
+		"https://production.cloudfront.docker.com:444/blob",
+		"https://registry-1.docker.io.attacker.example/blob",
+		"https://attacker.example/blob",
+	} {
+		if _, err := validatePullRedirect(current, location, "registry-1.docker.io"); err == nil {
+			t.Errorf("accepted unsafe redirect target %q", location)
+		}
+	}
+	got, err := validatePullRedirect(current, "https://production.cloudfront.docker.com/blob?sig=synthetic", "registry-1.docker.io")
+	if err != nil || got.Host != "production.cloudfront.docker.com" {
+		t.Fatalf("rejected trusted blob redirect: target=%v err=%v", got, err)
+	}
+}
+
 type countingPullResponseWriter struct {
 	header   http.Header
 	status   int
@@ -262,16 +512,22 @@ func TestPullProxyStreamsLargeResponseWithBoundedWrites(t *testing.T) {
 func TestPullProxyRejectsUnknownOrOversizedLengthBeforeWriting(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
+		status        int
 		contentLength int64
 		maxBytes      int64
 	}{
 		{name: "unknown", contentLength: -1, maxBytes: 1024},
 		{name: "oversized", contentLength: 1025, maxBytes: 1024},
+		{name: "oversized error", status: http.StatusNotFound, contentLength: maxPullErrorResponseBytes + 1, maxBytes: maxPullResponseBytes},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			proxy := &PullProxy{maxBytes: tc.maxBytes}
+			status := tc.status
+			if status == 0 {
+				status = http.StatusOK
+			}
 			response := &http.Response{
-				StatusCode: http.StatusOK, ContentLength: tc.contentLength,
+				StatusCode: status, ContentLength: tc.contentLength,
 				Header: make(http.Header), Body: io.NopCloser(strings.NewReader("synthetic")),
 			}
 			writer := &countingPullResponseWriter{header: make(http.Header)}
