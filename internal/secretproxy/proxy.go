@@ -486,11 +486,7 @@ func validateRouteConfigs(ctx context.Context, sandbox string, routes map[string
 	}
 	for name := range routes {
 		route := routes[name]
-<<<<<<< HEAD
 		if !validRouteConfig(name, route) {
-=======
-		if !validRouteConfig(name, route) {
->>>>>>> 42c22db (feat: add host OpenAI OAuth broker)
 			return errors.New("invalid proxy service route")
 		}
 		if err := validUnixStart(ctx, sandbox, name, route.Secret, socketPath, route.Token, route.Handler != nil || route.Service.Credential != nil); err != nil {
