@@ -1659,6 +1659,9 @@ func normalizeCreateEnv(input map[string]string) ([]string, error) {
 		if !validCreateEnvName(key) {
 			return nil, fmt.Errorf("%w: invalid environment name", core.ErrConflict)
 		}
+		if strings.Contains(value, secretRefPrefix) {
+			return nil, fmt.Errorf("%w: secret environment references expose credentials to guest processes; use a supported host proxy route", core.ErrConflict)
+		}
 		if strings.ContainsRune(value, '\x00') {
 			return nil, fmt.Errorf("%w: environment value contains NUL", core.ErrConflict)
 		}

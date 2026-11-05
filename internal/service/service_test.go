@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -105,14 +106,19 @@ func TestCreateBakesValidatedEnv(t *testing.T) {
 	if got := strings.Join(backend.lastConfig.Env, ","); got != "A=1,B=2" {
 		t.Fatalf("env = %q", got)
 	}
-	for _, env := range []map[string]string{
+	created := backend.created
+	for i, env := range []map[string]string{
 		{"BAD-NAME": "x"},
 		{"A": "x\x00y"},
 		{strings.Repeat("K", 256): "x"},
+		{"OPENAI_API_KEY": "${secret:openai}"},
 	} {
-		if _, err := svc.Create(ctx, CreateRequest{Name: "env-bad", Env: env}); err == nil {
+		if _, err := svc.Create(ctx, CreateRequest{Name: fmt.Sprintf("env-bad-%d", i), Env: env}); err == nil {
 			t.Fatalf("invalid env accepted: %v", env)
 		}
+	}
+	if backend.created != created {
+		t.Fatalf("invalid env reached runtime: created=%d want %d", backend.created, created)
 	}
 }
 
@@ -1806,7 +1812,7 @@ func TestServiceSecretNeverPersistsValue(t *testing.T) {
 	}
 }
 
-func TestResolveSecretEnvFailsClosedAndScopes(t *testing.T) {
+func TestResolveSecretEnvRejectsGuestVisibleReferences(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -1814,23 +1820,21 @@ func TestResolveSecretEnvFailsClosedAndScopes(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 	svc := New(st, nil)
-	secretStore, err := servicesecrets.NewStore(&fakeServiceSecretVault{items: make(map[string]string)})
-	if err != nil {
-		t.Fatal(err)
+	for _, entry := range []string{
+		"OPENAI_API_KEY=${secret:openai}",
+		"VALUE=prefix-${secret:openai}-suffix",
+	} {
+		env, err := svc.resolveSecretEnv(ctx, sandbox.Sandbox{Name: "dev"}, []string{entry, "PLAIN=value"})
+		if !errors.Is(err, core.ErrConflict) || len(env) != 0 {
+			t.Fatalf("secret reference was not rejected before exec: env=%q err=%v", env, err)
+		}
+		if strings.Contains(err.Error(), "synthetic-secret") {
+			t.Fatalf("error leaked a secret value: %v", err)
+		}
 	}
-	svc.SetServiceSecretStore(secretStore)
-	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("global-value")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeSandbox, "dev", []byte("sandbox-value")); err != nil {
-		t.Fatal(err)
-	}
-	env, err := svc.resolveSecretEnv(ctx, sandbox.Sandbox{Name: "dev"}, []string{"OPENAI_API_KEY=${secret:openai}", "PLAIN=value"})
-	if err != nil || len(env) != 2 || env[0] != "OPENAI_API_KEY=sandbox-value" || env[1] != "PLAIN=value" {
-		t.Fatalf("env=%q err=%v", env, err)
-	}
-	if _, err := svc.resolveSecretEnv(ctx, sandbox.Sandbox{Name: "other"}, []string{"KEY=${secret:missing}"}); err == nil {
-		t.Fatal("missing secret did not fail closed")
+	env, err := svc.resolveSecretEnv(ctx, sandbox.Sandbox{Name: "dev"}, []string{"PLAIN=value"})
+	if err != nil || len(env) != 1 || env[0] != "PLAIN=value" {
+		t.Fatalf("ordinary environment variable rejected: env=%q err=%v", env, err)
 	}
 }
 

@@ -84,9 +84,12 @@ unsupported or unverified.
 in the host vault, scoped globally or to one sandbox. Values are held in memory
 only for the RPC and are never returned by `List`. A non-secret SQLite index
 supports listing and sandbox-scoped cleanup; the value itself never enters the
-database, logs, argv or sandbox snapshots. At exec time a whole-value
-`${secret:service}` environment reference is resolved from the host vault and
-passed only to that process; sandbox scope wins over global. The
+database, logs, argv or sandbox snapshots. Guest-visible
+`${secret:service}` references are rejected: environment values are readable
+by guest processes and do not preserve the host credential boundary. Use a
+supported host proxy reference instead. Existing scripts using
+`${secret:service}` must migrate before upgrading; the daemon fails closed and
+does not pass the reference or credential to the guest. The
 `${proxy:service}` Create/Start/exec path is implemented on the current feature
 branches and remains **unreleased and pending verification**. It requires
 `--proxy-helper` and a supported provider credential variable; the guest image
