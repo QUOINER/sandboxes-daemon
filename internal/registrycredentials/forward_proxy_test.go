@@ -143,6 +143,59 @@ func TestUploadSessionBindsExactIssuedLocation(t *testing.T) {
 	}
 }
 
+func TestBlobRedirectRequiresExactRegistryIssuedURL(t *testing.T) {
+	proxy := &PullProxy{}
+	issued, err := url.Parse("https://production.cloudfront.docker.com/v2/blobs/sha256:abc?sig=synthetic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proxy.recordBlobRedirect(issued); err != nil {
+		t.Fatal(err)
+	}
+	allowed := *issued
+	if !proxy.consumeBlobRedirect(&allowed) {
+		t.Fatal("registry-issued blob URL was denied")
+	}
+	for _, mutate := range []func(*url.URL){
+		func(candidate *url.URL) { candidate.Path = "/arbitrary/object" },
+		func(candidate *url.URL) { candidate.RawQuery = "sig=attacker" },
+		func(candidate *url.URL) { candidate.Host = "attacker.example" },
+	} {
+		candidate := *issued
+		mutate(&candidate)
+		if proxy.consumeBlobRedirect(&candidate) {
+			t.Errorf("accepted an unissued redirect URL: %v", candidate)
+		}
+	}
+	for use := 1; use < blobRedirectUses; use++ {
+		if !proxy.consumeBlobRedirect(issued) {
+			t.Fatalf("registry-issued URL denied on use %d", use+1)
+		}
+	}
+	if proxy.consumeBlobRedirect(issued) {
+		t.Fatal("accepted a redirect URL beyond its bounded use count")
+	}
+}
+
+func TestBlobRedirectRejectsExpiredAndUntrustedSessions(t *testing.T) {
+	proxy := &PullProxy{blobRedirects: make(map[string]blobRedirectSession)}
+	expired, err := url.Parse("https://production.cloudfront.docker.com/blob?sig=expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy.blobRedirects[expired.String()] = blobRedirectSession{usesLeft: 1, expiresAt: time.Now().Add(-time.Second)}
+	if proxy.consumeBlobRedirect(expired) {
+		t.Fatal("accepted an expired registry redirect")
+	}
+	untrusted, err := url.Parse("https://attacker.example/blob?sig=synthetic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proxy.recordBlobRedirect(untrusted); err == nil {
+		t.Fatal("recorded a redirect to an untrusted host")
+	}
+}
+
 func TestProxyAuthorityPersistsAndMintsHostBoundLeaf(t *testing.T) {
 	vault := &fakeVault{}
 	store, err := NewStore(vault)

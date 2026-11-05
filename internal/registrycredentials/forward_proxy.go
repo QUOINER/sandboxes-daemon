@@ -20,13 +20,16 @@ import (
 )
 
 const (
-	dockerHubAuthAuthority = "auth.docker.io"
-	dockerHubBlobAuthority = "production.cloudfront.docker.com"
-	maxForwardTokens       = 256
-	maxUploadSessions      = 1024
-	maxRegistryRequestBody = int64(16 << 30)
-	maxRegistryErrorBody   = int64(64 << 10)
-	registryManifestsPath  = "manifests"
+	dockerHubAuthAuthority  = "auth.docker.io"
+	dockerHubBlobAuthority  = "production.cloudfront.docker.com"
+	maxForwardTokens        = 256
+	maxUploadSessions       = 1024
+	maxBlobRedirectSessions = 1024
+	blobRedirectUses        = 16
+	blobRedirectLifetime    = 15 * time.Minute
+	maxRegistryRequestBody  = int64(16 << 30)
+	maxRegistryErrorBody    = int64(64 << 10)
+	registryManifestsPath   = "manifests"
 )
 
 type registryOperation struct {
@@ -630,10 +633,18 @@ func (p *PullProxy) finishRegistryRedirect(w http.ResponseWriter, method string,
 		http.Error(w, "registry write redirect is unsupported", http.StatusBadGateway)
 		return
 	}
-	if _, err := validatePullRedirect(endpoint, response.Header.Get("Location"), p.authority); err != nil {
+	redirect, err := validatePullRedirect(endpoint, response.Header.Get("Location"), p.authority)
+	if err != nil {
 		_ = response.Body.Close()
 		http.Error(w, "registry redirect is untrusted", http.StatusBadGateway)
 		return
+	}
+	if !strings.EqualFold(redirect.Host, p.authority) {
+		if err := p.recordBlobRedirect(redirect); err != nil {
+			_ = response.Body.Close()
+			http.Error(w, "registry redirect capacity reached", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	copyForwardHeaders(w.Header(), response.Header, true)
 	w.WriteHeader(response.StatusCode)
@@ -794,8 +805,13 @@ func (p *PullProxy) serveBlobRedirectRequest(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "blob redirect method is unsupported", http.StatusForbidden)
 		return
 	}
-	if r.URL == nil || r.URL.Path == "" || r.URL.Opaque != "" || r.URL.Fragment != "" {
+	if r.URL == nil || r.URL.Path == "" || r.URL.Opaque != "" || r.URL.Fragment != "" || r.URL.User != nil {
 		http.Error(w, "invalid blob redirect URL", http.StatusBadRequest)
+		return
+	}
+	endpoint := &url.URL{Scheme: registryHTTPScheme, Host: host, Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery}
+	if !p.consumeBlobRedirect(endpoint) {
+		http.Error(w, "blob redirect was not authorized by the registry", http.StatusForbidden)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
@@ -815,6 +831,50 @@ func (p *PullProxy) serveBlobRedirectRequest(w http.ResponseWriter, r *http.Requ
 	}
 	defer func() { _ = response.Body.Close() }()
 	p.writeBlobRedirect(w, r.Method, response)
+}
+
+func (p *PullProxy) recordBlobRedirect(endpoint *url.URL) error {
+	if endpoint == nil || !strings.EqualFold(endpoint.Scheme, registryHTTPScheme) || !trustedPullRedirectHost(endpoint.Host) || endpoint.User != nil || endpoint.Fragment != "" {
+		return errors.New("invalid blob redirect session")
+	}
+	key := endpoint.String()
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	if p.blobRedirects == nil {
+		p.blobRedirects = make(map[string]blobRedirectSession)
+	}
+	now := time.Now()
+	for current, session := range p.blobRedirects {
+		if !session.expiresAt.After(now) || session.usesLeft <= 0 {
+			delete(p.blobRedirects, current)
+		}
+	}
+	if _, exists := p.blobRedirects[key]; !exists && len(p.blobRedirects) >= maxBlobRedirectSessions {
+		return errors.New("blob redirect session cache is full")
+	}
+	p.blobRedirects[key] = blobRedirectSession{usesLeft: blobRedirectUses, expiresAt: now.Add(blobRedirectLifetime)}
+	return nil
+}
+
+func (p *PullProxy) consumeBlobRedirect(endpoint *url.URL) bool {
+	if endpoint == nil || !strings.EqualFold(endpoint.Scheme, registryHTTPScheme) || !strings.EqualFold(endpoint.Host, dockerHubBlobAuthority) {
+		return false
+	}
+	key := endpoint.String()
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	session, ok := p.blobRedirects[key]
+	if !ok || !session.expiresAt.After(time.Now()) || session.usesLeft <= 0 {
+		delete(p.blobRedirects, key)
+		return false
+	}
+	session.usesLeft--
+	if session.usesLeft == 0 {
+		delete(p.blobRedirects, key)
+	} else {
+		p.blobRedirects[key] = session
+	}
+	return true
 }
 
 func (p *PullProxy) fetchBlobRedirect(ctx context.Context, r *http.Request, host string) (*http.Response, error) {
