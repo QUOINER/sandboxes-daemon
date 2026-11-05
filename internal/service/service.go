@@ -486,7 +486,7 @@ var ErrOAuthProviderUnavailable = errors.New("OAuth provider is not configured")
 var ErrOAuthCredentialConflict = oauthsession.ErrCredentialConflict
 var ErrOAuthPartialLogin = oauthsession.ErrOAuthPartialLogin
 var ErrDockerHubCredentialRejected = oauthsession.ErrDockerHubCredentialRejected
-var ErrOAuthRevocationFailed = errors.New("OAuth credentials were removed locally but provider revocation failed")
+var ErrOAuthRevocationFailed = errors.New("OAuth provider revocation failed")
 var ErrOAuthRevocationUnavailable = errors.New("OAuth credentials were removed locally but provider revocation is not configured")
 
 // SetRegistryCredentialStore configures host-keychain storage for registry logins.

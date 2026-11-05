@@ -134,14 +134,18 @@ func TestDeviceAccountLoginStoresAndLogoutRevokesHostTokens(t *testing.T) {
 	}
 	clear(unchanged.Password)
 	revokeFail.Store(true)
-	if removed, err := svc.LogoutAccount(ctx, "docker"); !removed || !errors.Is(err, ErrOAuthRevocationFailed) {
+	removed, err := svc.LogoutAccount(ctx, "docker")
+	if !removed || !errors.Is(err, ErrOAuthRevocationFailed) {
 		t.Fatalf("failed provider revoke should retain retryable state: removed=%t err=%v", removed, err)
+	}
+	if strings.Contains(err.Error(), "removed locally") {
+		t.Fatalf("failed provider revoke reported credentials removed: %v", err)
 	}
 	if _, _, err := sink.Load(ctx); err != nil {
 		t.Fatalf("refresh token was removed before successful provider revoke: %v", err)
 	}
 	revokeFail.Store(false)
-	removed, err := svc.LogoutAccount(ctx, "docker")
+	removed, err = svc.LogoutAccount(ctx, "docker")
 	if err != nil || !removed || revokeCalls.Load() != 2 {
 		t.Fatalf("logout removed=%t revoke calls=%d err=%v", removed, revokeCalls.Load(), err)
 	}
