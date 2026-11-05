@@ -859,11 +859,11 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	if err != nil {
 		return operation.Operation{}, err
 	}
-	env, proxyServiceName, err := stripProxyCreateEnv(env)
+	env, proxyServiceNames, err := stripProxyCreateEnv(env)
 	if err != nil {
 		return operation.Operation{}, err
 	}
-	if proxyServiceName != "" && s.backend == nil {
+	if len(proxyServiceNames) != 0 && s.backend == nil {
 		return operation.Operation{}, fmt.Errorf("%w: service proxy requires a VM runtime", core.ErrConflict)
 	}
 	workspace, workspaces, err := normalizeCreateWorkspaces(req)
@@ -877,7 +877,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	intent := createIntent{
 		name: name, image: image, workspace: workspace, workspaces: workspaces, ports: ports,
 		allow: allow, deny: deny, agent: req.Agent, detached: req.Detached, cpus: cpus, memoryMiB: memoryMiB,
-		proxyService: proxyServiceName,
+		proxyService: encodeProxyServices(proxyServiceNames),
 	}
 	if existing, found, err := s.replayCreateIfRequested(ctx, req.IdempotencyKey, intent); err != nil {
 		return operation.Operation{}, err
@@ -893,7 +893,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		return operation.Operation{}, err
 	}
 	cleanupProxy := func() error {
-		if proxyServiceName == "" {
+		if len(proxyServiceNames) == 0 {
 			return nil
 		}
 		return s.stopProxyChannel(name, sbID, true)
@@ -920,8 +920,8 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	state := sandbox.Stopped
 	var handle runtime.Handle
 	var proxyConfig proxyRuntimeConfig
-	if proxyServiceName != "" {
-		proxyConfig, err = s.proxyChannelConfig(ctx, sandbox.Sandbox{ID: sbID, Name: name}, proxyServiceName)
+	if len(proxyServiceNames) != 0 {
+		proxyConfig, err = s.proxyChannelConfig(ctx, sandbox.Sandbox{ID: sbID, Name: name}, proxyServiceNames)
 		if err != nil {
 			return operation.Operation{}, err
 		}
@@ -947,7 +947,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 			ProxyPort:    proxyConfig.port,
 			ProxySocket:  proxyConfig.socketPath,
 		}
-		handle, err = s.createRuntimeSandbox(ctx, &runtimeConfig, proxyServiceName, proxyConfig)
+		handle, err = s.createRuntimeSandbox(ctx, &runtimeConfig, proxyServiceNames, proxyConfig)
 		if err != nil {
 			return operation.Operation{}, errors.Join(err, cleanupProxy())
 		}
@@ -960,8 +960,8 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	if err := s.setDockerProfile(ctx, sbID, req.Privileged); err != nil {
 		return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), cleanupProxy())
 	}
-	if proxyServiceName != "" {
-		if err := s.store.SetSetting(ctx, proxyServiceSettingKey(sbID), proxyServiceName); err != nil {
+	if len(proxyServiceNames) != 0 {
+		if err := s.store.SetSetting(ctx, proxyServiceSettingKey(sbID), encodeProxyServices(proxyServiceNames)); err != nil {
 			return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), s.stopProxyChannel(name, sbID, true))
 		}
 	}
@@ -976,7 +976,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		UpdatedAt:      now,
 	}
 	if err := s.store.CreateSandboxWithOperation(ctx, sb, op); err != nil {
-		if proxyServiceName != "" {
+		if len(proxyServiceNames) != 0 {
 			_ = s.store.DeleteSetting(ctx, proxyServiceSettingKey(sbID))
 		}
 		return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), cleanupProxy())
@@ -984,15 +984,26 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	return op, nil
 }
 
-func (s *Service) createRuntimeSandbox(ctx context.Context, cfg *runtime.Config, proxyService string, proxyConfig proxyRuntimeConfig) (runtime.Handle, error) {
-	if proxyService == "" {
+func (s *Service) createRuntimeSandbox(ctx context.Context, cfg *runtime.Config, proxyServices []string, proxyConfig proxyRuntimeConfig) (runtime.Handle, error) {
+	if len(proxyServices) == 0 {
 		return s.backend.Create(ctx, *cfg)
+	}
+	if len(proxyConfig.routes) > 1 {
+		proxyBackend, ok := s.backend.(proxyRoutesRuntime)
+		if !ok {
+			return runtime.Handle{}, fmt.Errorf("%w: runtime backend does not support multiple service proxy routes", core.ErrConflict)
+		}
+		return proxyBackend.CreateWithProxyRouteArgs(ctx, cfg, proxyConfig.helperPath, proxyConfig.routes)
 	}
 	proxyBackend, ok := s.backend.(proxyRuntime)
 	if !ok {
 		return runtime.Handle{}, fmt.Errorf("%w: runtime backend does not support the service proxy helper", core.ErrConflict)
 	}
-	return proxyBackend.CreateWithProxy(ctx, cfg, proxyConfig.helperPath, proxyConfig.guestPort, proxyConfig.serviceHost)
+	contract, ok := proxyContract(proxyServices[0])
+	if !ok {
+		return runtime.Handle{}, fmt.Errorf("%w: unsupported service proxy route", core.ErrConflict)
+	}
+	return proxyBackend.CreateWithProxy(ctx, cfg, proxyConfig.helperPath, contract.guestPort, contract.upstreamHost)
 }
 
 func (s *Service) replayCreateIfRequested(ctx context.Context, key string, intent createIntent) (operation.Operation, bool, error) {

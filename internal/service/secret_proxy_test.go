@@ -20,37 +20,42 @@ import (
 )
 
 func TestStripProxyCreateEnv(t *testing.T) {
-	filtered, serviceName, err := stripProxyCreateEnv([]string{
+	filtered, serviceNames, err := stripProxyCreateEnv([]string{
 		"PATH=/usr/bin",
 		"OPENAI_API_KEY=${proxy:openai}",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if serviceName != "openai" || len(filtered) != 1 || filtered[0] != "PATH=/usr/bin" {
-		t.Fatalf("filtered=%v service=%q", filtered, serviceName)
+	if len(serviceNames) != 1 || serviceNames[0] != "openai" || len(filtered) != 1 || filtered[0] != "PATH=/usr/bin" {
+		t.Fatalf("filtered=%v services=%q", filtered, serviceNames)
 	}
 	for _, env := range [][]string{
 		{"API_KEY=${proxy:openai}"},
 		{"OPENAI_API_KEY=${proxy:unknown}"},
 		{"OPENAI_API_KEY=${proxy:openai", "PATH=/bin"},
-		{"OPENAI_API_KEY=${proxy:openai}", "ANTHROPIC_API_KEY=${proxy:anthropic}"},
 		{"OPENAI_API_KEY=${proxy:openai}", "OPENAI_BASE_URL=https://attacker.invalid"},
 	} {
 		if _, _, err := stripProxyCreateEnv(env); err == nil {
 			t.Errorf("accepted invalid proxy create env %v", env)
 		}
 	}
+	filtered, serviceNames, err = stripProxyCreateEnv([]string{
+		"OPENAI_API_KEY=${proxy:openai}", "ANTHROPIC_API_KEY=${proxy:anthropic}",
+	})
+	if err != nil || len(filtered) != 0 || strings.Join(serviceNames, ",") != "anthropic,openai" {
+		t.Fatalf("multiple services filtered=%v services=%v err=%v", filtered, serviceNames, err)
+	}
 }
 
 func TestProxyContractsUseProviderAPIBasePaths(t *testing.T) {
 	for service, want := range map[string]string{
 		"openai":     "http://127.0.0.1:3128/v1",
-		"mistral":    "http://127.0.0.1:3128/v1",
-		"groq":       "http://127.0.0.1:3128/openai/v1",
-		"openrouter": "http://127.0.0.1:3128/api/v1",
-		"xai":        "http://127.0.0.1:3128/v1",
-		"anthropic":  "http://127.0.0.1:3128",
+		"mistral":    "http://127.0.0.1:43131/v1",
+		"groq":       "http://127.0.0.1:43130/openai/v1",
+		"openrouter": "http://127.0.0.1:43132/api/v1",
+		"xai":        "http://127.0.0.1:43133/v1",
+		"anthropic":  "http://127.0.0.1:43129",
 	} {
 		contract, ok := proxyContract(service)
 		if !ok || contract.baseURL != want {
@@ -102,7 +107,7 @@ func TestProxyEnvironmentUsesHostBrokerAndSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if backend.lastConfig.ProxyPort != proxySocketPort || backend.lastConfig.ProxySocket == "" ||
-		backend.proxyGuestPort != proxyGuestListenPort || backend.proxyHelperPath != helperPath || backend.proxyServiceHost != "api.openai.com" {
+		backend.proxyGuestPort != 3128 || backend.proxyHelperPath != helperPath || backend.proxyServiceHost != "api.openai.com" {
 		t.Fatalf("runtime proxy config=%+v helper=%q guest_port=%d host=%q", backend.lastConfig, backend.proxyHelperPath, backend.proxyGuestPort, backend.proxyServiceHost)
 	}
 	if strings.Contains(strings.Join(backend.lastConfig.Env, "\n"), "proxy:openai") || strings.Contains(strings.Join(backend.lastConfig.Env, "\n"), "sk-synthetic-proxy-secret") {
@@ -134,6 +139,81 @@ func TestProxyEnvironmentUsesHostBrokerAndSurvivesRestart(t *testing.T) {
 	}
 	if _, err := st.GetSetting(ctx, proxyServiceSettingKey(op.SandboxID)); !errors.Is(err, core.ErrNotFound) {
 		t.Fatalf("proxy mapping remains after delete: %v", err)
+	}
+}
+
+func TestSandboxSupportsMultipleIsolatedServiceSecrets(t *testing.T) {
+	ctx := context.Background()
+	stateDir := t.TempDir()
+	st, err := store.Open(ctx, filepath.Join(stateDir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	backend := &fakeRuntime{}
+	svc := New(st, backend)
+	helperPath := writeStaticProxyHelperFixture(t)
+	secretVault := &fakeServiceSecretVault{items: make(map[string]string)}
+	secretStore, err := servicesecrets.NewStore(secretVault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetServiceSecretStore(secretStore)
+	manager := secretproxy.New()
+	svc.SetSecretProxyManager(manager)
+	svc.SetSecretProxyRuntime(helperPath, "/tmp")
+	t.Cleanup(func() { _ = manager.Close() })
+	for name, value := range map[string]string{"openai": "synthetic-openai-key", "anthropic": "synthetic-anthropic-key"} {
+		if _, err := svc.SetServiceSecret(ctx, name, servicesecrets.ScopeGlobal, "", []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	op, err := svc.Create(ctx, CreateRequest{
+		Name: "multi-proxy-run", Image: "alpine:3.22",
+		Env: map[string]string{
+			"OPENAI_API_KEY":     "${proxy:openai}",
+			"ANTHROPIC_API_KEY":  "${proxy:anthropic}",
+			"SAFE_LITERAL_VALUE": "not-a-secret",
+		},
+	})
+	if goruntime.GOOS == "windows" {
+		if !errors.Is(err, core.ErrConflict) || backend.created != 0 {
+			t.Fatalf("unsupported Windows proxy was not rejected before runtime start: err=%v created=%d", err, backend.created)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(backend.proxyRouteArgs, ",") != "anthropic=api.anthropic.com:43129,openai=api.openai.com:3128" {
+		t.Fatalf("runtime routes=%v", backend.proxyRouteArgs)
+	}
+	if strings.Contains(strings.Join(backend.lastConfig.Env, "\n"), "synthetic-") || len(backend.lastConfig.Env) != 1 || backend.lastConfig.Env[0] != "SAFE_LITERAL_VALUE=not-a-secret" {
+		t.Fatalf("secret refs or values entered runtime env: %v", backend.lastConfig.Env)
+	}
+	if got, err := st.GetSetting(ctx, proxyServiceSettingKey(op.SandboxID)); err != nil || got != "anthropic,openai" {
+		t.Fatalf("persisted proxy services=%q err=%v", got, err)
+	}
+	if _, err := svc.Exec(ctx, op.SandboxID, runtime.ExecRequest{Argv: []string{"/bin/true"}, Env: []string{
+		"OPENAI_API_KEY=${proxy:openai}", "ANTHROPIC_API_KEY=${proxy:anthropic}",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"OPENAI_API_KEY=rheic-proxy-placeholder",
+		"OPENAI_BASE_URL=http://127.0.0.1:3128/v1",
+		"ANTHROPIC_API_KEY=rheic-proxy-placeholder",
+		"ANTHROPIC_BASE_URL=http://127.0.0.1:43129",
+	} {
+		if !containsEnv(backend.lastExec.Env, want) {
+			t.Errorf("exec environment missing %q: %v", want, backend.lastExec.Env)
+		}
+	}
+	if strings.Contains(strings.Join(backend.lastExec.Env, "\n"), "synthetic-") {
+		t.Fatalf("secret value entered exec environment: %v", backend.lastExec.Env)
+	}
+	if _, err := svc.Delete(ctx, op.SandboxID, true); err != nil {
+		t.Fatal(err)
 	}
 }
 

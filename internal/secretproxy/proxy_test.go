@@ -335,6 +335,97 @@ func TestUnixProxyRevokeCancelsInflightRequestAndClosesChannel(t *testing.T) {
 	}
 }
 
+func TestUnixProxyRevokeCancelsOnlyRevokedRoute(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	var startedOnce, canceledOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			startedOnce.Do(func() { close(started) })
+			<-r.Context().Done()
+			canceledOnce.Do(func() { close(canceled) })
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer anthropic-secret" {
+			http.Error(w, "wrong route credential", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	dir, err := os.MkdirTemp("/tmp", "kqproxy-multi-revoke")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "proxy.sock")
+	manager := New()
+	route := func(secret, token string) RouteConfig {
+		return RouteConfig{Service: Service{Upstream: upstream.URL, Header: "Authorization", Prefix: "Bearer ", CredentialScope: "sandbox"},
+			Secret: []byte(secret), Token: token}
+	}
+	routes := map[string]RouteConfig{
+		"openai":    route("openai-secret", strings.Repeat("a", 64)),
+		"anthropic": route("anthropic-secret", strings.Repeat("b", 64)),
+	}
+	if _, err := manager.StartUnixRoutes(context.Background(), "multi-revoke", routes, socket); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = manager.Close() }()
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", socket)
+	}}}
+	request, err := http.NewRequest(http.MethodGet, "http://broker/slow", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(ServiceHeader, "openai")
+	request.Header.Set(TokenHeader, strings.Repeat("a", 64))
+	done := make(chan error, 1)
+	go func() {
+		response, requestErr := client.Do(request)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		done <- requestErr
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("positive control did not reach controlled upstream")
+	}
+	if err := manager.RevokeSecret("openai", "multi-revoke", "sandbox"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("revocation did not cancel the active route request")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("revoked route request did not complete")
+	}
+
+	request, err = http.NewRequest(http.MethodGet, "http://broker/ok", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(ServiceHeader, "anthropic")
+	request.Header.Set(TokenHeader, strings.Repeat("b", 64))
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("unrevoked route stopped with revoked route: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("unrevoked route status = %d, want 204", response.StatusCode)
+	}
+}
+
 func TestUnixProxyBrokerProcessDeathCancelsAndRecovers(t *testing.T) {
 	const (
 		childFlag = "RHEIC_P04_BROKER_CHILD"

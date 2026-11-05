@@ -148,3 +148,144 @@ func TestHelperForwardsWithTokenAndBrokerInjectsSecret(t *testing.T) {
 		t.Fatalf("body=%q auth=%q path=%q", body, gotAuth, gotPath)
 	}
 }
+
+func TestHelperMultiplexesConfiguredServicesWithoutCredentialMixing(t *testing.T) {
+	var gotOpenAI, gotAnthropic string
+	var routeHeaderLeaked bool
+	openAI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotOpenAI = r.Header.Get("Authorization")
+		routeHeaderLeaked = routeHeaderLeaked || r.Header.Get(secretproxy.ServiceHeader) != ""
+		_, _ = io.WriteString(w, "openai")
+	}))
+	defer openAI.Close()
+	anthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAnthropic = r.Header.Get("x-api-key")
+		routeHeaderLeaked = routeHeaderLeaked || r.Header.Get(secretproxy.ServiceHeader) != ""
+		_, _ = io.WriteString(w, "anthropic")
+	}))
+	defer anthropic.Close()
+
+	dir, err := os.MkdirTemp("/tmp", "rheic-multiproxy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "broker.sock")
+	tokenOpenAI := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	tokenAnthropic := "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+	broker := secretproxy.New()
+	t.Cleanup(func() { _ = broker.Close() })
+	routes := map[string]secretproxy.RouteConfig{
+		"openai":    {Service: secretproxy.Service{Upstream: openAI.URL, Header: "Authorization", Prefix: "Bearer ", CredentialScope: "sandbox"}, Secret: []byte("openai-secret"), Token: tokenOpenAI},
+		"anthropic": {Service: secretproxy.Service{Upstream: anthropic.URL, Header: "x-api-key", CredentialScope: "sandbox"}, Secret: []byte("anthropic-secret"), Token: tokenAnthropic},
+	}
+	if _, err := broker.StartUnixRoutes(context.Background(), "dev", routes, socket); err != nil {
+		t.Fatal(err)
+	}
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", socket)
+	}}
+	openAIHelper := httptest.NewServer(newRouteHandler("openai", "api.openai.com", transport))
+	defer openAIHelper.Close()
+	anthropicHelper := httptest.NewServer(newRouteHandler("anthropic", "api.anthropic.com", transport))
+	defer anthropicHelper.Close()
+
+	for _, tc := range []struct {
+		url    string
+		body   string
+		client *http.Client
+	}{
+		{url: openAIHelper.URL + "/v1/models", body: "openai", client: openAIHelper.Client()},
+		{url: anthropicHelper.URL + "/v1/models", body: "anthropic", client: anthropicHelper.Client()},
+	} {
+		response, err := tc.client.Get(tc.url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if readErr != nil || string(body) != tc.body || response.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: status=%d body=%q err=%v", tc.url, response.StatusCode, body, readErr)
+		}
+	}
+	if gotOpenAI != "Bearer openai-secret" || gotAnthropic != "anthropic-secret" {
+		t.Fatalf("service credentials crossed routes: openai=%q anthropic=%q", gotOpenAI, gotAnthropic)
+	}
+	if routeHeaderLeaked {
+		t.Fatal("internal service route metadata reached an upstream provider")
+	}
+	spoof, err := http.NewRequest(http.MethodGet, openAIHelper.URL+"/v1/models", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoof.Header.Set(secretproxy.ServiceHeader, "anthropic")
+	spoofResponse, err := openAIHelper.Client().Do(spoof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spoofBody, readErr := io.ReadAll(spoofResponse.Body)
+	_ = spoofResponse.Body.Close()
+	if readErr != nil || string(spoofBody) != "openai" || gotOpenAI != "Bearer openai-secret" || gotAnthropic != "anthropic-secret" {
+		t.Fatalf("guest route spoof changed destination or credential: body=%q openai=%q anthropic=%q err=%v", spoofBody, gotOpenAI, gotAnthropic, readErr)
+	}
+	broker.RefreshSecret("openai", "dev", "sandbox", []byte("rotated-openai-key"))
+	refreshed, err := openAIHelper.Client().Get(openAIHelper.URL + "/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, refreshed.Body)
+	_ = refreshed.Body.Close()
+	if gotOpenAI != "Bearer rotated-openai-key" {
+		t.Fatalf("OpenAI secret rotation was not isolated: auth=%q", gotOpenAI)
+	}
+	if err := broker.RevokeSecret("openai", "dev", "sandbox"); err != nil {
+		t.Fatal(err)
+	}
+	denied, err := openAIHelper.Client().Get(openAIHelper.URL + "/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = denied.Body.Close()
+	if denied.StatusCode != http.StatusBadGateway || broker.Has("dev", "openai") || !broker.Has("dev", "anthropic") {
+		t.Fatalf("route revoke status=%d openai_active=%t anthropic_active=%t", denied.StatusCode, broker.Has("dev", "openai"), broker.Has("dev", "anthropic"))
+	}
+	stillAllowed, err := anthropicHelper.Client().Get(anthropicHelper.URL + "/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stillAllowed.Body.Close()
+	if stillAllowed.StatusCode != http.StatusOK || gotAnthropic != "anthropic-secret" {
+		t.Fatalf("revoking OpenAI affected Anthropic: status=%d auth=%q", stillAllowed.StatusCode, gotAnthropic)
+	}
+	unknownRequest, err := http.NewRequest(http.MethodGet, "http://broker/__rheic/proxy/token/unknown", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownResponse, err := transport.RoundTrip(unknownRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unknownResponse.Body.Close()
+	if unknownResponse.StatusCode != http.StatusForbidden {
+		t.Fatalf("unknown route token status=%d", unknownResponse.StatusCode)
+	}
+}
+
+func TestParseProxyRoutesRejectsUnsafeConfiguration(t *testing.T) {
+	routes, err := parseProxyRoutes([]string{"openai=api.openai.com:3128", "anthropic=api.anthropic.com:3129"})
+	if err != nil || len(routes) != 2 {
+		t.Fatalf("parseProxyRoutes valid config: routes=%+v err=%v", routes, err)
+	}
+	for _, input := range [][]string{
+		{"openai=api.openai.com:3128", "openai=api.other.com:3129"},
+		{"openai=api.openai.com:80"},
+		{"openai=api.openai.com;touch:3128"},
+		{"openai=api.openai.com:3128:extra"},
+		{"OpenAI=api.openai.com:3128"},
+	} {
+		if _, err := parseProxyRoutes(input); err == nil {
+			t.Fatalf("parseProxyRoutes accepted unsafe config %q", input)
+		}
+	}
+}

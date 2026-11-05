@@ -208,6 +208,7 @@ type fakeRuntime struct {
 	proxyHelperPath  string
 	proxyGuestPort   uint16
 	proxyServiceHost string
+	proxyRouteArgs   []string
 	lastHandle       runtime.Handle
 	lastExec         runtime.ExecRequest
 	started          int
@@ -256,6 +257,11 @@ func (f *fakeRuntime) CreateWithProxy(ctx context.Context, cfg *runtime.Config, 
 	f.proxyHelperPath = helperPath
 	f.proxyGuestPort = guestPort
 	f.proxyServiceHost = serviceHost
+	return f.Create(ctx, *cfg)
+}
+func (f *fakeRuntime) CreateWithProxyRouteArgs(ctx context.Context, cfg *runtime.Config, helperPath string, routes []string) (runtime.Handle, error) {
+	f.proxyHelperPath = helperPath
+	f.proxyRouteArgs = append([]string(nil), routes...)
 	return f.Create(ctx, *cfg)
 }
 func (f *fakeRuntime) Exec(_ context.Context, _ runtime.Handle, req runtime.ExecRequest) (int, error) {
