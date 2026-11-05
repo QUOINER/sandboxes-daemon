@@ -527,6 +527,14 @@ func (s *Service) storeServiceSecret(ctx context.Context, service string, scope 
 	if s.serviceSecrets == nil {
 		return servicesecrets.Summary{}, errors.New("service secret store is unavailable")
 	}
+	// The vault canonicalizes these fields when constructing its account key.
+	// Use the same canonical identity for the gate or callers that vary case or
+	// whitespace can race create-only checks against the same vault entry.
+	service = strings.ToLower(strings.TrimSpace(service))
+	if scope == "" {
+		scope = servicesecrets.ScopeGlobal
+	}
+	sandboxName = strings.TrimSpace(sandboxName)
 	release, err := s.acquireCredentialGate(ctx, "service-secret/"+service+"/"+string(scope)+"/"+sandboxName)
 	if err != nil {
 		return servicesecrets.Summary{}, err

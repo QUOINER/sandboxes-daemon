@@ -1540,6 +1540,94 @@ func TestCreateServiceSecretIsAtomicForConcurrentWriters(t *testing.T) {
 	}
 }
 
+type barrierServiceSecretVault struct {
+	mu      sync.Mutex
+	items   map[string]string
+	gets    atomic.Int32
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (f *barrierServiceSecretVault) Set(_ context.Context, service, account, secret string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.items[service+"/"+account] = secret
+	return nil
+}
+
+func (f *barrierServiceSecretVault) Get(_ context.Context, service, account string) (string, error) {
+	f.mu.Lock()
+	value, ok := f.items[service+"/"+account]
+	f.mu.Unlock()
+	if f.gets.Add(1) == 2 {
+		close(f.ready)
+	}
+	<-f.release
+	if !ok {
+		return "", servicesecrets.ErrNotFound
+	}
+	return value, nil
+}
+
+func (f *barrierServiceSecretVault) Delete(_ context.Context, service, account string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := service + "/" + account
+	if _, ok := f.items[key]; !ok {
+		return servicesecrets.ErrNotFound
+	}
+	delete(f.items, key)
+	return nil
+}
+
+func TestCreateServiceSecretNormalizesIdentityBeforeAtomicGate(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "create-only-normalized.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &barrierServiceSecretVault{
+		items: make(map[string]string), ready: make(chan struct{}), release: make(chan struct{}),
+	}
+	secretStore, err := servicesecrets.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(st, nil)
+	svc.SetServiceSecretStore(secretStore)
+	errorsOut := make(chan error, 2)
+	for _, service := range []string{"openai", " OPENAI "} {
+		service := service
+		go func() {
+			_, createErr := svc.CreateServiceSecret(ctx, service, servicesecrets.ScopeGlobal, "", []byte("synthetic-"+service))
+			errorsOut <- createErr
+		}()
+	}
+	select {
+	case <-vault.ready:
+	case <-time.After(100 * time.Millisecond):
+		// With a canonical gate, the second call must wait until the first
+		// create has completed; release the first read so it can do so.
+	}
+	close(vault.release)
+	var successes, exists int
+	for range 2 {
+		createErr := <-errorsOut
+		switch {
+		case createErr == nil:
+			successes++
+		case errors.Is(createErr, servicesecrets.ErrExists):
+			exists++
+		default:
+			t.Fatalf("unexpected create error: %v", createErr)
+		}
+	}
+	if successes != 1 || exists != 1 {
+		t.Fatalf("canonical-equivalent create outcomes: success=%d exists=%d", successes, exists)
+	}
+}
+
 func TestServiceSecretNeverPersistsValue(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "test.db")
