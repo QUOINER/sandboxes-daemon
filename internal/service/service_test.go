@@ -1665,16 +1665,21 @@ func TestRemoveServiceSecretCleansStaleIndexWithCanonicalScope(t *testing.T) {
 	}
 	svc := New(st, nil)
 	svc.SetServiceSecretStore(secretStore)
-	manager := secretproxy.New()
-	svc.SetSecretProxyManager(manager)
-	t.Cleanup(func() { _ = manager.Close() })
+	var manager *secretproxy.Manager
+	if goruntime.GOOS != "windows" {
+		manager = secretproxy.New()
+		svc.SetSecretProxyManager(manager)
+		t.Cleanup(func() { _ = manager.Close() })
+	}
 	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("synthetic-key")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.StartUnix(ctx, "dev", "openai", secretproxy.Service{
-		Upstream: "http://127.0.0.1:1", Header: "Authorization", CredentialScope: "global",
-	}, []byte("synthetic-key"), shortTestProxySocketPath(t), strings.Repeat("a", 64)); err != nil {
-		t.Fatal(err)
+	if manager != nil {
+		if _, err := manager.StartUnix(ctx, "dev", "openai", secretproxy.Service{
+			Upstream: "http://127.0.0.1:1", Header: "Authorization", CredentialScope: "global",
+		}, []byte("synthetic-key"), shortTestProxySocketPath(t), strings.Repeat("a", 64)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := vault.Delete(ctx, "com.rheic.service-secrets.v1", "openai/global"); err != nil {
 		t.Fatal(err)
@@ -1683,7 +1688,7 @@ func TestRemoveServiceSecretCleansStaleIndexWithCanonicalScope(t *testing.T) {
 	if err != nil || removed {
 		t.Fatalf("stale-entry cleanup returned removed=%t err=%v", removed, err)
 	}
-	if manager.Has("dev", "openai") {
+	if manager != nil && manager.Has("dev", "openai") {
 		t.Fatal("canonical global removal left an active proxy route")
 	}
 	entries, err := svc.ListServiceSecrets(ctx)
@@ -1693,6 +1698,9 @@ func TestRemoveServiceSecretCleansStaleIndexWithCanonicalScope(t *testing.T) {
 }
 
 func TestRemoveServiceSecretRevokesProxyBeforeVaultDelete(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("service proxy lifecycle requires Unix sockets")
+	}
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "service-secret-remove-failure.db"))
 	if err != nil {
