@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net"
@@ -1643,6 +1644,71 @@ func TestSetAndRemoveServiceSecretShareCanonicalCredentialGate(t *testing.T) {
 	entries, err := svc.ListServiceSecrets(ctx)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("secret index after serialized set/remove=%+v err=%v", entries, err)
+	}
+}
+
+func TestSetServiceSecretRollsBackVaultWhenIndexWriteFails(t *testing.T) {
+	for _, hadPrevious := range []bool{false, true} {
+		t.Run(fmt.Sprintf("previous=%t", hadPrevious), func(t *testing.T) {
+			testSetServiceSecretIndexFailureRollback(t, hadPrevious)
+		})
+	}
+}
+
+func testSetServiceSecretIndexFailureRollback(t *testing.T, hadPrevious bool) {
+	t.Helper()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "service-secret-index-failure.db")
+	st, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &fakeServiceSecretVault{items: make(map[string]string)}
+	secretStore, err := servicesecrets.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(st, nil)
+	svc.SetServiceSecretStore(secretStore)
+	if hadPrevious {
+		if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("old-synthetic-value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.ExecContext(ctx, `CREATE TRIGGER fail_service_secret_index BEFORE INSERT ON service_secret_index BEGIN SELECT RAISE(ABORT, 'synthetic index failure'); END`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("new-synthetic-value")); err == nil {
+		t.Fatal("set succeeded despite injected index failure")
+	}
+	value, err := secretStore.Load(ctx, "openai", servicesecrets.ScopeGlobal, "")
+	if hadPrevious {
+		if err != nil || string(value) != "old-synthetic-value" {
+			t.Fatalf("previous vault value not restored: value=%q err=%v", value, err)
+		}
+		clear(value)
+		entries, err := svc.ListServiceSecrets(ctx)
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("existing index entry lost: entries=%+v err=%v", entries, err)
+		}
+		return
+	}
+	if !errors.Is(err, servicesecrets.ErrNotFound) {
+		t.Fatalf("new vault value remained after rollback: value=%q err=%v", value, err)
+	}
+	entries, err := svc.ListServiceSecrets(ctx)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("index entry remained after rollback: entries=%+v err=%v", entries, err)
 	}
 }
 

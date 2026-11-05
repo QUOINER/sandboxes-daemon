@@ -540,15 +540,14 @@ func (s *Service) storeServiceSecret(ctx context.Context, service string, scope 
 		return servicesecrets.Summary{}, err
 	}
 	defer release()
-	if createOnly {
-		existing, loadErr := s.serviceSecrets.Load(ctx, service, scope, sandboxName)
-		if loadErr == nil {
-			clear(existing)
-			return servicesecrets.Summary{}, servicesecrets.ErrExists
-		}
-		if !errors.Is(loadErr, servicesecrets.ErrNotFound) {
-			return servicesecrets.Summary{}, fmt.Errorf("check existing service secret: %w", loadErr)
-		}
+	previous, loadErr := s.serviceSecrets.Load(ctx, service, scope, sandboxName)
+	hadPrevious := loadErr == nil
+	if loadErr != nil && !errors.Is(loadErr, servicesecrets.ErrNotFound) {
+		return servicesecrets.Summary{}, fmt.Errorf("check existing service secret: %w", loadErr)
+	}
+	defer clear(previous)
+	if createOnly && hadPrevious {
+		return servicesecrets.Summary{}, servicesecrets.ErrExists
 	}
 	summary, err := s.serviceSecrets.Save(ctx, service, scope, sandboxName, value)
 	if err != nil {
@@ -557,13 +556,43 @@ func (s *Service) storeServiceSecret(ctx context.Context, service string, scope 
 	if err := s.store.UpsertServiceSecretIndex(ctx, store.ServiceSecretIndex{
 		Service: summary.Service, Scope: string(summary.Scope), SandboxName: summary.SandboxName,
 	}); err != nil {
-		_, _ = s.serviceSecrets.Delete(ctx, summary.Service, summary.Scope, summary.SandboxName)
-		return servicesecrets.Summary{}, err
+		return servicesecrets.Summary{}, errors.Join(err, s.rollbackServiceSecretAfterIndexFailure(ctx, summary, previous, hadPrevious))
 	}
 	if s.secretProxies != nil {
 		s.secretProxies.RefreshSecret(summary.Service, summary.SandboxName, string(summary.Scope), value)
 	}
 	return summary, nil
+}
+
+func (s *Service) rollbackServiceSecretAfterIndexFailure(ctx context.Context, summary servicesecrets.Summary, previous []byte, hadPrevious bool) error {
+	rollbackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	var rollbackErr error
+	if hadPrevious {
+		_, rollbackErr = s.serviceSecrets.Save(rollbackCtx, summary.Service, summary.Scope, summary.SandboxName, previous)
+	} else {
+		_, rollbackErr = s.serviceSecrets.Delete(rollbackCtx, summary.Service, summary.Scope, summary.SandboxName)
+	}
+	if rollbackErr != nil {
+		errs := []error{fmt.Errorf("rollback service secret after index failure: %w", rollbackErr)}
+		if s.secretProxies != nil {
+			if revokeErr := s.secretProxies.RevokeSecret(summary.Service, summary.SandboxName, string(summary.Scope)); revokeErr != nil {
+				errs = append(errs, fmt.Errorf("revoke active service proxy after rollback failure: %w", revokeErr))
+			}
+		}
+		return errors.Join(errs...)
+	}
+	if s.secretProxies == nil {
+		return nil
+	}
+	if hadPrevious {
+		s.secretProxies.RefreshSecret(summary.Service, summary.SandboxName, string(summary.Scope), previous)
+		return nil
+	}
+	if err := s.secretProxies.RevokeSecret(summary.Service, summary.SandboxName, string(summary.Scope)); err != nil {
+		return fmt.Errorf("revoke active service proxy after failed secret write: %w", err)
+	}
+	return nil
 }
 
 // ListServiceSecrets returns non-secret summaries.
