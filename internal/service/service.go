@@ -535,7 +535,7 @@ func (s *Service) storeServiceSecret(ctx context.Context, service string, scope 
 		scope = servicesecrets.ScopeGlobal
 	}
 	sandboxName = strings.TrimSpace(sandboxName)
-	release, err := s.acquireCredentialGate(ctx, "service-secret/"+service+"/"+string(scope)+"/"+sandboxName)
+	release, err := s.acquireCredentialGate(ctx, serviceSecretGateKey(service, scope, sandboxName))
 	if err != nil {
 		return servicesecrets.Summary{}, err
 	}
@@ -586,6 +586,11 @@ func (s *Service) RemoveServiceSecret(ctx context.Context, service string, scope
 	if s.serviceSecrets == nil {
 		return false, errors.New("service secret store is unavailable")
 	}
+	release, err := s.acquireCredentialGate(ctx, serviceSecretGateKey(service, scope, sandboxName))
+	if err != nil {
+		return false, err
+	}
+	defer release()
 	removed, err := s.serviceSecrets.Delete(ctx, service, scope, sandboxName)
 	if err != nil || !removed {
 		return removed, err
@@ -599,6 +604,15 @@ func (s *Service) RemoveServiceSecret(ctx context.Context, service string, scope
 		return true, err
 	}
 	return true, nil
+}
+
+func serviceSecretGateKey(service string, scope servicesecrets.Scope, sandboxName string) string {
+	service = strings.ToLower(strings.TrimSpace(service))
+	if scope == "" {
+		scope = servicesecrets.ScopeGlobal
+	}
+	sandboxName = strings.TrimSpace(sandboxName)
+	return "service-secret/" + service + "/" + string(scope) + "/" + sandboxName
 }
 
 // PolicyDecision is the gateway-consistent result of a policy check.

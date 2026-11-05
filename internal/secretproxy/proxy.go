@@ -27,12 +27,13 @@ import (
 
 // Service describes one supported upstream and its auth header.
 type Service struct {
-	Upstream        string
-	Header          string
-	Prefix          string
-	CredentialScope string
-	Authorize       func(context.Context) error
-	Credential      func(context.Context) ([]byte, error)
+	Upstream         string
+	Header           string
+	Prefix           string
+	CredentialScope  string
+	Authorize        func(context.Context) error
+	AuthorizeAddress func(context.Context, netip.Addr) (bool, error)
+	Credential       func(context.Context) ([]byte, error)
 }
 
 const (
@@ -183,7 +184,7 @@ func (m *Manager) StartUnixRoutes(ctx context.Context, sandbox string, routes ma
 			return "", err
 		}
 		reverse := httputil.NewSingleHostReverseProxy(upstream)
-		reverse.Transport = outboundTransport(upstream.Scheme == "https", m.dialContext)
+		reverse.Transport = outboundTransportWithPolicy(upstream.Scheme == "https", m.dialContext, route.Service.AuthorizeAddress)
 		reverse.ModifyResponse = enforceResponseLimit
 		reverse.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 			http.Error(w, "proxy upstream unavailable", http.StatusBadGateway)
@@ -607,9 +608,14 @@ func (m *Manager) RevokeSecret(service, sandboxName, scope string) error {
 }
 
 func outboundTransport(requirePublicIP bool, dialOverride func(context.Context, string, string) (net.Conn, error)) *http.Transport {
+	return outboundTransportWithPolicy(requirePublicIP, dialOverride, nil)
+}
+
+func outboundTransportWithPolicy(requirePublicIP bool, dialOverride func(context.Context, string, string) (net.Conn, error), authorize func(context.Context, netip.Addr) (bool, error)) *http.Transport {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
 		Proxy:                 nil,
+		DisableKeepAlives:     authorize != nil,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
@@ -623,7 +629,7 @@ func outboundTransport(requirePublicIP bool, dialOverride func(context.Context, 
 			if !requirePublicIP {
 				return dialer.DialContext(ctx, network, address)
 			}
-			return dialPublicUnicast(ctx, network, address, net.DefaultResolver.LookupIPAddr, dialer.DialContext)
+			return dialPublicUnicastWithPolicy(ctx, network, address, net.DefaultResolver.LookupIPAddr, dialer.DialContext, authorize)
 		},
 	}
 	return transport
@@ -635,6 +641,16 @@ func dialPublicUnicast(
 	lookup func(context.Context, string) ([]net.IPAddr, error),
 	dial func(context.Context, string, string) (net.Conn, error),
 ) (net.Conn, error) {
+	return dialPublicUnicastWithPolicy(ctx, network, address, lookup, dial, nil)
+}
+
+func dialPublicUnicastWithPolicy(
+	ctx context.Context,
+	network, address string,
+	lookup func(context.Context, string) ([]net.IPAddr, error),
+	dial func(context.Context, string, string) (net.Conn, error),
+	authorize func(context.Context, netip.Addr) (bool, error),
+) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, errors.New("invalid proxy upstream address")
@@ -643,13 +659,39 @@ func dialPublicUnicast(
 	if err != nil || len(ips) == 0 {
 		return nil, errors.New("proxy upstream DNS resolution failed")
 	}
+	allowedAddresses := make([]netip.Addr, 0, len(ips))
 	for _, answer := range ips {
 		ip, ok := netip.AddrFromSlice(answer.IP)
 		if !ok || !daemonnetwork.IsPublicUnicast(ip) {
 			return nil, errors.New("proxy upstream resolved to a non-public address")
 		}
+		ip = ip.Unmap()
+		if authorize != nil {
+			allowed, err := authorize(ctx, ip)
+			if err != nil {
+				return nil, errors.New("proxy upstream policy check failed")
+			}
+			if !allowed {
+				continue
+			}
+		}
+		allowedAddresses = append(allowedAddresses, ip)
 	}
-	return dial(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+	if len(allowedAddresses) == 0 {
+		return nil, errors.New("sandbox policy denied proxy upstream addresses")
+	}
+	var failures []error
+	for _, address := range allowedAddresses {
+		conn, err := dial(ctx, network, net.JoinHostPort(address.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		failures = append(failures, err)
+	}
+	if len(failures) == 0 {
+		return nil, errors.New("proxy upstream has no usable addresses")
+	}
+	return nil, errors.Join(failures...)
 }
 
 func isPublicUnicast(ip net.IP) bool {
