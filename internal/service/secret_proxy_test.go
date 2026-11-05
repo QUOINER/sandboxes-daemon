@@ -46,16 +46,31 @@ func TestStripProxyCreateEnv(t *testing.T) {
 	if err != nil || len(filtered) != 0 || strings.Join(serviceNames, ",") != "anthropic,openai" {
 		t.Fatalf("multiple services filtered=%v services=%v err=%v", filtered, serviceNames, err)
 	}
+	filtered, serviceNames, err = stripProxyCreateEnv([]string{"OPENAI_API_KEY=${oauth:openai}", "PATH=/bin"})
+	if err != nil || len(filtered) != 1 || filtered[0] != "PATH=/bin" || strings.Join(serviceNames, ",") != "openai-oauth" {
+		t.Fatalf("OAuth proxy env filtered=%v services=%v err=%v", filtered, serviceNames, err)
+	}
+	for _, env := range [][]string{
+		{"ANTHROPIC_API_KEY=${oauth:openai}"},
+		{"OPENAI_API_KEY=${oauth:anthropic}"},
+		{"OPENAI_API_KEY=${oauth:openai}", "OPENAI_API_KEY=${proxy:openai}"},
+		{"OPENAI_API_KEY=prefix${oauth:openai}"},
+	} {
+		if _, _, err := stripProxyCreateEnv(env); err == nil {
+			t.Errorf("accepted invalid OAuth proxy env %v", env)
+		}
+	}
 }
 
 func TestProxyContractsUseProviderAPIBasePaths(t *testing.T) {
 	for service, want := range map[string]string{
-		"openai":     "http://127.0.0.1:3128/v1",
-		"mistral":    "http://127.0.0.1:43131/v1",
-		"groq":       "http://127.0.0.1:43130/openai/v1",
-		"openrouter": "http://127.0.0.1:43132/api/v1",
-		"xai":        "http://127.0.0.1:43133/v1",
-		"anthropic":  "http://127.0.0.1:43129",
+		"openai":       "http://127.0.0.1:3128/v1",
+		"openai-oauth": "http://127.0.0.1:3128/v1",
+		"mistral":      "http://127.0.0.1:43131/v1",
+		"groq":         "http://127.0.0.1:43130/openai/v1",
+		"openrouter":   "http://127.0.0.1:43132/api/v1",
+		"xai":          "http://127.0.0.1:43133/v1",
+		"anthropic":    "http://127.0.0.1:43129",
 	} {
 		contract, ok := proxyContract(service)
 		if !ok || contract.baseURL != want {

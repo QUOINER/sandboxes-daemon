@@ -17,10 +17,12 @@ var ErrOAuthReauthRequired = errors.New("OAuth credentials require sign-in")
 
 // Tokens contain sensitive material; never log or expose them to guests.
 type Tokens struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int64  `json:"expires_in"`
+	AccessToken  string   `json:"access_token"`
+	RefreshToken string   `json:"refresh_token"`
+	IDToken      string   `json:"id_token,omitempty"`
+	Scopes       []string `json:"scopes,omitempty"`
+	TokenType    string   `json:"token_type"`
+	ExpiresIn    int64    `json:"expires_in"`
 }
 
 // String and GoString prevent accidental formatting of credentials in logs.
@@ -66,7 +68,7 @@ func Refresh(ctx context.Context, transport http.RoundTripper, endpoint, clientI
 		return Tokens{}, errors.New("invalid OAuth refresh request")
 	}
 	return tokenRequest(ctx, transport, endpoint, url.Values{
-		grantTypeKey: {"refresh_token"}, "refresh_token": {refreshToken}, clientIDKey: {clientID},
+		grantTypeKey: {refreshGrant}, refreshGrant: {refreshToken}, clientIDKey: {clientID},
 	})
 }
 
@@ -133,7 +135,7 @@ func tokenRequest(ctx context.Context, transport http.RoundTripper, endpoint str
 }
 
 func classifyTokenError(body io.Reader) error {
-	const maxTokenErrorResponse = 64 << 10
+	const maxTokenErrorResponse = 8 << 10
 	data, err := io.ReadAll(io.LimitReader(body, maxTokenErrorResponse+1))
 	if err != nil || len(data) > maxTokenErrorResponse {
 		clear(data)

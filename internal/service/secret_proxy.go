@@ -19,6 +19,7 @@ import (
 	"github.com/rheic/sandboxes-core/sandbox"
 	runtime "github.com/rheic/sandboxes-runtime"
 
+	"github.com/rheic/sandboxes-daemon/internal/oauthsession"
 	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
 	"github.com/rheic/sandboxes-daemon/internal/secretproxy"
 	"github.com/rheic/sandboxes-daemon/internal/servicesecrets"
@@ -29,6 +30,8 @@ const (
 	proxySettingPrefix   = "sandbox.proxy-service."
 	proxyGuestHelperPath = "/tmp/rheic-proxy-helper"
 	proxyMaxRoutes       = 32
+	openAIServiceName    = "openai"
+	openAIOAuthRoute     = openAIServiceName + "-oauth"
 )
 
 type proxyRuntimeConfig struct {
@@ -58,7 +61,11 @@ type proxyEnvContract struct {
 }
 
 func proxyContract(name string) (proxyEnvContract, bool) {
-	service, ok := secretproxy.Lookup(name)
+	lookupName := name
+	if isOAuthProxyRoute(name) {
+		lookupName = openAIServiceName
+	}
+	service, ok := secretproxy.Lookup(lookupName)
 	if !ok {
 		return proxyEnvContract{}, false
 	}
@@ -68,7 +75,7 @@ func proxyContract(name string) (proxyEnvContract, bool) {
 	}
 	contract := proxyEnvContract{serviceName: strings.ToLower(name), upstreamHost: upstream.Host}
 	switch contract.serviceName {
-	case "openai":
+	case openAIServiceName, openAIOAuthRoute:
 		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "OPENAI_API_KEY", "OPENAI_BASE_URL", 3128
 	case "anthropic":
 		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", 43129
@@ -90,7 +97,7 @@ func proxyContract(name string) (proxyEnvContract, bool) {
 func proxyBaseURL(service string, port uint16) string {
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 	switch service {
-	case "openai", "mistral", "xai":
+	case openAIServiceName, openAIOAuthRoute, "mistral", "xai":
 		return base + "/v1"
 	case "groq":
 		return base + "/openai/v1"
@@ -113,17 +120,13 @@ func stripProxyCreateEnv(env []string) ([]string, []string, error) {
 			return nil, nil, fmt.Errorf("%w: invalid environment entry", core.ErrConflict)
 		}
 		keys[key] = value
-		if !strings.Contains(value, "${proxy:") {
+		name, isProxyRef, err := parseProxyEnvReference(key, value)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !isProxyRef {
 			filtered = append(filtered, entry)
 			continue
-		}
-		if !strings.HasPrefix(value, "${proxy:") || !strings.HasSuffix(value, "}") || strings.Count(value, "${proxy:") != 1 {
-			return nil, nil, fmt.Errorf("%w: invalid proxy reference for %s", core.ErrConflict, key)
-		}
-		name := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(value, "${proxy:"), "}"))
-		contract, ok := proxyContract(name)
-		if !ok || key != contract.credentialEnv {
-			return nil, nil, fmt.Errorf("%w: proxy reference is not supported for %s", core.ErrConflict, key)
 		}
 		serviceNames[name] = struct{}{}
 		if len(serviceNames) > proxyMaxRoutes {
@@ -141,10 +144,46 @@ func stripProxyCreateEnv(env []string) ([]string, []string, error) {
 			return nil, nil, fmt.Errorf("%w: %s is managed by the service proxy", core.ErrConflict, contract.baseURLEnv)
 		}
 	}
+	if containsString(names, openAIServiceName) && containsString(names, openAIOAuthRoute) {
+		return nil, nil, fmt.Errorf("%w: API-key and OAuth proxy routes cannot share OPENAI_API_KEY", core.ErrConflict)
+	}
 	return filtered, names, nil
 }
 
 func proxyServiceSettingKey(id string) string { return proxySettingPrefix + id }
+
+func isOAuthProxyRoute(name string) bool { return name == openAIOAuthRoute }
+
+func parseProxyEnvReference(key, value string) (string, bool, error) {
+	proxyRef := strings.Contains(value, proxyRefPrefix)
+	oauthRef := strings.Contains(value, oauthRefPrefix)
+	if !proxyRef && !oauthRef {
+		return "", false, nil
+	}
+	if proxyRef == oauthRef {
+		return "", true, fmt.Errorf("%w: invalid proxy reference for %s", core.ErrConflict, key)
+	}
+	prefix := proxyRefPrefix
+	if oauthRef {
+		prefix = oauthRefPrefix
+	}
+	if !strings.HasPrefix(value, prefix) || !strings.HasSuffix(value, "}") ||
+		strings.Count(value, proxyRefPrefix)+strings.Count(value, oauthRefPrefix) != 1 {
+		return "", true, fmt.Errorf("%w: invalid proxy reference for %s", core.ErrConflict, key)
+	}
+	name := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(value, prefix), "}"))
+	if oauthRef {
+		if name != openAIServiceName {
+			return "", true, fmt.Errorf("%w: OAuth proxy is not supported for %s", core.ErrConflict, key)
+		}
+		name = openAIOAuthRoute
+	}
+	contract, ok := proxyContract(name)
+	if !ok || key != contract.credentialEnv {
+		return "", true, fmt.Errorf("%w: proxy reference is not supported for %s", core.ErrConflict, key)
+	}
+	return name, true, nil
+}
 
 func registryProxySettingKey(id string) string { return "sandbox.registry-proxy." + id }
 
@@ -189,7 +228,7 @@ func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, se
 
 func hasServiceSecretRoute(serviceNames []string) bool {
 	for _, name := range serviceNames {
-		if name != dockerHubProxyService {
+		if name != dockerHubProxyService && !isOAuthProxyRoute(name) {
 			return true
 		}
 	}
@@ -265,6 +304,9 @@ func (s *Service) buildProxyRoute(ctx context.Context, sb sandbox.Sandbox, name 
 	if !ok {
 		return secretproxy.RouteConfig{}, "", fmt.Errorf("%w: unsupported service proxy route", core.ErrConflict)
 	}
+	if isOAuthProxyRoute(name) {
+		return s.buildOAuthProxyRoute(ctx, sb, contract)
+	}
 	secret, scope, err := s.loadServiceProxySecret(ctx, name, sb.Name)
 	if err != nil {
 		return secretproxy.RouteConfig{}, "", err
@@ -279,6 +321,40 @@ func (s *Service) buildProxyRoute(ctx context.Context, sb sandbox.Sandbox, name 
 	service.Authorize = s.proxyPolicyAuthorizer(sb.ID, contract.upstreamHost)
 	return secretproxy.RouteConfig{Service: service, Secret: secret, Token: token},
 		fmt.Sprintf("%s=%s:%d", name, contract.upstreamHost, contract.guestPort), nil
+}
+
+func (s *Service) buildOAuthProxyRoute(ctx context.Context, sb sandbox.Sandbox, contract proxyEnvContract) (secretproxy.RouteConfig, string, error) {
+	provider, ok := s.oauthProviders[openAIServiceName]
+	if !ok || provider.Config.Transport == nil || s.oauthRefresh == nil {
+		return secretproxy.RouteConfig{}, "", fmt.Errorf("%w: OpenAI OAuth proxy is unavailable", core.ErrConflict)
+	}
+	sink, err := oauthsession.NewVaultSink(s.oauthVault(), openAIServiceName)
+	if err != nil {
+		return secretproxy.RouteConfig{}, "", fmt.Errorf("%w: OAuth credential vault is unavailable", core.ErrConflict)
+	}
+	manager, err := oauthsession.NewTokenManager(sink, provider.Config.Transport, provider.Config.TokenEndpoint, provider.Config.ClientID, s.oauthRefresh)
+	if err != nil {
+		return secretproxy.RouteConfig{}, "", fmt.Errorf("%w: OpenAI OAuth refresh is unavailable", core.ErrConflict)
+	}
+	if _, err := manager.AccessToken(ctx); err != nil {
+		return secretproxy.RouteConfig{}, "", fmt.Errorf("%w: OpenAI OAuth credentials are unavailable", core.ErrConflict)
+	}
+	token, err := newProxyToken()
+	if err != nil {
+		return secretproxy.RouteConfig{}, "", err
+	}
+	service := contractService(openAIServiceName)
+	service.CredentialScope = "global-oauth"
+	service.Credential = func(ctx context.Context) ([]byte, error) {
+		accessToken, err := manager.AccessToken(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(accessToken), nil
+	}
+	service.Authorize = s.proxyPolicyAuthorizer(sb.ID, contract.upstreamHost)
+	return secretproxy.RouteConfig{Service: service, Token: token},
+		fmt.Sprintf("%s=%s:%d", openAIOAuthRoute, contract.upstreamHost, contract.guestPort), nil
 }
 
 func newProxyToken() (string, error) {

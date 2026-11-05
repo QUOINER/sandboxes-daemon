@@ -10,6 +10,7 @@ import (
 	goruntime "runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -377,7 +378,7 @@ func TestStopAndDeleteSerializePerSandbox(t *testing.T) {
 	case <-backend.deleteCalled:
 		close(backend.stopRelease)
 		t.Fatal("delete reached runtime while stop was in progress")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
 	}
 	close(backend.stopRelease)
 	if err := <-stopDone; err != nil {
@@ -1462,14 +1463,21 @@ func TestGlobalPolicyMergesIntoNewSandboxes(t *testing.T) {
 	}
 }
 
-type fakeServiceSecretVault struct{ items map[string]string }
+type fakeServiceSecretVault struct {
+	mu    sync.Mutex
+	items map[string]string
+}
 
 func (f *fakeServiceSecretVault) Set(_ context.Context, service, account, secret string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.items[service+"/"+account] = secret
 	return nil
 }
 
 func (f *fakeServiceSecretVault) Get(_ context.Context, service, account string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	value, ok := f.items[service+"/"+account]
 	if !ok {
 		return "", servicesecrets.ErrNotFound
@@ -1478,12 +1486,146 @@ func (f *fakeServiceSecretVault) Get(_ context.Context, service, account string)
 }
 
 func (f *fakeServiceSecretVault) Delete(_ context.Context, service, account string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	key := service + "/" + account
 	if _, ok := f.items[key]; !ok {
 		return servicesecrets.ErrNotFound
 	}
 	delete(f.items, key)
 	return nil
+}
+
+func TestCreateServiceSecretIsAtomicForConcurrentWriters(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "create-only.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &fakeServiceSecretVault{items: make(map[string]string)}
+	secretStore, err := servicesecrets.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(st, nil)
+	svc.SetServiceSecretStore(secretStore)
+	const writers = 24
+	var wg sync.WaitGroup
+	var successes atomic.Int32
+	var exists atomic.Int32
+	var unexpected atomic.Int32
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, createErr := svc.CreateServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("synthetic-secret"))
+			switch {
+			case createErr == nil:
+				successes.Add(1)
+			case errors.Is(createErr, servicesecrets.ErrExists):
+				exists.Add(1)
+			default:
+				unexpected.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if successes.Load() != 1 || exists.Load() != writers-1 || unexpected.Load() != 0 {
+		t.Fatalf("create outcomes: success=%d exists=%d unexpected=%d", successes.Load(), exists.Load(), unexpected.Load())
+	}
+	items, err := svc.ListServiceSecrets(ctx)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("secret index=%+v err=%v", items, err)
+	}
+}
+
+type barrierServiceSecretVault struct {
+	mu      sync.Mutex
+	items   map[string]string
+	gets    atomic.Int32
+	ready   chan struct{}
+	release chan struct{}
+}
+
+func (f *barrierServiceSecretVault) Set(_ context.Context, service, account, secret string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.items[service+"/"+account] = secret
+	return nil
+}
+
+func (f *barrierServiceSecretVault) Get(_ context.Context, service, account string) (string, error) {
+	f.mu.Lock()
+	value, ok := f.items[service+"/"+account]
+	f.mu.Unlock()
+	if f.gets.Add(1) == 2 {
+		close(f.ready)
+	}
+	<-f.release
+	if !ok {
+		return "", servicesecrets.ErrNotFound
+	}
+	return value, nil
+}
+
+func (f *barrierServiceSecretVault) Delete(_ context.Context, service, account string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := service + "/" + account
+	if _, ok := f.items[key]; !ok {
+		return servicesecrets.ErrNotFound
+	}
+	delete(f.items, key)
+	return nil
+}
+
+func TestCreateServiceSecretNormalizesIdentityBeforeAtomicGate(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "create-only-normalized.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &barrierServiceSecretVault{
+		items: make(map[string]string), ready: make(chan struct{}), release: make(chan struct{}),
+	}
+	secretStore, err := servicesecrets.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(st, nil)
+	svc.SetServiceSecretStore(secretStore)
+	errorsOut := make(chan error, 2)
+	for _, service := range []string{"openai", " OPENAI "} {
+		service := service
+		go func() {
+			_, createErr := svc.CreateServiceSecret(ctx, service, servicesecrets.ScopeGlobal, "", []byte("synthetic-"+service))
+			errorsOut <- createErr
+		}()
+	}
+	select {
+	case <-vault.ready:
+	case <-time.After(100 * time.Millisecond):
+		// With a canonical gate, the second call must wait until the first
+		// create has completed; release the first read so it can do so.
+	}
+	close(vault.release)
+	var successes, exists int
+	for range 2 {
+		createErr := <-errorsOut
+		switch {
+		case createErr == nil:
+			successes++
+		case errors.Is(createErr, servicesecrets.ErrExists):
+			exists++
+		default:
+			t.Fatalf("unexpected create error: %v", createErr)
+		}
+	}
+	if successes != 1 || exists != 1 {
+		t.Fatalf("canonical-equivalent create outcomes: success=%d exists=%d", successes, exists)
+	}
 }
 
 func TestServiceSecretNeverPersistsValue(t *testing.T) {
@@ -1567,6 +1709,32 @@ func TestResolveProxyEnvRequiresConfiguredCredentialVariable(t *testing.T) {
 	env, err := svc.resolveSecretEnv(ctx, sandbox.Sandbox{Name: "dev"}, []string{"OPENAI_BASE_URL=${proxy:openai}"})
 	if err == nil || !strings.Contains(err.Error(), "proxy reference is not supported") || len(env) != 0 {
 		t.Fatalf("env=%q err=%v", env, err)
+	}
+}
+
+func TestResolveOpenAIOAuthProxyEnvUsesExplicitConfiguredRoute(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	sb := sandbox.Sandbox{ID: "sb-oauth", Name: "oauth"}
+	if err := st.SetSetting(ctx, proxyServiceSettingKey(sb.ID), "openai-oauth"); err != nil {
+		t.Fatal(err)
+	}
+	resolved, route, err := svc.resolveProxyEnvEntry(ctx, sb, "OPENAI_API_KEY", "${oauth:openai}")
+	if err != nil || route != "openai-oauth" || resolved != "OPENAI_API_KEY=rheic-proxy-placeholder" {
+		t.Fatalf("resolved=%q route=%q err=%v", resolved, route, err)
+	}
+	for _, value := range []string{"${oauth:anthropic}", "${oauth:openai}${proxy:openai}", "prefix${oauth:openai}"} {
+		if _, _, err := svc.resolveProxyEnvEntry(ctx, sb, "OPENAI_API_KEY", value); err == nil {
+			t.Errorf("accepted invalid OAuth proxy reference %q", value)
+		}
+	}
+	if _, _, err := svc.resolveProxyEnvEntry(ctx, sb, "ANTHROPIC_API_KEY", "${oauth:openai}"); err == nil {
+		t.Fatal("accepted OAuth proxy on the wrong credential variable")
 	}
 }
 

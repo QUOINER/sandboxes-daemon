@@ -1,5 +1,5 @@
-// Package oauthsession provides host-side building blocks for native OAuth.
-// It does not register a provider, exchange tokens, or open a browser.
+// Package oauthsession provides host-side OAuth flows, token lifecycle, and
+// loopback callback handling for explicitly registered providers.
 package oauthsession
 
 import (
@@ -19,6 +19,7 @@ const (
 	clientIDKey  = "client_id"
 	grantTypeKey = "grant_type"
 	httpsScheme  = "https"
+	refreshGrant = "refresh_token"
 )
 
 // ErrDenied indicates that the authorization server returned an error for a
@@ -55,6 +56,12 @@ func New() (*Session, error) {
 // AuthorizationURL constructs an S256 authorization request using a trusted
 // provider endpoint and a loopback IP redirect with an already bound port.
 func (s *Session) AuthorizationURL(endpoint, clientID, redirect string, scopes []string) (string, error) {
+	return s.AuthorizationURLWithParams(endpoint, clientID, redirect, scopes, nil)
+}
+
+// AuthorizationURLWithParams adds only trusted provider-specific parameters
+// without allowing them to override the transaction's security fields.
+func (s *Session) AuthorizationURLWithParams(endpoint, clientID, redirect string, scopes []string, extra map[string]string) (string, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil || !validAuthorizationEndpoint(u) || clientID == "" || s == nil || s.state == "" || s.verifier == "" {
 		return "", errors.New("invalid OAuth authorization configuration")
@@ -65,19 +72,54 @@ func (s *Session) AuthorizationURL(endpoint, clientID, redirect string, scopes [
 	if err := s.bindAuthorization(endpoint, clientID, redirect); err != nil {
 		return "", err
 	}
+	q, err := authorizationQuery(clientID, redirect, s.state, s.verifier, scopes, extra)
+	if err != nil {
+		return "", err
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
+func authorizationQuery(clientID, redirect, state, verifier string, scopes []string, extra map[string]string) (url.Values, error) {
 	for _, scope := range scopes {
 		if scope == "" || strings.ContainsAny(scope, " \t\r\n") {
-			return "", errors.New("invalid OAuth scope")
+			return nil, errors.New("invalid OAuth scope")
 		}
 	}
-	hash := sha256.Sum256([]byte(s.verifier))
-	q := url.Values{"response_type": {"code"}, clientIDKey: {clientID}, "redirect_uri": {redirect}, "state": {s.state},
+	hash := sha256.Sum256([]byte(verifier))
+	q := url.Values{"response_type": {"code"}, clientIDKey: {clientID}, "redirect_uri": {redirect}, "state": {state},
 		"code_challenge": {base64.RawURLEncoding.EncodeToString(hash[:])}, "code_challenge_method": {"S256"}}
 	if len(scopes) > 0 {
 		q.Set("scope", strings.Join(scopes, " "))
 	}
-	u.RawQuery = q.Encode()
-	return u.String(), nil
+	for key, value := range extra {
+		if !validAuthorizationExtra(key, value) {
+			return nil, errors.New("invalid OAuth provider authorization parameter")
+		}
+		if _, exists := q[key]; exists {
+			return nil, errors.New("OAuth provider parameter overrides transaction field")
+		}
+		q.Set(key, value)
+	}
+	return q, nil
+}
+
+func validAuthorizationExtra(key, value string) bool {
+	if key == "" || len(key) > 64 || len(value) > 256 || strings.ContainsAny(key+value, "\x00\r\n") {
+		return false
+	}
+	for i := range key {
+		c := key[i]
+		if !isAuthorizationParamChar(c) {
+			return false
+		}
+	}
+	return true
+}
+
+func isAuthorizationParamChar(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+		c >= '0' && c <= '9' || c == '_' || c == '-'
 }
 
 func (s *Session) bindAuthorization(endpoint, clientID, redirect string) error {

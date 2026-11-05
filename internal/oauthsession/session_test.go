@@ -94,3 +94,20 @@ func TestAuthorizationRejectsUnsafeEndpoints(t *testing.T) {
 		t.Fatalf("valid IPv6 loopback: %v", err)
 	}
 }
+
+func TestAuthorizationRejectsProviderParamsThatOverridePKCEFields(t *testing.T) {
+	for _, extra := range []map[string]string{
+		{"state": "attacker"},
+		{"redirect_uri": "http://attacker.invalid/"},
+		{"originator": "unsafe\r\nHeader: value"},
+		{"bad key": "value"},
+	} {
+		session, err := New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := session.AuthorizationURLWithParams("https://identity.example/authorize", "client", "http://127.0.0.1:12345/callback", nil, extra); err == nil {
+			t.Fatalf("accepted unsafe provider authorization parameters: %#v", extra)
+		}
+	}
+}

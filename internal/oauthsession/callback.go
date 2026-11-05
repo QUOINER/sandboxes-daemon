@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -14,6 +16,7 @@ import (
 type Callback struct {
 	listener net.Listener
 	server   *http.Server
+	path     string
 	result   chan string
 	failed   chan error
 }
@@ -28,14 +31,45 @@ func Listen(s *Session) (*Callback, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bind OAuth callback: %w", err)
 	}
-	c := &Callback{listener: listener, result: make(chan string, 1), failed: make(chan error, 1)}
+	return newCallback(s, listener, "/callback"), nil
+}
+
+func listenOnPorts(s *Session, ports []uint16, path string) (*Callback, error) {
+	if s == nil || !validCallbackPath(path) || len(ports) == 0 || len(ports) > 4 {
+		return nil, errors.New("invalid OAuth callback configuration")
+	}
+	seen := make(map[uint16]struct{}, len(ports))
+	var lastErr error
+	for _, port := range ports {
+		if port == 0 {
+			return nil, errors.New("invalid OAuth callback port")
+		}
+		if _, exists := seen[port]; exists {
+			return nil, errors.New("duplicate OAuth callback port")
+		}
+		seen[port] = struct{}{}
+		listener, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port))))
+		if err == nil {
+			return newCallback(s, listener, path), nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("bind configured OAuth callback ports: %w", lastErr)
+}
+
+func validCallbackPath(path string) bool {
+	return strings.HasPrefix(path, "/") && path != "/" && !strings.ContainsAny(path, "?#%\\\x00\r\n") && !strings.Contains(path, "//")
+}
+
+func newCallback(s *Session, listener net.Listener, path string) *Callback {
+	c := &Callback{listener: listener, path: path, result: make(chan string, 1), failed: make(chan error, 1)}
 	c.server = &http.Server{Handler: c.handler(s), ReadHeaderTimeout: 5 * time.Second, MaxHeaderBytes: 8 << 10}
 	go func() {
 		if err := c.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			c.failed <- err
 		}
 	}()
-	return c, nil
+	return c
 }
 
 func listenLoopback(listen func(string, string) (net.Listener, error)) (net.Listener, error) {
@@ -47,11 +81,11 @@ func listenLoopback(listen func(string, string) (net.Listener, error)) (net.List
 }
 
 // RedirectURI is the exact redirect registered for this listener.
-func (c *Callback) RedirectURI() string { return "http://" + c.listener.Addr().String() + "/callback" }
+func (c *Callback) RedirectURI() string { return "http://" + c.listener.Addr().String() + c.path }
 
 func (c *Callback) handler(s *Session) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.Host != c.listener.Addr().String() || r.URL.Path != "/callback" || r.URL.RawPath != "" {
+		if r.Method != http.MethodGet || r.Host != c.listener.Addr().String() || r.URL.Path != c.path || r.URL.RawPath != "" {
 			http.Error(w, "invalid callback", http.StatusBadRequest)
 			return
 		}

@@ -109,6 +109,17 @@ func TestGRPCLifecycle(t *testing.T) {
 	}); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("invalid deny was not rejected: %v", err)
 	}
+	if _, err := sandboxes.Create(ctx, &localv1.CreateRequest{
+		Name: "unsupported-oauth", OauthCredentials: []*localv1.OAuthCredential{{
+			Service:        "fixture",
+			TokenEndpoint:  &localv1.OAuthTokenEndpoint{Host: "auth.example.test", Path: "/oauth/token"},
+			ResourceHosts:  []string{"api.example.test"},
+			Sentinels:      &localv1.OAuthSentinels{AccessToken: "ACCESS_SENTINEL", RefreshToken: "REFRESH_SENTINEL"},
+			CredentialFile: &localv1.OAuthCredentialFile{Path: "~/.fixture/credentials.json", StructureJson: `{"access_token":"{{.AccessToken}}"}`},
+		}},
+	}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("unsupported custom OAuth declaration was not rejected: %v", err)
+	}
 	created, err := sandboxes.Create(ctx, &localv1.CreateRequest{
 		Name: "dev", Deny: []*localv1.NetworkRule{{Protocol: "tcp", Cidr: "192.0.2.0/24", Port: 443}},
 	})

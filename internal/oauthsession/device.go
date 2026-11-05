@@ -188,7 +188,7 @@ func devicePollingInterval(interval int64) time.Duration {
 func SameHTTPSOrigin(a, b string) bool {
 	ua, errA := url.Parse(a)
 	ub, errB := url.Parse(b)
-	if errA != nil || errB != nil || ua.Scheme != "https" || ub.Scheme != "https" || ua.User != nil || ub.User != nil {
+	if errA != nil || errB != nil || ua.Scheme != httpsScheme || ub.Scheme != httpsScheme || ua.User != nil || ub.User != nil {
 		return false
 	}
 	portA, portB := ua.Port(), ub.Port()

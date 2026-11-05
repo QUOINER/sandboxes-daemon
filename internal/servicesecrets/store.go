@@ -17,6 +17,7 @@ const vaultService = "com.rheic.service-secrets.v1"
 var (
 	ErrInvalid  = errors.New("invalid service secret")
 	ErrNotFound = errors.New("service secret not found")
+	ErrExists   = errors.New("service secret already exists")
 )
 
 // Scope controls where a secret may be used.

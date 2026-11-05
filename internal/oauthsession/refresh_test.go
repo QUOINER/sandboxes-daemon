@@ -29,6 +29,14 @@ func FuzzClassifyTokenError(f *testing.F) {
 	})
 }
 
+func TestClassifyTokenErrorRejectsOversizedResponse(t *testing.T) {
+	body := `{"error":"invalid_grant","padding":"` + strings.Repeat("x", 8<<10) + `"}`
+	err := classifyTokenError(strings.NewReader(body))
+	if err == nil || errors.Is(err, ErrOAuthReauthRequired) || err.Error() != "OAuth token endpoint rejected request" {
+		t.Fatalf("oversized provider error was not rejected generically: %v", err)
+	}
+}
+
 func TestTokenManagerConcurrentRefresh(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -44,7 +52,7 @@ func TestTokenManagerConcurrentRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sink.Save(context.Background(), Tokens{AccessToken: "old-token", RefreshToken: "synthetic-refresh", TokenType: "Bearer", ExpiresIn: 1}); err != nil {
+	if err := sink.Save(context.Background(), Tokens{AccessToken: "old-token", RefreshToken: "synthetic-refresh", IDToken: "synthetic-id", TokenType: "Bearer", ExpiresIn: 1}); err != nil {
 		t.Fatal(err)
 	}
 	coordinator := NewRefreshCoordinator()
@@ -82,7 +90,7 @@ func TestTokenManagerConcurrentRefresh(t *testing.T) {
 		t.Fatalf("refresh calls: %d", calls.Load())
 	}
 	stored, _, err := sink.Load(context.Background())
-	if err != nil || stored.RefreshToken != "new-refresh" {
+	if err != nil || stored.RefreshToken != "new-refresh" || stored.IDToken != "synthetic-id" {
 		t.Fatal("rotated refresh token not stored")
 	}
 	if stored.AccessToken != "new-token" {

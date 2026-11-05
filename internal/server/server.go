@@ -289,6 +289,9 @@ func (s *RegistryCredentialServer) Logout(ctx context.Context, req *localv1.Regi
 
 // Create creates a sandbox.
 func (s *SandboxServer) Create(ctx context.Context, req *localv1.CreateRequest) (*localv1.CreateResponse, error) {
+	if len(req.GetOauthCredentials()) != 0 {
+		return nil, status.Error(codes.FailedPrecondition, "custom kit OAuth interception is not enabled by this daemon")
+	}
 	allow := fromProtoRules(req.GetAllow())
 	deny := fromProtoRules(req.GetDeny())
 	if len(allow) != len(req.GetAllow()) || len(deny) != len(req.GetDeny()) {

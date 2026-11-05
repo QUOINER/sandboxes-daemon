@@ -6,6 +6,16 @@ import (
 	"net/http"
 )
 
+func listenForProvider(session *Session, provider Provider) (*Callback, error) {
+	if len(provider.CallbackPorts) == 0 {
+		if provider.CallbackPath != "" {
+			return nil, errors.New("OAuth callback path requires fixed callback ports")
+		}
+		return Listen(session)
+	}
+	return listenOnPorts(session, provider.CallbackPorts, provider.CallbackPath)
+}
+
 // Provider is trusted host configuration for one OAuth provider, never guest
 // input. Provider registration, endpoint and TLS policy must be verified by
 // the integration before invoking this flow.
@@ -14,6 +24,9 @@ type Provider struct {
 	TokenEndpoint         string
 	ClientID              string
 	Scopes                []string
+	AuthorizationParams   map[string]string
+	CallbackPorts         []uint16
+	CallbackPath          string
 	Transport             http.RoundTripper
 }
 
@@ -39,13 +52,13 @@ func Authorize(ctx context.Context, provider Provider, open func(context.Context
 	if err := s.bindTokenEndpoint(provider.TokenEndpoint); err != nil {
 		return err
 	}
-	callback, err := Listen(s)
+	callback, err := listenForProvider(s, provider)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = callback.Close() }()
 	redirect := callback.RedirectURI()
-	authURL, err := s.AuthorizationURL(provider.AuthorizationEndpoint, provider.ClientID, redirect, provider.Scopes)
+	authURL, err := s.AuthorizationURLWithParams(provider.AuthorizationEndpoint, provider.ClientID, redirect, provider.Scopes, provider.AuthorizationParams)
 	if err != nil {
 		return err
 	}

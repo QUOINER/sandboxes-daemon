@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rheic/sandboxes-core/sandbox"
+
 	"github.com/rheic/sandboxes-daemon/internal/oauthsession"
 	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
 	"github.com/rheic/sandboxes-daemon/internal/store"
@@ -132,14 +134,18 @@ func TestDeviceAccountLoginStoresAndLogoutRevokesHostTokens(t *testing.T) {
 	}
 	clear(unchanged.Password)
 	revokeFail.Store(true)
-	if removed, err := svc.LogoutAccount(ctx, "docker"); !removed || !errors.Is(err, ErrOAuthRevocationFailed) {
+	removed, err := svc.LogoutAccount(ctx, "docker")
+	if !removed || !errors.Is(err, ErrOAuthRevocationFailed) {
 		t.Fatalf("failed provider revoke should retain retryable state: removed=%t err=%v", removed, err)
+	}
+	if strings.Contains(err.Error(), "removed locally") {
+		t.Fatalf("failed provider revoke reported credentials removed: %v", err)
 	}
 	if _, _, err := sink.Load(ctx); err != nil {
 		t.Fatalf("refresh token was removed before successful provider revoke: %v", err)
 	}
 	revokeFail.Store(false)
-	removed, err := svc.LogoutAccount(ctx, "docker")
+	removed, err = svc.LogoutAccount(ctx, "docker")
 	if err != nil || !removed || revokeCalls.Load() != 2 {
 		t.Fatalf("logout removed=%t revoke calls=%d err=%v", removed, revokeCalls.Load(), err)
 	}
@@ -154,6 +160,166 @@ func TestDeviceAccountLoginStoresAndLogoutRevokesHostTokens(t *testing.T) {
 	removed, err = svc.LogoutAccount(ctx, "docker")
 	if err != nil || removed || revokeCalls.Load() != 2 {
 		t.Fatalf("second logout removed=%t revoke calls=%d err=%v", removed, revokeCalls.Load(), err)
+	}
+}
+
+func TestOpenAIOAuthLogoutDeletesLocallyBeforeBestEffortRevoke(t *testing.T) {
+	vault := &memoryOAuthVault{values: make(map[string]string)}
+	st, err := store.Open(context.Background(), t.TempDir()+"/openai-oauth-logout.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	svc.SetOAuthVault(vault)
+	revokedToken := ""
+	svc.SetOAuthProviders(map[string]OAuthProvider{"openai": {
+		RevokeToken: func(_ context.Context, token string) error {
+			revokedToken = token
+			return errors.New("synthetic provider unavailable")
+		},
+	}})
+	sink, err := oauthsession.NewVaultSink(vault, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Save(context.Background(), oauthsession.Tokens{AccessToken: "synthetic-access", RefreshToken: "synthetic-refresh", TokenType: "Bearer", ExpiresIn: 60}); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := svc.LogoutAccount(context.Background(), "openai")
+	if !removed || !errors.Is(err, ErrOAuthRevocationFailed) || revokedToken != "synthetic-refresh" {
+		t.Fatalf("logout removed=%t err=%v revoked=%q", removed, err, revokedToken)
+	}
+	if _, _, err := sink.Load(context.Background()); !errors.Is(err, oauthsession.ErrNoTokens) {
+		t.Fatalf("local credentials remained after provider revoke failure: %v", err)
+	}
+}
+
+func TestDockerDevicePartialPATSaveCanBeCleanedByLogout(t *testing.T) {
+	ctx := context.Background()
+	vault := &registrySetFaultVault{memoryOAuthVault: &memoryOAuthVault{values: make(map[string]string)}, failSetNumber: 2}
+	registryStore, err := registrycredentials.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patTransport := dockerPATRoundTripper(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != "https://hub.example.test/pat" || req.Header.Get("Authorization") != "Bearer "+syntheticHubAccessToken() {
+			t.Fatalf("unexpected PAT request: %s %s", req.Method, req.URL)
+		}
+		return &http.Response{StatusCode: http.StatusCreated, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"data":{"token":"synthetic-partial-pat"}}`)), Request: req}, nil
+	})
+	oauthSink, err := oauthsession.NewVaultSink(vault, "docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := dockerAccountSink{oauth: oauthSink, registry: registryStore, provider: oauthsession.DeviceProvider{
+		PATEndpoint: "https://hub.example.test/pat", Transport: patTransport,
+	}}
+	tokens := oauthsession.Tokens{AccessToken: syntheticHubAccessToken(), TokenType: "Bearer", ExpiresIn: 60}
+	if err := sink.Save(ctx, tokens); !errors.Is(err, oauthsession.ErrOAuthPartialLogin) {
+		t.Fatalf("partial registry write error = %v, want ErrOAuthPartialLogin", err)
+	}
+	if _, _, err := oauthSink.Load(ctx); err != nil {
+		t.Fatalf("OAuth token was not retained for cleanup: %v", err)
+	}
+	partialCredential, err := registryStore.Load(ctx, "docker.io", registrycredentials.ScopeHostOnly, "")
+	if err != nil {
+		t.Fatalf("first successful scoped credential was not stored: %v", err)
+	}
+	clear(partialCredential.Password)
+	if _, err := registryStore.Load(ctx, "docker.io", registrycredentials.ScopeAllSandboxes, ""); !errors.Is(err, registrycredentials.ErrNotFound) {
+		t.Fatalf("failed second-scope write unexpectedly exists: %v", err)
+	}
+	if _, err := oauthSink.DockerHubPATFingerprint(ctx); err != nil {
+		t.Fatalf("PAT ownership marker was not stored before scoped writes: %v", err)
+	}
+
+	st, err := store.Open(ctx, t.TempDir()+"/docker-partial-oauth.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	svc.SetOAuthVault(vault)
+	svc.SetRegistryCredentialStore(registryStore)
+	removed, err := svc.LogoutAccount(ctx, "docker")
+	if err != nil || !removed {
+		t.Fatalf("logout did not clean partial login: removed=%t err=%v", removed, err)
+	}
+	if _, _, err := oauthSink.Load(ctx); !errors.Is(err, oauthsession.ErrNoTokens) {
+		t.Fatalf("OAuth token remained after partial-login cleanup: %v", err)
+	}
+	if _, err := oauthSink.DockerHubPATFingerprint(ctx); !errors.Is(err, oauthsession.ErrNoCredentialFingerprint) {
+		t.Fatalf("PAT ownership marker remained after cleanup: %v", err)
+	}
+	if _, err := registryStore.Load(ctx, "docker.io", registrycredentials.ScopeHostOnly, ""); !errors.Is(err, registrycredentials.ErrNotFound) {
+		t.Fatalf("partially written scoped PAT remained after cleanup: %v", err)
+	}
+}
+
+type registrySetFaultVault struct {
+	*memoryOAuthVault
+	registrySets  int
+	failSetNumber int
+}
+
+func (v *registrySetFaultVault) Set(ctx context.Context, service, account, value string) error {
+	if service == "com.rheic.registry-credentials.v1" {
+		v.registrySets++
+		if v.registrySets == v.failSetNumber {
+			return errors.New("synthetic keychain write failure")
+		}
+	}
+	return v.memoryOAuthVault.Set(ctx, service, account, value)
+}
+
+func TestOpenAIOAuthProxyUsesHostTokenManager(t *testing.T) {
+	ctx := context.Background()
+	vault := &memoryOAuthVault{values: make(map[string]string)}
+	sink, err := oauthsession.NewVaultSink(vault, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Save(ctx, oauthsession.Tokens{AccessToken: "synthetic-expiring-access", RefreshToken: "synthetic-refresh", TokenType: "Bearer", ExpiresIn: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var refreshCalls atomic.Int32
+	transport := dockerPATRoundTripper(func(req *http.Request) (*http.Response, error) {
+		refreshCalls.Add(1)
+		if req.Method != http.MethodPost || req.URL.String() != "https://auth.fixture/oauth/token" {
+			t.Errorf("unexpected refresh request %s %s", req.Method, req.URL)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"synthetic-refreshed-access","refresh_token":"synthetic-rotated-refresh","token_type":"Bearer","expires_in":300}`)), Request: req}, nil
+	})
+	st, err := store.Open(ctx, t.TempDir()+"/oauth-proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	svc.SetOAuthVault(vault)
+	svc.SetOAuthProviders(map[string]OAuthProvider{"openai": {Config: oauthsession.Provider{
+		TokenEndpoint: "https://auth.fixture/oauth/token", ClientID: "synthetic-client", Transport: transport,
+	}}})
+	contract, ok := proxyContract("openai-oauth")
+	if !ok || contract.credentialEnv != "OPENAI_API_KEY" || contract.upstreamHost != "api.openai.com" {
+		t.Fatalf("OAuth proxy contract=%+v ok=%t", contract, ok)
+	}
+	route, runtimeRoute, err := svc.buildOAuthProxyRoute(ctx, sandbox.Sandbox{ID: "sandbox-oauth-proxy", Name: "oauth-proxy"}, contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(route.Secret)
+	if runtimeRoute != "openai-oauth=api.openai.com:3128" || route.Service.Credential == nil || route.Secret != nil {
+		t.Fatalf("OAuth route=%+v runtime=%q", route, runtimeRoute)
+	}
+	credential, err := route.Service.Credential(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(credential)
+	if string(credential) != "synthetic-refreshed-access" || refreshCalls.Load() != 1 {
+		t.Fatalf("OAuth credential=%q refresh calls=%d", credential, refreshCalls.Load())
 	}
 }
 
