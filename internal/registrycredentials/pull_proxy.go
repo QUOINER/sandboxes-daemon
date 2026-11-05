@@ -39,6 +39,7 @@ type PullProxy struct {
 	stateMu           sync.Mutex
 	tokens            map[string]tokenGrant
 	uploads           map[string]uploadSession
+	blobRedirects     map[string]blobRedirectSession
 }
 
 type tokenGrant struct {
@@ -53,6 +54,14 @@ type uploadSession struct {
 	id           string
 	location     *url.URL
 	expiresAt    time.Time
+}
+
+// blobRedirectSession binds guest CDN requests to a URL returned by the
+// trusted registry. A small use budget permits Docker range retries while
+// preventing the CDN endpoint from becoming a general-purpose proxy.
+type blobRedirectSession struct {
+	usesLeft  int
+	expiresAt time.Time
 }
 
 // PullProxyTransportFactory creates host-only HTTPS transports for the
@@ -108,7 +117,8 @@ func NewPullProxy(store *Store, cfg PullProxyConfig) (*PullProxy, error) {
 		service: cfg.Service, realms: append([]registryauth.Realm(nil), cfg.Realms...), registryTransport: cfg.RegistryTransport,
 		tokenTransport: cfg.TokenTransport, transportFactory: cfg.TransportFactory, limiter: cfg.Limiter,
 		maxBytes: cfg.MaxBytes, inflight: make(chan struct{}, 4), tlsAuthority: cfg.TLSAuthority,
-		tunnelSlots: make(chan struct{}, 8), tokens: make(map[string]tokenGrant), uploads: make(map[string]uploadSession)}, nil
+		tunnelSlots: make(chan struct{}, 8), tokens: make(map[string]tokenGrant), uploads: make(map[string]uploadSession),
+		blobRedirects: make(map[string]blobRedirectSession)}, nil
 }
 
 func validPullProxyConfig(store *Store, cfg PullProxyConfig) bool {
