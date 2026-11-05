@@ -60,6 +60,7 @@ type Service struct {
 	proxyTempDir         string
 	oauthProviders       map[string]OAuthProvider
 	oauthVaultStore      oauthsession.Vault
+	oauthRefresh         *oauthsession.RefreshCoordinator
 	dockerHubAuth        http.RoundTripper
 	DefaultImage         string
 	DefaultCPUs          uint32
@@ -85,6 +86,7 @@ type OAuthProvider struct {
 	Config         oauthsession.Provider
 	Device         oauthsession.DeviceProvider
 	RevokeEndpoint string
+	RevokeToken    func(context.Context, string) error
 	OpenBrowser    func(context.Context, string) error
 	DeviceHandoff  func(context.Context, string, string) error
 }
@@ -95,6 +97,14 @@ func (s *Service) SetOAuthProviders(providers map[string]OAuthProvider) {
 	for name := range providers {
 		provider := providers[name]
 		provider.Config.Scopes = append([]string(nil), provider.Config.Scopes...)
+		provider.Config.CallbackPorts = append([]uint16(nil), provider.Config.CallbackPorts...)
+		if provider.Config.AuthorizationParams != nil {
+			params := make(map[string]string, len(provider.Config.AuthorizationParams))
+			for key, value := range provider.Config.AuthorizationParams {
+				params[key] = value
+			}
+			provider.Config.AuthorizationParams = params
+		}
 		provider.Device.Scopes = append([]string(nil), provider.Device.Scopes...)
 		copyOf[name] = provider
 	}
@@ -127,7 +137,7 @@ func (s *Service) LoginAccount(ctx context.Context, name string) error {
 		return err
 	}
 	if provider.Device.ClientID != "" {
-		return s.authorizeDeviceAccount(ctx, provider, sink)
+		return s.authorizeDeviceAccount(ctx, &provider, sink)
 	}
 	if provider.OpenBrowser == nil || provider.Config.Transport == nil {
 		return ErrOAuthProviderUnavailable
@@ -176,7 +186,7 @@ func (s *Service) BeginDeviceAccountLogin(ctx context.Context, name string) (oau
 	}
 	defer release()
 	provider, ok := s.oauthProviders[name]
-	if !ok || provider.Device.ClientID == "" || !deviceProviderReady(provider) || s.registryCredentials == nil {
+	if !ok || provider.Device.ClientID == "" || !deviceProviderReady(&provider) || s.registryCredentials == nil {
 		return oauthsession.DeviceAuthorization{}, ErrOAuthProviderUnavailable
 	}
 	sink, err := oauthsession.NewVaultSink(s.oauthVault(), name)
@@ -202,7 +212,7 @@ func (s *Service) CompleteDeviceAccountLogin(ctx context.Context, name string, a
 	}
 	defer release()
 	provider, ok := s.oauthProviders[name]
-	if !ok || provider.Device.ClientID == "" || !deviceProviderReady(provider) {
+	if !ok || provider.Device.ClientID == "" || !deviceProviderReady(&provider) {
 		return ErrOAuthProviderUnavailable
 	}
 	sink, err := oauthsession.NewVaultSink(s.oauthVault(), name)
@@ -212,10 +222,10 @@ func (s *Service) CompleteDeviceAccountLogin(ctx context.Context, name string, a
 	if err := s.checkAccountLoginAvailable(ctx, name, sink); err != nil {
 		return err
 	}
-	return s.completeDeviceAccount(ctx, provider, sink, authorization)
+	return s.completeDeviceAccount(ctx, &provider, sink, authorization)
 }
 
-func deviceProviderReady(provider OAuthProvider) bool {
+func deviceProviderReady(provider *OAuthProvider) bool {
 	return provider.DeviceHandoff != nil && provider.Device.PATEndpoint != "" &&
 		provider.Device.Transport != nil && sameIssuerDeviceProvider(provider.Device) &&
 		oauthsession.SameHTTPSOrigin(provider.Device.Audience, provider.Device.PATEndpoint)
@@ -237,7 +247,7 @@ func (s *Service) checkAccountLoginAvailable(ctx context.Context, name string, s
 	return nil
 }
 
-func (s *Service) authorizeDeviceAccount(ctx context.Context, provider OAuthProvider, sink *oauthsession.VaultSink) error {
+func (s *Service) authorizeDeviceAccount(ctx context.Context, provider *OAuthProvider, sink *oauthsession.VaultSink) error {
 	if !deviceProviderReady(provider) || s.registryCredentials == nil {
 		return ErrOAuthProviderUnavailable
 	}
@@ -245,7 +255,7 @@ func (s *Service) authorizeDeviceAccount(ctx context.Context, provider OAuthProv
 	return oauthsession.AuthorizeDevice(ctx, provider.Device, provider.DeviceHandoff, combined)
 }
 
-func (s *Service) completeDeviceAccount(ctx context.Context, provider OAuthProvider, sink *oauthsession.VaultSink, authorization oauthsession.DeviceAuthorization) error {
+func (s *Service) completeDeviceAccount(ctx context.Context, provider *OAuthProvider, sink *oauthsession.VaultSink, authorization oauthsession.DeviceAuthorization) error {
 	if !deviceProviderReady(provider) || s.registryCredentials == nil {
 		return ErrOAuthProviderUnavailable
 	}
@@ -274,8 +284,19 @@ func (s *Service) LogoutAccount(ctx context.Context, name string) (bool, error) 
 		return false, err
 	}
 	if !hasTokens && !hasFingerprint {
+		if err := s.revokeOAuthProxy(name); err != nil {
+			return false, fmt.Errorf("revoke active OAuth proxy: %w", err)
+		}
 		return false, nil
 	}
+	provider := s.oauthProviders[name]
+	if hasTokens && tokens.RefreshToken != "" && provider.RevokeToken != nil {
+		return s.revokeAndDeleteAccountTokens(ctx, name, sink, tokens, provider.RevokeToken)
+	}
+	return s.logoutAccountCredential(ctx, name, sink, tokens, hasTokens, fingerprint, hasFingerprint)
+}
+
+func (s *Service) logoutAccountCredential(ctx context.Context, name string, sink *oauthsession.VaultSink, tokens oauthsession.Tokens, hasTokens bool, fingerprint string, hasFingerprint bool) (bool, error) {
 	var revokeErr error
 	if hasTokens && tokens.RefreshToken != "" {
 		revokeErr = s.revokeAccountRefreshToken(ctx, name, tokens.RefreshToken)
@@ -286,6 +307,9 @@ func (s *Service) LogoutAccount(ctx context.Context, name string) (bool, error) 
 	if err := deleteAccountTokens(ctx, sink, hasTokens); err != nil {
 		return false, err
 	}
+	if err := s.revokeOAuthProxy(name); err != nil {
+		return true, fmt.Errorf("revoke active OAuth proxy: %w", err)
+	}
 	if hasFingerprint {
 		if err := s.removeOAuthOwnedDockerHubCredentials(ctx, fingerprint); err != nil {
 			return true, err
@@ -295,6 +319,36 @@ func (s *Service) LogoutAccount(ctx context.Context, name string) (bool, error) 
 		}
 	}
 	return true, revokeErr
+}
+
+func (s *Service) revokeAndDeleteAccountTokens(ctx context.Context, name string, sink *oauthsession.VaultSink, tokens oauthsession.Tokens, revoke func(context.Context, string) error) (bool, error) {
+	// Delete host credentials before network I/O so provider failure cannot leave
+	// the sandbox credential available for another run.
+	if err := deleteAccountTokens(ctx, sink, true); err != nil {
+		return false, err
+	}
+	proxyErr := s.revokeOAuthProxy(name)
+	if err := revoke(ctx, tokens.RefreshToken); err != nil {
+		return true, errors.Join(ErrOAuthRevocationFailed, proxyErr)
+	}
+	if proxyErr != nil {
+		return true, fmt.Errorf("revoke active OAuth proxy: %w", proxyErr)
+	}
+	return true, nil
+}
+
+func (s *Service) revokeOAuthProxy(name string) error {
+	if s.secretProxies == nil {
+		return nil
+	}
+	switch name {
+	case openAIServiceName:
+		return s.secretProxies.RevokeSecret(openAIOAuthRoute, "", "global-oauth")
+	case dockerAccountProvider:
+		return s.secretProxies.RevokeSecret(dockerHubProxyService, "", string(registrycredentials.ScopeAllSandboxes))
+	default:
+		return nil
+	}
 }
 
 func loadAccountTokens(ctx context.Context, sink *oauthsession.VaultSink) (oauthsession.Tokens, bool, error) {
@@ -360,8 +414,14 @@ func (s *Service) removeCredentialIfFingerprintMatches(ctx context.Context, scop
 
 func (s *Service) revokeAccountRefreshToken(ctx context.Context, name, refreshToken string) error {
 	provider, configured := s.oauthProviders[name]
-	if !configured || provider.RevokeEndpoint == "" {
+	if !configured || provider.RevokeEndpoint == "" && provider.RevokeToken == nil {
 		return ErrOAuthRevocationUnavailable
+	}
+	if provider.RevokeToken != nil {
+		if err := provider.RevokeToken(ctx, refreshToken); err != nil {
+			return ErrOAuthRevocationFailed
+		}
+		return nil
 	}
 	transport, clientID := provider.Config.Transport, provider.Config.ClientID
 	if provider.Device.Transport != nil {
@@ -453,6 +513,16 @@ func (s *Service) SetSecretProxyRuntime(helperPath, tempDir string) {
 
 // SetServiceSecret stores one service secret and a non-secret index entry.
 func (s *Service) SetServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string, value []byte) (servicesecrets.Summary, error) {
+	return s.storeServiceSecret(ctx, service, scope, sandboxName, value, false)
+}
+
+// CreateServiceSecret stores a service secret only if its host-vault key is absent.
+// The check and write share the daemon's per-credential gate.
+func (s *Service) CreateServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string, value []byte) (servicesecrets.Summary, error) {
+	return s.storeServiceSecret(ctx, service, scope, sandboxName, value, true)
+}
+
+func (s *Service) storeServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string, value []byte, createOnly bool) (servicesecrets.Summary, error) {
 	defer clear(value)
 	if s.serviceSecrets == nil {
 		return servicesecrets.Summary{}, errors.New("service secret store is unavailable")
@@ -462,6 +532,16 @@ func (s *Service) SetServiceSecret(ctx context.Context, service string, scope se
 		return servicesecrets.Summary{}, err
 	}
 	defer release()
+	if createOnly {
+		existing, loadErr := s.serviceSecrets.Load(ctx, service, scope, sandboxName)
+		if loadErr == nil {
+			clear(existing)
+			return servicesecrets.Summary{}, servicesecrets.ErrExists
+		}
+		if !errors.Is(loadErr, servicesecrets.ErrNotFound) {
+			return servicesecrets.Summary{}, fmt.Errorf("check existing service secret: %w", loadErr)
+		}
+	}
 	summary, err := s.serviceSecrets.Save(ctx, service, scope, sandboxName, value)
 	if err != nil {
 		return servicesecrets.Summary{}, err
@@ -696,13 +776,22 @@ func (s *Service) LogoutRegistry(ctx context.Context, registry string, scope reg
 		clear(loaded.Password)
 	}
 	removed, err := s.registryCredentials.Delete(ctx, registry, scope, sandboxName)
-	if err != nil || !removed {
+	if err != nil {
 		return removed, err
 	}
-	if err := s.store.DeleteRegistryCredentialIndex(ctx, canonical, string(scope), sandboxName); err != nil {
-		return true, err
+	var failures []error
+	if (strings.EqualFold(canonical, dockerHubRegistry) || strings.EqualFold(canonical, "index.docker.io")) && s.secretProxies != nil {
+		if err := s.secretProxies.RevokeSecret(dockerHubProxyService, sandboxName, string(scope)); err != nil {
+			failures = append(failures, fmt.Errorf("revoke active registry proxy: %w", err))
+		}
 	}
-	return true, nil
+	if !removed {
+		return false, errors.Join(failures...)
+	}
+	if err := s.store.DeleteRegistryCredentialIndex(ctx, canonical, string(scope), sandboxName); err != nil {
+		failures = append(failures, err)
+	}
+	return true, errors.Join(failures...)
 }
 
 // ListRegistryCredentials returns non-secret summaries of stored registry logins.
@@ -814,6 +903,7 @@ func New(st *store.Store, backend runtime.Backend) *Service {
 		DefaultMemoryMiB:    memoryMiB,
 		now:                 time.Now,
 		dockerHubAuth:       oauthsession.NewDockerHubAuthTransport(),
+		oauthRefresh:        oauthsession.NewRefreshCoordinator(),
 	}
 	for i := range s.createGates {
 		s.createGates[i] = make(chan struct{}, 1)

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 
 	localv1 "github.com/rheic/sandboxes-api/gen/go/sandboxes/local/v1"
 	"google.golang.org/grpc/codes"
@@ -33,6 +34,26 @@ func (s *SecretServer) Set(ctx context.Context, req *localv1.SecretServiceSetReq
 		return nil, err
 	}
 	return &localv1.SecretServiceSetResponse{Secret: &localv1.SecretSummary{
+		Service: summary.Service, Scope: string(summary.Scope), SandboxName: summary.SandboxName,
+	}}, nil
+}
+
+// Create stores a secret only when the requested scope is empty.
+func (s *SecretServer) Create(ctx context.Context, req *localv1.SecretServiceCreateRequest) (*localv1.SecretServiceCreateResponse, error) {
+	value := req.GetValue()
+	defer clear(value)
+	scope, err := parseSecretScope(req.GetScope())
+	if err != nil {
+		return nil, err
+	}
+	summary, err := s.svc.CreateServiceSecret(ctx, req.GetService(), scope, req.GetSandboxName(), value)
+	if errors.Is(err, servicesecrets.ErrExists) {
+		return nil, status.Error(codes.AlreadyExists, "service secret already exists; pass --force to replace it")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &localv1.SecretServiceCreateResponse{Secret: &localv1.SecretSummary{
 		Service: summary.Service, Scope: string(summary.Scope), SandboxName: summary.SandboxName,
 	}}, nil
 }

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -93,6 +94,74 @@ func TestUnixProxyChannelInjectsSecretAndRequiresToken(t *testing.T) {
 	}
 	if gotAuth != "Bearer s3cret" {
 		t.Fatal("unauthorized request reached upstream")
+	}
+}
+
+func TestUnixProxyResolvesOAuthCredentialOnHostAndFailsClosed(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	var credentialAvailable atomic.Bool
+	upstreamAuth := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		upstreamAuth <- r.Header.Get("Authorization")
+		if r.Header.Get("X-Api-Key") != "" {
+			t.Error("guest API key header reached upstream")
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	m := New()
+	defer func() { _ = m.Close() }()
+	dir, err := os.MkdirTemp("/tmp", "kqoauth-proxy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "proxy.sock")
+	token := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	service := Service{Upstream: upstream.URL, Header: "Authorization", Prefix: "Bearer ", Credential: func(context.Context) ([]byte, error) {
+		if !credentialAvailable.Load() {
+			return nil, errors.New("OAuth credential unavailable")
+		}
+		return []byte("synthetic-host-oauth-token"), nil
+	}}
+	if _, err := m.StartUnixRoutes(context.Background(), "oauth", map[string]RouteConfig{"openai-oauth": {
+		Service: service, Token: token,
+	}}, socket); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "unix", socket)
+	}}}
+	request := func() *http.Response {
+		req, reqErr := http.NewRequest(http.MethodGet, "http://upstream.test/v1/models", nil)
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		req.Header.Set(ServiceHeader, "openai-oauth")
+		req.Header.Set(TokenHeader, token)
+		req.Header.Set("Authorization", "Bearer rheic-proxy-placeholder")
+		req.Header.Set("X-Api-Key", "guest-controlled")
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		return resp
+	}
+
+	denied := request()
+	_ = denied.Body.Close()
+	if denied.StatusCode != http.StatusBadGateway || upstreamCalls.Load() != 0 {
+		t.Fatalf("missing OAuth credential status=%d upstream calls=%d", denied.StatusCode, upstreamCalls.Load())
+	}
+	credentialAvailable.Store(true)
+	allowed := request()
+	_ = allowed.Body.Close()
+	gotAuth := <-upstreamAuth
+	if allowed.StatusCode != http.StatusNoContent || upstreamCalls.Load() != 1 || gotAuth != "Bearer synthetic-host-oauth-token" {
+		t.Fatalf("OAuth proxy status=%d calls=%d upstream auth=%q", allowed.StatusCode, upstreamCalls.Load(), gotAuth)
 	}
 }
 

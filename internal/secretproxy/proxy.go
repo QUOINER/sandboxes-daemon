@@ -32,6 +32,7 @@ type Service struct {
 	Prefix          string
 	CredentialScope string
 	Authorize       func(context.Context) error
+	Credential      func(context.Context) ([]byte, error)
 }
 
 const (
@@ -337,8 +338,19 @@ func serveProxyRequest(w http.ResponseWriter, r *http.Request, p *proxy) {
 	r.Header.Del("Proxy-Authorization")
 	r.Header.Del("Authorization")
 	r.Header.Del("X-Api-Key")
+	credential := snapshot.secret
+	if snapshot.service.Credential != nil {
+		resolved, credentialErr := snapshot.service.Credential(r.Context())
+		if credentialErr != nil || len(resolved) == 0 {
+			clear(resolved)
+			http.Error(w, "proxy credential unavailable", http.StatusBadGateway)
+			return
+		}
+		credential = resolved
+		defer clear(credential)
+	}
 	if snapshot.service.Header != "" {
-		r.Header.Set(snapshot.service.Header, snapshot.service.Prefix+string(snapshot.secret))
+		r.Header.Set(snapshot.service.Header, snapshot.service.Prefix+string(credential))
 	}
 	r.Header.Set("X-Rheic-Secret-Proxy", service)
 	if snapshot.handler != nil {
@@ -474,10 +486,14 @@ func validateRouteConfigs(ctx context.Context, sandbox string, routes map[string
 	}
 	for name := range routes {
 		route := routes[name]
+<<<<<<< HEAD
 		if !validRouteConfig(name, route) {
+=======
+		if !validRouteConfig(name, route) {
+>>>>>>> 42c22db (feat: add host OpenAI OAuth broker)
 			return errors.New("invalid proxy service route")
 		}
-		if err := validUnixStart(ctx, sandbox, name, route.Secret, socketPath, route.Token, route.Handler != nil); err != nil {
+		if err := validUnixStart(ctx, sandbox, name, route.Secret, socketPath, route.Token, route.Handler != nil || route.Service.Credential != nil); err != nil {
 			return err
 		}
 		if _, err := parseUpstream(route.Service.Upstream); err != nil {
@@ -488,7 +504,7 @@ func validateRouteConfigs(ctx context.Context, sandbox string, routes map[string
 }
 
 func validRouteConfig(name string, route RouteConfig) bool {
-	if !validRouteName(name) || (route.Secret == nil && route.Handler == nil) || len(route.CACert) > 16<<10 {
+	if !validRouteName(name) || (route.Secret == nil && route.Handler == nil && route.Service.Credential == nil) || len(route.CACert) > 16<<10 {
 		return false
 	}
 	if len(route.CACert) != 0 && route.Handler == nil {

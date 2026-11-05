@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rheic/sandboxes-core/sandbox"
+
 	"github.com/rheic/sandboxes-daemon/internal/oauthsession"
 	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
 	"github.com/rheic/sandboxes-daemon/internal/store"
@@ -154,6 +156,88 @@ func TestDeviceAccountLoginStoresAndLogoutRevokesHostTokens(t *testing.T) {
 	removed, err = svc.LogoutAccount(ctx, "docker")
 	if err != nil || removed || revokeCalls.Load() != 2 {
 		t.Fatalf("second logout removed=%t revoke calls=%d err=%v", removed, revokeCalls.Load(), err)
+	}
+}
+
+func TestOpenAIOAuthLogoutDeletesLocallyBeforeBestEffortRevoke(t *testing.T) {
+	vault := &memoryOAuthVault{values: make(map[string]string)}
+	st, err := store.Open(context.Background(), t.TempDir()+"/openai-oauth-logout.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	svc.SetOAuthVault(vault)
+	revokedToken := ""
+	svc.SetOAuthProviders(map[string]OAuthProvider{"openai": {
+		RevokeToken: func(_ context.Context, token string) error {
+			revokedToken = token
+			return errors.New("synthetic provider unavailable")
+		},
+	}})
+	sink, err := oauthsession.NewVaultSink(vault, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Save(context.Background(), oauthsession.Tokens{AccessToken: "synthetic-access", RefreshToken: "synthetic-refresh", TokenType: "Bearer", ExpiresIn: 60}); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := svc.LogoutAccount(context.Background(), "openai")
+	if !removed || !errors.Is(err, ErrOAuthRevocationFailed) || revokedToken != "synthetic-refresh" {
+		t.Fatalf("logout removed=%t err=%v revoked=%q", removed, err, revokedToken)
+	}
+	if _, _, err := sink.Load(context.Background()); !errors.Is(err, oauthsession.ErrNoTokens) {
+		t.Fatalf("local credentials remained after provider revoke failure: %v", err)
+	}
+}
+
+func TestOpenAIOAuthProxyUsesHostTokenManager(t *testing.T) {
+	ctx := context.Background()
+	vault := &memoryOAuthVault{values: make(map[string]string)}
+	sink, err := oauthsession.NewVaultSink(vault, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Save(ctx, oauthsession.Tokens{AccessToken: "synthetic-expiring-access", RefreshToken: "synthetic-refresh", TokenType: "Bearer", ExpiresIn: 1}); err != nil {
+		t.Fatal(err)
+	}
+	var refreshCalls atomic.Int32
+	transport := dockerPATRoundTripper(func(req *http.Request) (*http.Response, error) {
+		refreshCalls.Add(1)
+		if req.Method != http.MethodPost || req.URL.String() != "https://auth.fixture/oauth/token" {
+			t.Errorf("unexpected refresh request %s %s", req.Method, req.URL)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"synthetic-refreshed-access","refresh_token":"synthetic-rotated-refresh","token_type":"Bearer","expires_in":300}`)), Request: req}, nil
+	})
+	st, err := store.Open(ctx, t.TempDir()+"/oauth-proxy.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	svc.SetOAuthVault(vault)
+	svc.SetOAuthProviders(map[string]OAuthProvider{"openai": {Config: oauthsession.Provider{
+		TokenEndpoint: "https://auth.fixture/oauth/token", ClientID: "synthetic-client", Transport: transport,
+	}}})
+	contract, ok := proxyContract("openai-oauth")
+	if !ok || contract.credentialEnv != "OPENAI_API_KEY" || contract.upstreamHost != "api.openai.com" {
+		t.Fatalf("OAuth proxy contract=%+v ok=%t", contract, ok)
+	}
+	route, runtimeRoute, err := svc.buildOAuthProxyRoute(ctx, sandbox.Sandbox{ID: "sandbox-oauth-proxy", Name: "oauth-proxy"}, contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(route.Secret)
+	if runtimeRoute != "openai-oauth=api.openai.com:3128" || route.Service.Credential == nil || route.Secret != nil {
+		t.Fatalf("OAuth route=%+v runtime=%q", route, runtimeRoute)
+	}
+	credential, err := route.Service.Credential(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(credential)
+	if string(credential) != "synthetic-refreshed-access" || refreshCalls.Load() != 1 {
+		t.Fatalf("OAuth credential=%q refresh calls=%d", credential, refreshCalls.Load())
 	}
 }
 

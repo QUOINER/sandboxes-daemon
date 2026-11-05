@@ -87,6 +87,9 @@ func (m *TokenManager) AccessToken(ctx context.Context) (string, error) {
 	if updated.RefreshToken == "" {
 		updated.RefreshToken = tokens.RefreshToken
 	}
+	if updated.IDToken == "" {
+		updated.IDToken = tokens.IDToken
+	}
 	if err := m.sink.Save(ctx, updated); err != nil {
 		return "", err
 	}

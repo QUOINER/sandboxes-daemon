@@ -180,6 +180,7 @@ func cancelableOutputs(req runtime.ExecRequest) bool {
 const (
 	secretRefPrefix = "${secret:"
 	proxyRefPrefix  = "${proxy:"
+	oauthRefPrefix  = "${oauth:"
 )
 
 // resolveSecretEnv expands whole-value "${secret:service}" references from the
@@ -210,7 +211,7 @@ func (s *Service) resolveSecretEnv(ctx context.Context, sb sandbox.Sandbox, env 
 }
 
 func (s *Service) resolveEnvEntry(ctx context.Context, sb sandbox.Sandbox, key, value string) (string, string, error) {
-	if strings.Contains(value, proxyRefPrefix) {
+	if strings.Contains(value, proxyRefPrefix) || strings.Contains(value, oauthRefPrefix) {
 		return s.resolveProxyEnvEntry(ctx, sb, key, value)
 	}
 	if strings.HasPrefix(value, secretRefPrefix) {
@@ -221,10 +222,13 @@ func (s *Service) resolveEnvEntry(ctx context.Context, sb sandbox.Sandbox, key, 
 }
 
 func (s *Service) resolveProxyEnvEntry(ctx context.Context, sb sandbox.Sandbox, key, value string) (string, string, error) {
-	if !strings.HasPrefix(value, proxyRefPrefix) || !strings.HasSuffix(value, "}") || strings.Count(value, proxyRefPrefix) != 1 {
-		return "", "", fmt.Errorf("%w: invalid proxy reference for %s", core.ErrConflict, key)
+	name, isProxyRef, err := parseProxyEnvReference(key, value)
+	if err != nil || !isProxyRef {
+		if err == nil {
+			err = fmt.Errorf("%w: invalid proxy reference for %s", core.ErrConflict, key)
+		}
+		return "", "", err
 	}
-	name := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(value, proxyRefPrefix), "}"))
 	contract, ok := proxyContract(name)
 	if !ok || key != contract.credentialEnv {
 		return "", "", fmt.Errorf("%w: proxy reference is not supported for %s", core.ErrConflict, key)

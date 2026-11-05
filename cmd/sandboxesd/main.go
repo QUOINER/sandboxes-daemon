@@ -135,13 +135,27 @@ func dockerOAuthProviders() map[string]service.OAuthProvider {
 		slog.Error("Docker Hub OAuth provider configuration is invalid", "error", err)
 		return nil
 	}
-	return map[string]service.OAuthProvider{"docker": {
-		Device:         provider,
-		RevokeEndpoint: oauthsession.DockerOAuthRevokeURL,
-		DeviceHandoff: func(ctx context.Context, _ string, verificationURI string) error {
-			return oauthsession.OpenBrowser(ctx, verificationURI)
+	openai, err := oauthsession.NewOpenAICodexProvider(http.DefaultTransport)
+	if err != nil {
+		slog.Error("OpenAI OAuth provider configuration is invalid", "error", err)
+		return nil
+	}
+	return map[string]service.OAuthProvider{
+		"docker": {
+			Device:         provider,
+			RevokeEndpoint: oauthsession.DockerOAuthRevokeURL,
+			DeviceHandoff: func(ctx context.Context, _ string, verificationURI string) error {
+				return oauthsession.OpenBrowser(ctx, verificationURI)
+			},
 		},
-	}}
+		"openai": {
+			Config: openai,
+			RevokeToken: func(ctx context.Context, token string) error {
+				return oauthsession.RevokeOpenAI(ctx, openai.Transport, token)
+			},
+			OpenBrowser: oauthsession.OpenBrowser,
+		},
+	}
 }
 
 func buildBackend(opts *options, gatewayLost chan<- string) (runtime.Backend, func() error, error) {
