@@ -99,6 +99,16 @@ The broker refuses to replace an existing socket path and requires a private
 parent directory owned by the daemon user. The value is not written to SQLite
 or sandbox metadata.
 
+Service records can also hold a fixed `op://` or AWS Secrets Manager reference,
+or an explicitly supplied host-shell command. The daemon resolves these sources
+only when the proxy needs a credential, caches successful values according to
+the source refresh policy, and keeps source text and resolved values out of
+SQLite and guest state. Host commands run as the daemon user and are not
+confined from host files; use only trusted commands and keep their helpers and
+the temporary directory outside writable sandbox mounts. The implementation
+is on an unpublished feature branch and has not received provider/runtime or
+independent security review.
+
 Global network rules are stored as daemon settings, merged with each sandbox's
 explicit rules at gateway start/update, and re-applied to running sandboxes on
 mutation. Deny wins across scopes. Domain rules require `--dns-upstream` and a

@@ -1386,6 +1386,56 @@ func TestServiceProxyAddressAuthorizerAppliesCIDRDenyRules(t *testing.T) {
 	}
 }
 
+func TestDynamicServiceSecretProxyResolvesOnHostAndDoesNotUseSourceAsCredential(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "dynamic-service-secret.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	op, err := svc.Create(ctx, CreateRequest{Name: "dynamic-service-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vault, err := servicesecrets.NewStore(&fakeServiceSecretVault{items: make(map[string]string)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetServiceSecretStore(vault)
+	command := "printf synthetic-proxy-key"
+	if goruntime.GOOS == "windows" {
+		command = "echo synthetic-proxy-key"
+	}
+	if _, err := svc.SetServiceSecretSource(ctx, "openai", servicesecrets.ScopeGlobal, "", servicesecrets.Source{
+		Command: command, NoVerify: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sandboxRecord, err := st.Get(ctx, op.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, _, err := svc.buildProxyRoute(ctx, sandboxRecord, "openai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(route.Secret) != 0 {
+		t.Fatalf("dynamic source envelope was installed as route credential: %q", route.Secret)
+	}
+	if route.Service.Credential == nil {
+		t.Fatal("dynamic route has no host credential resolver")
+	}
+	value, err := route.Service.Credential(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(value)
+	if string(value) != "synthetic-proxy-key" {
+		t.Fatalf("resolved host credential=%q", value)
+	}
+}
+
 func TestCreatePassesPrivileged(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "priv.db"))
