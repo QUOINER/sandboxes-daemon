@@ -378,7 +378,7 @@ func TestStopAndDeleteSerializePerSandbox(t *testing.T) {
 	case <-backend.deleteCalled:
 		close(backend.stopRelease)
 		t.Fatal("delete reached runtime while stop was in progress")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
 	}
 	close(backend.stopRelease)
 	if err := <-stopDone; err != nil {
