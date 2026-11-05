@@ -1520,8 +1520,9 @@ func TestGlobalPolicyMergesIntoNewSandboxes(t *testing.T) {
 }
 
 type fakeServiceSecretVault struct {
-	mu    sync.Mutex
-	items map[string]string
+	mu        sync.Mutex
+	items     map[string]string
+	deleteErr error
 }
 
 func (f *fakeServiceSecretVault) Set(_ context.Context, service, account, secret string) error {
@@ -1544,6 +1545,9 @@ func (f *fakeServiceSecretVault) Get(_ context.Context, service, account string)
 func (f *fakeServiceSecretVault) Delete(_ context.Context, service, account string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	key := service + "/" + account
 	if _, ok := f.items[key]; !ok {
 		return servicesecrets.ErrNotFound
@@ -1661,7 +1665,15 @@ func TestRemoveServiceSecretCleansStaleIndexWithCanonicalScope(t *testing.T) {
 	}
 	svc := New(st, nil)
 	svc.SetServiceSecretStore(secretStore)
+	manager := secretproxy.New()
+	svc.SetSecretProxyManager(manager)
+	t.Cleanup(func() { _ = manager.Close() })
 	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("synthetic-key")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.StartUnix(ctx, "dev", "openai", secretproxy.Service{
+		Upstream: "http://127.0.0.1:1", Header: "Authorization", CredentialScope: "global",
+	}, []byte("synthetic-key"), shortTestProxySocketPath(t), strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
 	}
 	if err := vault.Delete(ctx, "com.rheic.service-secrets.v1", "openai/global"); err != nil {
@@ -1671,10 +1683,76 @@ func TestRemoveServiceSecretCleansStaleIndexWithCanonicalScope(t *testing.T) {
 	if err != nil || removed {
 		t.Fatalf("stale-entry cleanup returned removed=%t err=%v", removed, err)
 	}
+	if manager.Has("dev", "openai") {
+		t.Fatal("canonical global removal left an active proxy route")
+	}
 	entries, err := svc.ListServiceSecrets(ctx)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("stale secret index remains: entries=%+v err=%v", entries, err)
 	}
+}
+
+func TestRemoveServiceSecretRevokesProxyBeforeVaultDelete(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "service-secret-remove-failure.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &fakeServiceSecretVault{items: make(map[string]string)}
+	secretStore, err := servicesecrets.NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := New(st, nil)
+	svc.SetServiceSecretStore(secretStore)
+	manager := secretproxy.New()
+	svc.SetSecretProxyManager(manager)
+	t.Cleanup(func() { _ = manager.Close() })
+	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "", []byte("synthetic-key")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.StartUnix(ctx, "dev", "openai", secretproxy.Service{
+		Upstream: "http://127.0.0.1:1", Header: "Authorization", CredentialScope: "global",
+	}, []byte("synthetic-key"), shortTestProxySocketPath(t), strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	deleteErr := errors.New("synthetic keychain delete failure")
+	vault.mu.Lock()
+	vault.deleteErr = deleteErr
+	vault.mu.Unlock()
+	removed, err := svc.RemoveServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "")
+	if removed || !errors.Is(err, deleteErr) {
+		t.Fatalf("failed vault deletion returned removed=%t err=%v", removed, err)
+	}
+	if manager.Has("dev", "openai") {
+		t.Fatal("active proxy remained usable after a failed secret removal")
+	}
+	entries, err := svc.ListServiceSecrets(ctx)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("metadata should remain for retry: entries=%+v err=%v", entries, err)
+	}
+	vault.mu.Lock()
+	vault.deleteErr = nil
+	vault.mu.Unlock()
+	removed, err = svc.RemoveServiceSecret(ctx, "openai", servicesecrets.ScopeGlobal, "")
+	if !removed || err != nil {
+		t.Fatalf("retry returned removed=%t err=%v", removed, err)
+	}
+	entries, err = svc.ListServiceSecrets(ctx)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("retry left metadata: entries=%+v err=%v", entries, err)
+	}
+}
+
+func shortTestProxySocketPath(t *testing.T) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("/tmp", "rheic-rm-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(directory) })
+	return filepath.Join(directory, "proxy.sock")
 }
 
 func TestSetServiceSecretRollsBackVaultWhenIndexWriteFails(t *testing.T) {

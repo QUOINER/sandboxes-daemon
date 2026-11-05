@@ -612,9 +612,6 @@ func (s *Service) ListServiceSecrets(ctx context.Context) ([]servicesecrets.Summ
 
 // RemoveServiceSecret deletes one service secret from the host keychain.
 func (s *Service) RemoveServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string) (bool, error) {
-	if s.serviceSecrets == nil {
-		return false, errors.New("service secret store is unavailable")
-	}
 	service = strings.ToLower(strings.TrimSpace(service))
 	if scope == "" {
 		scope = servicesecrets.ScopeGlobal
@@ -625,19 +622,25 @@ func (s *Service) RemoveServiceSecret(ctx context.Context, service string, scope
 		return false, err
 	}
 	defer release()
-	removed, err := s.serviceSecrets.Delete(ctx, service, scope, sandboxName)
-	if err != nil {
-		return removed, err
-	}
+	var failures []error
 	if s.secretProxies != nil {
 		if err := s.secretProxies.RevokeSecret(service, sandboxName, string(scope)); err != nil {
-			return removed, fmt.Errorf("revoke active service proxy: %w", err)
+			failures = append(failures, fmt.Errorf("revoke active service proxy: %w", err))
 		}
 	}
-	if err := s.store.DeleteServiceSecretIndex(ctx, service, string(scope), sandboxName); err != nil {
-		return removed, err
+	if s.serviceSecrets == nil {
+		failures = append(failures, errors.New("service secret store is unavailable"))
+		return false, errors.Join(failures...)
 	}
-	return removed, nil
+	removed, err := s.serviceSecrets.Delete(ctx, service, scope, sandboxName)
+	if err != nil {
+		failures = append(failures, err)
+		return removed, errors.Join(failures...)
+	}
+	if err := s.store.DeleteServiceSecretIndex(ctx, service, string(scope), sandboxName); err != nil {
+		failures = append(failures, err)
+	}
+	return removed, errors.Join(failures...)
 }
 
 func serviceSecretGateKey(service string, scope servicesecrets.Scope, sandboxName string) string {
