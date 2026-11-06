@@ -2211,3 +2211,67 @@ func TestStopSandboxByNameStopsRunningSandbox(t *testing.T) {
 		t.Fatalf("missing sandbox must be ignored: %v", err)
 	}
 }
+
+func TestRefreshPoliciesAppliesToRunningOnly(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	backend := &fakePolicyRuntime{}
+	svc := New(st, backend)
+	_, err = svc.Create(ctx, CreateRequest{Name: "running-policy-refresh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stoppedOp, err := svc.Create(ctx, CreateRequest{Name: "stopped-policy-refresh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Stop(ctx, stoppedOp.SandboxID); err != nil {
+		t.Fatal(err)
+	}
+	revisionBefore := backend.revision
+	applied, err := svc.RefreshPolicies(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("applied=%d, want 1", applied)
+	}
+	if backend.revision <= revisionBefore {
+		t.Fatalf("revision did not advance: %d -> %d", revisionBefore, backend.revision)
+	}
+}
+
+func TestResetGlobalPolicyClearsRulesAndProfile(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	backend := &fakePolicyRuntime{}
+	svc := New(st, backend)
+	if _, _, err := svc.MutateGlobalPolicy(ctx, "allow", sandbox.NetworkRule{Protocol: "tcp", CIDR: "192.0.2.0/24", Port: 443}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SetPolicyProfile(ctx, "balanced"); err != nil {
+		t.Fatal(err)
+	}
+	allow, deny, profile, err := svc.ResetGlobalPolicy(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(allow) != 0 || len(deny) != 0 {
+		t.Fatalf("rules not cleared: allow=%+v deny=%+v", allow, deny)
+	}
+	if profile != "deny-all" {
+		t.Fatalf("profile=%q, want deny-all", profile)
+	}
+	storedAllow, storedDeny, err := svc.GlobalPolicy(ctx)
+	if err != nil || len(storedAllow) != 0 || len(storedDeny) != 0 {
+		t.Fatalf("stored global policy not cleared: %+v %+v %v", storedAllow, storedDeny, err)
+	}
+}
