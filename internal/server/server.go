@@ -477,6 +477,25 @@ func (s *OperationServer) Wait(ctx context.Context, req *localv1.OperationServic
 	return &localv1.OperationServiceWaitResponse{Operation: toProtoOperation(op)}, nil
 }
 
+// RefreshPolicies re-applies effective policy to running sandboxes.
+func (s *SandboxServer) RefreshPolicies(ctx context.Context, _ *localv1.RefreshPoliciesRequest) (*localv1.RefreshPoliciesResponse, error) {
+	applied, err := s.svc.RefreshPolicies(ctx)
+	if err != nil {
+		return nil, err
+	}
+	//nolint:gosec // applied is a sandbox count bounded by the store page size.
+	return &localv1.RefreshPoliciesResponse{Applied: int32(applied)}, nil
+}
+
+// ResetGlobalPolicy clears custom global rules and restores the default profile.
+func (s *SandboxServer) ResetGlobalPolicy(ctx context.Context, _ *localv1.ResetGlobalPolicyRequest) (*localv1.ResetGlobalPolicyResponse, error) {
+	allow, deny, profile, err := s.svc.ResetGlobalPolicy(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &localv1.ResetGlobalPolicyResponse{Allow: toProtoRules(allow), Deny: toProtoRules(deny), Profile: profile}, nil
+}
+
 // GetPolicyProfile returns the global default profile for new sandboxes.
 func (s *SandboxServer) GetPolicyProfile(ctx context.Context, _ *localv1.GetPolicyProfileRequest) (*localv1.GetPolicyProfileResponse, error) {
 	profile, err := s.svc.GetPolicyProfile(ctx)

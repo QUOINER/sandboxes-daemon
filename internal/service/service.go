@@ -1913,6 +1913,59 @@ func (s *Service) MutateGlobalPolicy(ctx context.Context, action string, rule sa
 	return allow, deny, nil
 }
 
+// RefreshPolicies re-applies the effective policy to every running sandbox
+// immediately and returns how many accepted the refresh.
+func (s *Service) RefreshPolicies(ctx context.Context) (int, error) {
+	sandboxes, _, err := s.store.List(ctx, sandbox.ListOptions{PageSize: 1000})
+	if err != nil {
+		return 0, err
+	}
+	applied := 0
+	var failures []error
+	for i := range sandboxes {
+		sb := sandboxes[i]
+		if sb.State != sandbox.Running {
+			continue
+		}
+		if _, err := s.UpdatePolicy(ctx, sb.ID, policyAllow(sb.Policy), policyDeny(sb.Policy)); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		applied++
+	}
+	return applied, errors.Join(failures...)
+}
+
+// ResetGlobalPolicy removes all custom global rules and restores the default
+// profile. Running sandboxes keep their own rules; the cleared global policy
+// is applied to them live. Sandbox-scoped rules are not touched.
+func (s *Service) ResetGlobalPolicy(ctx context.Context) ([]sandbox.NetworkRule, []sandbox.NetworkRule, string, error) {
+	s.globalPolicyMu.Lock()
+	if err := s.store.DeleteSetting(ctx, globalAllowSetting); err != nil {
+		s.globalPolicyMu.Unlock()
+		return nil, nil, "", err
+	}
+	if err := s.store.DeleteSetting(ctx, globalDenySetting); err != nil {
+		s.globalPolicyMu.Unlock()
+		return nil, nil, "", err
+	}
+	if err := s.store.DeleteSetting(ctx, policyProfileSetting); err != nil {
+		s.globalPolicyMu.Unlock()
+		return nil, nil, "", err
+	}
+	s.globalPolicyMu.Unlock()
+	refreshErr := s.refreshRunningPolicies(ctx)
+	allow, deny, err := s.GlobalPolicy(ctx)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	profile, err := s.GetPolicyProfile(ctx)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return allow, deny, profile, refreshErr
+}
+
 // refreshRunningPolicies applies a changed global policy to running sandboxes.
 // A failed reload stops that sandbox rather than leaving old rules active.
 func (s *Service) refreshRunningPolicies(ctx context.Context) error {
