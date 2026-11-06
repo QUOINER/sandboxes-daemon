@@ -55,14 +55,15 @@ type ApprovalProvider interface {
 }
 
 type ApprovalRequest struct {
-	Action        string
-	ServerName    string
-	Command       string
-	Arguments     []string
-	Directory     string
-	SandboxID     string
-	ToolName      string
-	ToolArguments json.RawMessage
+	Action            string
+	ServerName        string
+	Command           string
+	ArgumentCount     int
+	Directory         string
+	SandboxID         string
+	ToolName          string
+	ToolArgumentKeys  []string
+	ToolArgumentBytes int
 }
 type Server struct {
 	Name             string   `json:"name"`
@@ -197,7 +198,7 @@ func (m *Manager) ApproveRegistration(ctx context.Context, id string) (*Summary,
 	if approver == nil {
 		return nil, errors.New("trusted MCP host approval provider is unavailable")
 	}
-	if err := approver.Approve(ctx, ApprovalRequest{Action: "register", ServerName: p.server.Name, Command: p.server.Command, Arguments: append([]string(nil), p.server.Arguments...), Directory: p.server.Directory}); err != nil {
+	if err := approver.Approve(ctx, ApprovalRequest{Action: "register", ServerName: p.server.Name, Command: p.server.Command, ArgumentCount: len(p.server.Arguments), Directory: p.server.Directory}); err != nil {
 		return nil, errors.New("MCP registration was denied or trusted approval failed")
 	}
 	if err := verifyExecutable(p.server); err != nil {
@@ -318,10 +319,15 @@ func (m *Manager) ApproveCall(ctx context.Context, id string, validateSandbox fu
 	if approver == nil {
 		return nil, errors.New("trusted MCP host approval provider is unavailable")
 	}
+	argumentKeys, err := jsonObjectKeys(p.arguments)
+	if err != nil {
+		return nil, errors.New("MCP tool arguments are invalid")
+	}
 	if err := approver.Approve(ctx, ApprovalRequest{
 		Action: "call", ServerName: p.server.Name, Command: p.server.Command,
-		Arguments: append([]string(nil), p.server.Arguments...), Directory: p.server.Directory,
-		SandboxID: p.sandbox, ToolName: p.tool, ToolArguments: append(json.RawMessage(nil), p.arguments...),
+		ArgumentCount: len(p.server.Arguments), Directory: p.server.Directory,
+		SandboxID: p.sandbox, ToolName: p.tool, ToolArgumentKeys: argumentKeys,
+		ToolArgumentBytes: len(p.arguments),
 	}); err != nil {
 		return nil, errors.New("MCP tool call was denied or trusted approval failed")
 	}
@@ -329,6 +335,19 @@ func (m *Manager) ApproveCall(ctx context.Context, id string, validateSandbox fu
 		return nil, errors.New("sandbox is no longer available for MCP")
 	}
 	return m.execute(ctx, p.server, p.tool, p.arguments)
+}
+
+func jsonObjectKeys(raw json.RawMessage) ([]string, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return nil, errors.New("MCP arguments must be a JSON object")
+	}
+	keys := make([]string, 0, len(object))
+	for key := range object {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return keys, nil
 }
 
 // Close terminates and reaps every host stdio process owned by this manager.
