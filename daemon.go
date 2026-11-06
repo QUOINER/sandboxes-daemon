@@ -104,6 +104,7 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	defer func() { _ = st.Close() }()
 
 	svc := service.New(st, cfg.Backend)
+	defer func() { runErr = errors.Join(runErr, svc.Close()) }()
 	credentialCleanup, err := configureService(ctx, cfg, svc)
 	if err != nil {
 		return err

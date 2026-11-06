@@ -58,6 +58,73 @@ func (s *SandboxServer) GetVersion(context.Context, *localv1.GetVersionRequest) 
 	}, nil
 }
 
+func (s *SandboxServer) ListMCPServers(ctx context.Context, req *localv1.ListMCPServersRequest) (*localv1.ListMCPServersResponse, error) {
+	servers, err := s.svc.ListMCPServers(ctx, req.GetSandboxId())
+	if err != nil {
+		return nil, mapError(err)
+	}
+	response := &localv1.ListMCPServersResponse{Servers: make([]*localv1.MCPServerSummary, 0, len(servers))}
+	for _, server := range servers {
+		response.Servers = append(response.Servers, &localv1.MCPServerSummary{Name: server.Name, Gateway: "local", Transport: "stdio", Loaded: server.Loaded, Usable: server.Usable})
+	}
+	return response, nil
+}
+
+func (s *SandboxServer) MCPRegisterServer(ctx context.Context, req *localv1.MCPRegisterServerRequest) (*localv1.MCPRegisterServerResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "MCP registration request is required")
+	}
+	id, err := s.svc.RegisterMCPServer(ctx, req.GetName(), req.GetCommand(), req.GetArguments(), req.GetWorkingDirectory())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	return &localv1.MCPRegisterServerResponse{ApprovalRequired: true, ApprovalId: id}, nil
+}
+
+func (s *SandboxServer) MCPApproveRegistration(ctx context.Context, req *localv1.MCPApproveRegistrationRequest) (*localv1.MCPApproveRegistrationResponse, error) {
+	if req == nil || req.GetApprovalId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "MCP approval ID is required")
+	}
+	server, err := s.svc.ApproveMCPRegistration(ctx, req.GetApprovalId())
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, "trusted MCP approval was unavailable, denied, or expired")
+	}
+	return &localv1.MCPApproveRegistrationResponse{Server: &localv1.MCPServerSummary{Name: server.Name, Gateway: "local", Transport: "stdio", Loaded: false, Usable: true}}, nil
+}
+
+func (s *SandboxServer) MCPRemoveServer(ctx context.Context, req *localv1.MCPRemoveServerRequest) (*localv1.MCPRemoveServerResponse, error) {
+	if req == nil || req.GetName() == "" {
+		return nil, status.Error(codes.InvalidArgument, "MCP server name is required")
+	}
+	removed, err := s.svc.RemoveMCPServer(ctx, req.GetName())
+	if err != nil {
+		return nil, status.Error(codes.Internal, "MCP registry update failed")
+	}
+	return &localv1.MCPRemoveServerResponse{Removed: removed}, nil
+}
+
+func (s *SandboxServer) MCPCall(ctx context.Context, req *localv1.MCPCallRequest) (*localv1.MCPCallResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "MCP call request is required")
+	}
+	id, err := s.svc.RequestMCPCall(ctx, req.GetSandboxId(), req.GetServerName(), req.GetToolName(), req.GetArgumentsJson())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	return &localv1.MCPCallResponse{ApprovalRequired: true, ApprovalId: id, ApprovalReason: "Execute host MCP tool " + req.GetServerName() + "." + req.GetToolName()}, nil
+}
+
+func (s *SandboxServer) MCPApproveCall(ctx context.Context, req *localv1.MCPApproveCallRequest) (*localv1.MCPApproveCallResponse, error) {
+	if req == nil || req.GetApprovalId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "MCP approval ID is required")
+	}
+	result, err := s.svc.ApproveMCPCall(ctx, req.GetApprovalId())
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, "trusted MCP approval was unavailable, denied, expired, or the tool call failed")
+	}
+	return &localv1.MCPApproveCallResponse{ResultJson: string(result)}, nil
+}
+
 // NewOperation creates an operation gRPC service.
 func NewOperation(svc *service.Service) *OperationServer { return &OperationServer{svc: svc} }
 
