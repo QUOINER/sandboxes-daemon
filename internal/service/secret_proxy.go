@@ -389,10 +389,32 @@ func (s *Service) buildProxyRoute(ctx context.Context, sb sandbox.Sandbox, name 
 	}
 	service := contractService(name)
 	service.CredentialScope = string(scope)
+	dynamic, err := s.serviceSecrets.IsDynamic(ctx, name, scope, secretScopeSandboxName(scope, sb.Name))
+	if err != nil {
+		clear(secret)
+		return secretproxy.RouteConfig{}, "", fmt.Errorf("inspect service credential source: %w", err)
+	}
+	if dynamic {
+		clear(secret)
+		service.Credential = func(ctx context.Context) ([]byte, error) {
+			return s.serviceSecrets.Resolve(ctx, name, scope, secretScopeSandboxName(scope, sb.Name))
+		}
+	}
 	service.Authorize = s.proxyPolicyAuthorizer(sb.ID, contract.upstreamHost)
 	service.AuthorizeAddress = s.proxyAddressAuthorizer(sb.ID, contract.upstreamHost)
-	return secretproxy.RouteConfig{Service: service, Secret: secret, Token: token},
+	routeSecret := secret
+	if dynamic {
+		routeSecret = nil
+	}
+	return secretproxy.RouteConfig{Service: service, Secret: routeSecret, Token: token},
 		fmt.Sprintf("%s=%s:%d", name, contract.upstreamHost, contract.guestPort), nil
+}
+
+func secretScopeSandboxName(scope servicesecrets.Scope, sandboxName string) string {
+	if scope == servicesecrets.ScopeSandbox {
+		return sandboxName
+	}
+	return ""
 }
 
 func (s *Service) buildOAuthProxyRoute(ctx context.Context, sb sandbox.Sandbox, contract proxyEnvContract) (secretproxy.RouteConfig, string, error) {

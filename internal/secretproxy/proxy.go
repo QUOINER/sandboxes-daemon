@@ -447,6 +447,17 @@ func (p *proxy) refreshSecret(service string, secret []byte) {
 	if route := p.routes[service]; route != nil {
 		clear(route.secret)
 		route.secret = append([]byte(nil), secret...)
+		route.service.Credential = nil
+	}
+	p.mu.Unlock()
+}
+
+func (p *proxy) refreshCredential(service string, credential func(context.Context) ([]byte, error)) {
+	p.mu.Lock()
+	if route := p.routes[service]; route != nil {
+		clear(route.secret)
+		route.secret = nil
+		route.service.Credential = credential
 	}
 	p.mu.Unlock()
 }
@@ -578,6 +589,29 @@ func (m *Manager) RefreshSecret(service, sandboxName, scope string, secret []byt
 	m.mu.Unlock()
 	for current := range selected {
 		current.refreshSecret(service, secret)
+	}
+}
+
+// RefreshCredential replaces the host-side credential callback for matching
+// active channels and clears any previously cached literal secret.
+func (m *Manager) RefreshCredential(service, sandboxName, scope string, credential func(context.Context) ([]byte, error)) {
+	m.mu.Lock()
+	selected := make(map[*proxy]struct{})
+	for key, current := range m.proxies {
+		if sandboxName != "" && key != sandboxName+"/"+service {
+			continue
+		}
+		if sandboxName == "" && !strings.HasSuffix(key, "/"+service) {
+			continue
+		}
+		currentScope, exists := current.routeScope(service)
+		if exists && (sandboxName != "" || currentScope == scope) {
+			selected[current] = struct{}{}
+		}
+	}
+	m.mu.Unlock()
+	for current := range selected {
+		current.refreshCredential(service, credential)
 	}
 }
 

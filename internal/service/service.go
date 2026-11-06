@@ -513,16 +513,27 @@ func (s *Service) SetSecretProxyRuntime(helperPath, tempDir string) {
 
 // SetServiceSecret stores one service secret and a non-secret index entry.
 func (s *Service) SetServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string, value []byte) (servicesecrets.Summary, error) {
-	return s.storeServiceSecret(ctx, service, scope, sandboxName, value, false)
+	return s.storeServiceSecret(ctx, service, scope, sandboxName, value, nil, false)
+}
+
+// SetServiceSecretSource stores a host-side dynamic source rather than a
+// credential value.
+func (s *Service) SetServiceSecretSource(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string, source servicesecrets.Source) (servicesecrets.Summary, error) {
+	return s.storeServiceSecret(ctx, service, scope, sandboxName, nil, &source, false)
 }
 
 // CreateServiceSecret stores a service secret only if its host-vault key is absent.
 // The check and write share the daemon's per-credential gate.
 func (s *Service) CreateServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string, value []byte) (servicesecrets.Summary, error) {
-	return s.storeServiceSecret(ctx, service, scope, sandboxName, value, true)
+	return s.storeServiceSecret(ctx, service, scope, sandboxName, value, nil, true)
 }
 
-func (s *Service) storeServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string, value []byte, createOnly bool) (servicesecrets.Summary, error) {
+// CreateServiceSecretSource stores a host-side dynamic source only if absent.
+func (s *Service) CreateServiceSecretSource(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string, source servicesecrets.Source) (servicesecrets.Summary, error) {
+	return s.storeServiceSecret(ctx, service, scope, sandboxName, nil, &source, true)
+}
+
+func (s *Service) storeServiceSecret(ctx context.Context, service string, scope servicesecrets.Scope, sandboxName string, value []byte, source *servicesecrets.Source, createOnly bool) (servicesecrets.Summary, error) {
 	defer clear(value)
 	if s.serviceSecrets == nil {
 		return servicesecrets.Summary{}, errors.New("service secret store is unavailable")
@@ -549,7 +560,12 @@ func (s *Service) storeServiceSecret(ctx context.Context, service string, scope 
 	if createOnly && hadPrevious {
 		return servicesecrets.Summary{}, servicesecrets.ErrExists
 	}
-	summary, err := s.serviceSecrets.Save(ctx, service, scope, sandboxName, value)
+	var summary servicesecrets.Summary
+	if source != nil {
+		summary, err = s.serviceSecrets.SaveSource(ctx, service, scope, sandboxName, *source)
+	} else {
+		summary, err = s.serviceSecrets.Save(ctx, service, scope, sandboxName, value)
+	}
 	if err != nil {
 		return servicesecrets.Summary{}, err
 	}
@@ -558,8 +574,8 @@ func (s *Service) storeServiceSecret(ctx context.Context, service string, scope 
 	}); err != nil {
 		return servicesecrets.Summary{}, errors.Join(err, s.rollbackServiceSecretAfterIndexFailure(ctx, summary, previous, hadPrevious))
 	}
-	if s.secretProxies != nil {
-		s.secretProxies.RefreshSecret(summary.Service, summary.SandboxName, string(summary.Scope), value)
+	if err := s.refreshActiveServiceSecret(ctx, summary, value); err != nil {
+		return servicesecrets.Summary{}, err
 	}
 	return summary, nil
 }
@@ -580,12 +596,32 @@ func (s *Service) rollbackServiceSecretAfterIndexFailure(ctx context.Context, su
 		return nil
 	}
 	if hadPrevious {
-		s.secretProxies.RefreshSecret(summary.Service, summary.SandboxName, string(summary.Scope), previous)
-		return nil
+		return s.refreshActiveServiceSecret(rollbackCtx, summary, previous)
 	}
 	if err := s.secretProxies.RevokeSecret(summary.Service, summary.SandboxName, string(summary.Scope)); err != nil {
 		return fmt.Errorf("revoke active service proxy after failed secret write: %w", err)
 	}
+	return nil
+}
+
+func (s *Service) refreshActiveServiceSecret(ctx context.Context, summary servicesecrets.Summary, value []byte) error {
+	if s.secretProxies == nil {
+		return nil
+	}
+	sandboxName := secretScopeSandboxName(summary.Scope, summary.SandboxName)
+	dynamic, err := s.serviceSecrets.IsDynamic(ctx, summary.Service, summary.Scope, sandboxName)
+	if err != nil {
+		revokeErr := s.secretProxies.RevokeSecret(summary.Service, summary.SandboxName, string(summary.Scope))
+		return errors.Join(fmt.Errorf("inspect updated service credential: %w", err), revokeErr)
+	}
+	if dynamic {
+		credential := func(ctx context.Context) ([]byte, error) {
+			return s.serviceSecrets.Resolve(ctx, summary.Service, summary.Scope, sandboxName)
+		}
+		s.secretProxies.RefreshCredential(summary.Service, summary.SandboxName, string(summary.Scope), credential)
+		return nil
+	}
+	s.secretProxies.RefreshSecret(summary.Service, summary.SandboxName, string(summary.Scope), value)
 	return nil
 }
 

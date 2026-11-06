@@ -29,7 +29,19 @@ func (s *SecretServer) Set(ctx context.Context, req *localv1.SecretServiceSetReq
 	if err != nil {
 		return nil, err
 	}
-	summary, err := s.svc.SetServiceSecret(ctx, req.GetService(), scope, req.GetSandboxName(), value)
+	var summary servicesecrets.Summary
+	if source := req.GetSource(); source != nil {
+		if len(value) != 0 {
+			return nil, status.Error(codes.InvalidArgument, "provide either a secret value or a secret source")
+		}
+		summary, err = s.svc.SetServiceSecretSource(ctx, req.GetService(), scope, req.GetSandboxName(), servicesecrets.Source{
+			Reference: source.GetReference(), Command: source.GetCommand(), Refresh: source.GetRefresh(),
+			NoVerify: source.GetNoVerify(), ShowError: source.GetShowError(),
+			OPAccount: source.GetOpAccount(), AWSProfile: source.GetAwsProfile(),
+		})
+	} else {
+		summary, err = s.svc.SetServiceSecret(ctx, req.GetService(), scope, req.GetSandboxName(), value)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +58,19 @@ func (s *SecretServer) Create(ctx context.Context, req *localv1.SecretServiceCre
 	if err != nil {
 		return nil, err
 	}
-	summary, err := s.svc.CreateServiceSecret(ctx, req.GetService(), scope, req.GetSandboxName(), value)
+	var summary servicesecrets.Summary
+	if source := req.GetSource(); source != nil {
+		if len(value) != 0 {
+			return nil, status.Error(codes.InvalidArgument, "provide either a secret value or a secret source")
+		}
+		summary, err = s.svc.CreateServiceSecretSource(ctx, req.GetService(), scope, req.GetSandboxName(), servicesecrets.Source{
+			Reference: source.GetReference(), Command: source.GetCommand(), Refresh: source.GetRefresh(),
+			NoVerify: source.GetNoVerify(), ShowError: source.GetShowError(),
+			OPAccount: source.GetOpAccount(), AWSProfile: source.GetAwsProfile(),
+		})
+	} else {
+		summary, err = s.svc.CreateServiceSecret(ctx, req.GetService(), scope, req.GetSandboxName(), value)
+	}
 	if errors.Is(err, servicesecrets.ErrExists) {
 		return nil, status.Error(codes.AlreadyExists, "service secret already exists; pass --force to replace it")
 	}

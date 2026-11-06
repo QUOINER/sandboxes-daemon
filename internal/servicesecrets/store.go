@@ -105,14 +105,17 @@ func (v NativeVault) Delete(ctx context.Context, service, account string) error 
 }
 
 // Store persists service secrets in a host vault.
-type Store struct{ vault Vault }
+type Store struct {
+	vault          Vault
+	sourceResolver *sourceResolver
+}
 
 // NewStore creates a store.
 func NewStore(vault Vault) (*Store, error) {
 	if vault == nil {
 		return nil, errors.New("host credential vault is required")
 	}
-	return &Store{vault: vault}, nil
+	return &Store{vault: vault, sourceResolver: newSourceResolver()}, nil
 }
 
 // Save validates and stores one service secret.
@@ -130,6 +133,7 @@ func (s *Store) Save(ctx context.Context, service string, scope Scope, sandboxNa
 		}
 		return Summary{}, errors.New("store service secret in host keychain")
 	}
+	s.resolver().invalidate(account(summary))
 	return summary, nil
 }
 
@@ -159,6 +163,7 @@ func (s *Store) Delete(ctx context.Context, service string, scope Scope, sandbox
 	if err != nil {
 		return false, err
 	}
+	s.resolver().invalidate(account(summary))
 	return true, nil
 }
 
