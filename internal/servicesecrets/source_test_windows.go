@@ -16,7 +16,7 @@ func testFailCommand() string {
 }
 
 func testWaitCommand() string {
-	return "timeout /t 30 /nobreak >nul"
+	return "ping -n 30 127.0.0.1 >nul"
 }
 
 func TestWindowsResolverEnvironmentPreservesProviderConfigLocations(t *testing.T) {
