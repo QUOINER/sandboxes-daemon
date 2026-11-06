@@ -78,12 +78,26 @@ func (b *boundedResponseBody) Read(p []byte) (int, error) {
 func (b *boundedResponseBody) Close() error { return b.body.Close() }
 
 var services = map[string]Service{
-	"openai":     {Upstream: "https://api.openai.com", Header: authHeader, Prefix: bearerPrefix},
-	"anthropic":  {Upstream: "https://api.anthropic.com", Header: "x-api-key"},
-	"groq":       {Upstream: "https://api.groq.com", Header: authHeader, Prefix: bearerPrefix},
-	"mistral":    {Upstream: "https://api.mistral.ai", Header: authHeader, Prefix: bearerPrefix},
-	"openrouter": {Upstream: "https://openrouter.ai", Header: authHeader, Prefix: bearerPrefix},
-	"xai":        {Upstream: "https://api.x.ai", Header: authHeader, Prefix: bearerPrefix},
+	"openai":             {Upstream: "https://api.openai.com", Header: authHeader, Prefix: bearerPrefix},
+	"anthropic":          {Upstream: "https://api.anthropic.com", Header: "x-api-key"},
+	"google":             {Upstream: "https://generativelanguage.googleapis.com", Header: "x-goog-api-key"},
+	"github":             {Upstream: "https://api.github.com", Header: authHeader, Prefix: bearerPrefix},
+	"github-web":         {Upstream: "https://github.com", Header: authHeader, Prefix: bearerPrefix},
+	"github-raw":         {Upstream: "https://raw.githubusercontent.com", Header: authHeader, Prefix: bearerPrefix},
+	"github-gist":        {Upstream: "https://gist.github.com", Header: authHeader, Prefix: bearerPrefix},
+	"github-copilot":     {Upstream: "https://copilot.github.com", Header: authHeader, Prefix: bearerPrefix},
+	"github-copilot-api": {Upstream: "https://api.githubcopilot.com", Header: authHeader, Prefix: bearerPrefix},
+	"cursor":             {Upstream: "https://api2.cursor.sh", Header: authHeader, Prefix: bearerPrefix},
+	"cursor-api3":        {Upstream: "https://api3.cursor.sh", Header: authHeader, Prefix: bearerPrefix},
+	"cursor-repo42":      {Upstream: "https://repo42.cursor.sh", Header: authHeader, Prefix: bearerPrefix},
+	"cursor-web":         {Upstream: "https://cursor.com", Header: authHeader, Prefix: bearerPrefix},
+	"droid":              {Upstream: "https://api.factory.ai", Header: authHeader, Prefix: bearerPrefix},
+	"droid-app":          {Upstream: "https://app.factory.ai", Header: authHeader, Prefix: bearerPrefix},
+	"droid-relay":        {Upstream: "https://relay.factory.ai", Header: authHeader, Prefix: bearerPrefix},
+	"groq":               {Upstream: "https://api.groq.com", Header: authHeader, Prefix: bearerPrefix},
+	"mistral":            {Upstream: "https://api.mistral.ai", Header: authHeader, Prefix: bearerPrefix},
+	"openrouter":         {Upstream: "https://openrouter.ai", Header: authHeader, Prefix: bearerPrefix},
+	"xai":                {Upstream: "https://api.x.ai", Header: authHeader, Prefix: bearerPrefix},
 }
 
 // Lookup returns the fixed upstream configuration for a service.

@@ -98,6 +98,72 @@ func TestUnixProxyChannelInjectsSecretAndRequiresToken(t *testing.T) {
 	}
 }
 
+func TestGoogleServiceProxyOverridesGuestKey(t *testing.T) {
+	var gotKey, gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("x-goog-api-key")
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	service, ok := Lookup("google")
+	if !ok || service.Upstream != "https://generativelanguage.googleapis.com" || service.Header != "x-goog-api-key" {
+		t.Fatalf("Google service contract=%+v, found=%t", service, ok)
+	}
+	service.Upstream = upstream.URL
+	dir, err := os.MkdirTemp("/tmp", "rheic-google-proxy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "proxy.sock")
+	token := strings.Repeat("a", 64)
+	manager := New()
+	if _, err := manager.StartUnixRoutes(context.Background(), "google-test", map[string]RouteConfig{
+		"google": {Service: service, Secret: []byte("synthetic-google-key"), Token: token},
+	}, socket); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = manager.Close() }()
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "unix", socket)
+	}}}
+	request, err := http.NewRequest(http.MethodPost, "http://broker/v1beta/models:testGenerateContent", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(TokenHeader, token)
+	request.Header.Set(ServiceHeader, "google")
+	request.Header.Set("x-goog-api-key", "guest-controlled-key")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusNoContent || gotKey != "synthetic-google-key" || gotPath != "/v1beta/models:testGenerateContent" {
+		t.Fatalf("response=%d upstream key=%q path=%q", response.StatusCode, gotKey, gotPath)
+	}
+}
+
+func TestFixedAgentServiceAliasesUseExpectedUpstreamAndBearerHeader(t *testing.T) {
+	want := map[string]string{
+		"github": "https://api.github.com", "github-web": "https://github.com",
+		"github-raw": "https://raw.githubusercontent.com", "github-gist": "https://gist.github.com",
+		"github-copilot": "https://copilot.github.com", "github-copilot-api": "https://api.githubcopilot.com",
+		"cursor": "https://api2.cursor.sh", "cursor-api3": "https://api3.cursor.sh",
+		"cursor-repo42": "https://repo42.cursor.sh", "cursor-web": "https://cursor.com",
+		"droid": "https://api.factory.ai", "droid-app": "https://app.factory.ai", "droid-relay": "https://relay.factory.ai",
+	}
+	for name, upstream := range want {
+		service, ok := Lookup(name)
+		if !ok || service.Upstream != upstream || service.Header != "Authorization" || service.Prefix != "Bearer " {
+			t.Errorf("service %q = %+v, found=%t; want upstream %q with fixed bearer injection", name, service, ok, upstream)
+		}
+	}
+}
+
 func TestUnixProxyResolvesOAuthCredentialOnHostAndFailsClosed(t *testing.T) {
 	var upstreamCalls atomic.Int32
 	var credentialAvailable atomic.Bool
