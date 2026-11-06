@@ -46,6 +46,13 @@ func TestStripProxyCreateEnv(t *testing.T) {
 	if err != nil || len(filtered) != 0 || strings.Join(serviceNames, ",") != "anthropic,openai" {
 		t.Fatalf("multiple services filtered=%v services=%v err=%v", filtered, serviceNames, err)
 	}
+	filtered, serviceNames, err = stripProxyCreateEnv([]string{
+		"GH_TOKEN=${proxy:github}", "RHEIC_PROXY_GITHUB_WEB=${proxy:github-web}",
+		"RHEIC_PROXY_GITHUB_COPILOT_API=${proxy:github-copilot-api}",
+	})
+	if err != nil || len(filtered) != 0 || strings.Join(serviceNames, ",") != "github,github-copilot-api,github-web" {
+		t.Fatalf("fixed host aliases filtered=%v services=%v err=%v", filtered, serviceNames, err)
+	}
 	filtered, serviceNames, err = stripProxyCreateEnv([]string{"OPENAI_API_KEY=${oauth:openai}", "PATH=/bin"})
 	if err != nil || len(filtered) != 1 || filtered[0] != "PATH=/bin" || strings.Join(serviceNames, ",") != "openai-oauth" {
 		t.Fatalf("OAuth proxy env filtered=%v services=%v err=%v", filtered, serviceNames, err)
@@ -71,11 +78,50 @@ func TestProxyContractsUseProviderAPIBasePaths(t *testing.T) {
 		"openrouter":   "http://127.0.0.1:43132/api/v1",
 		"xai":          "http://127.0.0.1:43133/v1",
 		"anthropic":    "http://127.0.0.1:43129",
+		"google":       "http://127.0.0.1:43134",
 	} {
 		contract, ok := proxyContract(service)
 		if !ok || contract.baseURL != want {
 			t.Errorf("proxy contract %q = %+v, want base URL %q", service, contract, want)
 		}
+	}
+	google, ok := proxyContract("google")
+	if !ok || google.credentialEnv != "GEMINI_API_KEY" || google.baseURLEnv != "GOOGLE_GEMINI_BASE_URL" || google.upstreamHost != "generativelanguage.googleapis.com" {
+		t.Fatalf("Google proxy contract=%+v, valid=%t", google, ok)
+	}
+}
+
+func TestAgentCredentialAliasesHaveFixedHostsAndCredentialScopes(t *testing.T) {
+	want := map[string]struct {
+		host    string
+		key     string
+		service string
+	}{
+		"github":             {"api.github.com", "GH_TOKEN", githubCredentialService},
+		"github-web":         {"github.com", "RHEIC_PROXY_GITHUB_WEB", githubCredentialService},
+		"github-raw":         {"raw.githubusercontent.com", "RHEIC_PROXY_GITHUB_RAW", githubCredentialService},
+		"github-gist":        {"gist.github.com", "RHEIC_PROXY_GITHUB_GIST", githubCredentialService},
+		"github-copilot":     {"copilot.github.com", "RHEIC_PROXY_GITHUB_COPILOT", githubCredentialService},
+		"github-copilot-api": {"api.githubcopilot.com", "RHEIC_PROXY_GITHUB_COPILOT_API", githubCredentialService},
+		"cursor":             {"api2.cursor.sh", "CURSOR_API_KEY", cursorCredentialService},
+		"cursor-api3":        {"api3.cursor.sh", "RHEIC_PROXY_CURSOR_API3", cursorCredentialService},
+		"cursor-repo42":      {"repo42.cursor.sh", "RHEIC_PROXY_CURSOR_REPO42", cursorCredentialService},
+		"cursor-web":         {"cursor.com", "RHEIC_PROXY_CURSOR_WEB", cursorCredentialService},
+		"droid":              {"api.factory.ai", "FACTORY_API_KEY", droidCredentialService},
+		"droid-app":          {"app.factory.ai", "RHEIC_PROXY_DROID_APP", droidCredentialService},
+		"droid-relay":        {"relay.factory.ai", "RHEIC_PROXY_DROID_RELAY", droidCredentialService},
+	}
+	ports := make(map[uint16]string, len(want))
+	for name, expected := range want {
+		contract, ok := proxyContract(name)
+		if !ok || contract.upstreamHost != expected.host || contract.credentialEnv != expected.key || contract.credentialService != expected.service {
+			t.Errorf("contract %q = %+v, valid=%t; want host=%q env=%q secret=%q", name, contract, ok, expected.host, expected.key, expected.service)
+			continue
+		}
+		if previous, exists := ports[contract.guestPort]; exists {
+			t.Errorf("routes %q and %q share guest port %d", previous, name, contract.guestPort)
+		}
+		ports[contract.guestPort] = name
 	}
 }
 

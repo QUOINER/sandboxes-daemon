@@ -27,12 +27,15 @@ import (
 )
 
 const (
-	proxySocketPort      = uint32(1027)
-	proxySettingPrefix   = "sandbox.proxy-service."
-	proxyGuestHelperPath = "/tmp/rheic-proxy-helper"
-	proxyMaxRoutes       = 32
-	openAIServiceName    = "openai"
-	openAIOAuthRoute     = openAIServiceName + "-oauth"
+	proxySocketPort         = uint32(1027)
+	proxySettingPrefix      = "sandbox.proxy-service."
+	proxyGuestHelperPath    = "/tmp/rheic-proxy-helper"
+	proxyMaxRoutes          = 32
+	openAIServiceName       = "openai"
+	openAIOAuthRoute        = openAIServiceName + "-oauth"
+	githubCredentialService = "github"
+	cursorCredentialService = "cursor"
+	droidCredentialService  = "droid"
 )
 
 type proxyRuntimeConfig struct {
@@ -53,12 +56,13 @@ type proxyRoutesRuntime interface {
 }
 
 type proxyEnvContract struct {
-	serviceName   string
-	credentialEnv string
-	baseURLEnv    string
-	baseURL       string
-	upstreamHost  string
-	guestPort     uint16
+	serviceName       string
+	credentialService string
+	credentialEnv     string
+	baseURLEnv        string
+	baseURL           string
+	upstreamHost      string
+	guestPort         uint16
 }
 
 func proxyContract(name string) (proxyEnvContract, bool) {
@@ -74,12 +78,46 @@ func proxyContract(name string) (proxyEnvContract, bool) {
 	if err != nil || upstream.Scheme != "https" || upstream.Hostname() == "" || upstream.Port() != "" {
 		return proxyEnvContract{}, false
 	}
-	contract := proxyEnvContract{serviceName: strings.ToLower(name), upstreamHost: upstream.Host}
+	contract := proxyEnvContract{serviceName: strings.ToLower(name), credentialService: strings.ToLower(name), upstreamHost: upstream.Host}
+	if configureAgentCredentialContract(&contract) {
+		contract.baseURL = proxyBaseURL(contract.serviceName, contract.guestPort)
+		return contract, true
+	}
+	if !configureProviderContract(&contract) {
+		return proxyEnvContract{}, false
+	}
+	contract.baseURL = proxyBaseURL(contract.serviceName, contract.guestPort)
+	return contract, true
+}
+
+func configureAgentCredentialContract(contract *proxyEnvContract) bool {
 	switch contract.serviceName {
 	case openAIServiceName, openAIOAuthRoute:
 		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "OPENAI_API_KEY", "OPENAI_BASE_URL", 3128
+		return true
+	case githubCredentialService, "github-web", "github-raw", "github-gist", "github-copilot", "github-copilot-api":
+		contract.credentialService = githubCredentialService
+		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = proxyCredentialRouteEnv(contract.serviceName)
+		return true
+	case cursorCredentialService, "cursor-api3", "cursor-repo42", "cursor-web":
+		contract.credentialService = cursorCredentialService
+		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = proxyCredentialRouteEnv(contract.serviceName)
+		return true
+	case droidCredentialService, "droid-app", "droid-relay":
+		contract.credentialService = droidCredentialService
+		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = proxyCredentialRouteEnv(contract.serviceName)
+		return true
+	default:
+		return false
+	}
+}
+
+func configureProviderContract(contract *proxyEnvContract) bool {
+	switch contract.serviceName {
 	case "anthropic":
 		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", 43129
+	case "google":
+		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "GEMINI_API_KEY", "GOOGLE_GEMINI_BASE_URL", 43134
 	case "groq":
 		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "GROQ_API_KEY", "GROQ_BASE_URL", 43130
 	case "mistral":
@@ -89,10 +127,42 @@ func proxyContract(name string) (proxyEnvContract, bool) {
 	case "xai":
 		contract.credentialEnv, contract.baseURLEnv, contract.guestPort = "XAI_API_KEY", "XAI_BASE_URL", 43133
 	default:
-		return proxyEnvContract{}, false
+		return false
 	}
-	contract.baseURL = proxyBaseURL(contract.serviceName, contract.guestPort)
-	return contract, true
+	return true
+}
+
+func proxyCredentialRouteEnv(name string) (credentialEnv, baseURLEnv string, guestPort uint16) {
+	switch name {
+	case githubCredentialService:
+		return "GH_TOKEN", "RHEIC_GITHUB_API_BASE_URL", 43135
+	case "github-web":
+		return "RHEIC_PROXY_GITHUB_WEB", "RHEIC_PROXY_GITHUB_WEB_BASE_URL", 43136
+	case "github-raw":
+		return "RHEIC_PROXY_GITHUB_RAW", "RHEIC_PROXY_GITHUB_RAW_BASE_URL", 43137
+	case "github-gist":
+		return "RHEIC_PROXY_GITHUB_GIST", "RHEIC_PROXY_GITHUB_GIST_BASE_URL", 43138
+	case "github-copilot":
+		return "RHEIC_PROXY_GITHUB_COPILOT", "RHEIC_PROXY_GITHUB_COPILOT_BASE_URL", 43139
+	case "github-copilot-api":
+		return "RHEIC_PROXY_GITHUB_COPILOT_API", "RHEIC_PROXY_GITHUB_COPILOT_API_BASE_URL", 43140
+	case cursorCredentialService:
+		return "CURSOR_API_KEY", "RHEIC_CURSOR_API_BASE_URL", 43141
+	case "cursor-api3":
+		return "RHEIC_PROXY_CURSOR_API3", "RHEIC_PROXY_CURSOR_API3_BASE_URL", 43142
+	case "cursor-repo42":
+		return "RHEIC_PROXY_CURSOR_REPO42", "RHEIC_PROXY_CURSOR_REPO42_BASE_URL", 43143
+	case "cursor-web":
+		return "RHEIC_PROXY_CURSOR_WEB", "RHEIC_PROXY_CURSOR_WEB_BASE_URL", 43144
+	case droidCredentialService:
+		return "FACTORY_API_KEY", "RHEIC_FACTORY_API_BASE_URL", 43145
+	case "droid-app":
+		return "RHEIC_PROXY_DROID_APP", "RHEIC_PROXY_DROID_APP_BASE_URL", 43146
+	case "droid-relay":
+		return "RHEIC_PROXY_DROID_RELAY", "RHEIC_PROXY_DROID_RELAY_BASE_URL", 43147
+	default:
+		return "", "", 0
+	}
 }
 
 func proxyBaseURL(service string, port uint16) string {
@@ -308,7 +378,7 @@ func (s *Service) buildProxyRoute(ctx context.Context, sb sandbox.Sandbox, name 
 	if isOAuthProxyRoute(name) {
 		return s.buildOAuthProxyRoute(ctx, sb, contract)
 	}
-	secret, scope, err := s.loadServiceProxySecret(ctx, name, sb.Name)
+	secret, scope, err := s.loadServiceProxySecret(ctx, contract.credentialService, sb.Name)
 	if err != nil {
 		return secretproxy.RouteConfig{}, "", err
 	}
