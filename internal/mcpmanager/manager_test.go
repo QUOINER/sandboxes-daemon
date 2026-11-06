@@ -109,6 +109,25 @@ func TestApprovalFailsClosedWithoutTrustedProvider(t *testing.T) {
 	if len(manager.List()) != 0 {
 		t.Fatal("registration persisted without trusted approval")
 	}
+	manager.SetApprovalProvider(testApprovalProvider{})
+	id, err = manager.Register(ctx, "fixture", command, nil, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ApproveRegistration(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	manager.SetApprovalProvider(nil)
+	callID, err := manager.RequestCall("sb-owned", "fixture", "tool", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ApproveCall(ctx, callID, func(context.Context, string) error { return nil }); err == nil || !strings.Contains(err.Error(), "trusted MCP host approval provider is unavailable") {
+		t.Fatalf("tool call without a trusted provider err=%v", err)
+	}
+	if got := manager.List(); len(got) != 1 || got[0].Loaded {
+		t.Fatalf("host process was started without trusted approval: %+v", got)
+	}
 }
 
 func TestCallRequiresOneUseApprovalAndRejectsChangedExecutable(t *testing.T) {
