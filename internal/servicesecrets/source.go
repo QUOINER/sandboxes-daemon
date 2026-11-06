@@ -3,6 +3,8 @@ package servicesecrets
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -263,12 +265,16 @@ func (r *sourceResolver) resolve(ctx context.Context, key string, source Source)
 		value, err := resolveSource(ctx, source)
 		return value, err
 	}
+	cacheKey, err := sourceCacheKey(key, source)
+	if err != nil {
+		return nil, err
+	}
 	duration, _ := time.ParseDuration(source.Refresh)
 	lock := r.keyLock(key)
 	lock.Lock()
 	defer lock.Unlock()
 	r.mu.Lock()
-	if entry, ok := r.entries[key]; ok && time.Now().Before(entry.expiresAt) {
+	if entry, ok := r.entries[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
 		r.mu.Unlock()
 		return append([]byte(nil), entry.value...), nil
 	}
@@ -277,8 +283,18 @@ func (r *sourceResolver) resolve(ctx context.Context, key string, source Source)
 	if err != nil {
 		return nil, err
 	}
-	r.cache(key, value, time.Now().Add(duration))
+	r.cache(cacheKey, value, time.Now().Add(duration))
 	return value, nil
+}
+
+func sourceCacheKey(account string, source Source) (string, error) {
+	encoded, err := encodeSource(source)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	clear(encoded)
+	return account + "\x00" + hex.EncodeToString(digest[:]), nil
 }
 
 func (r *sourceResolver) keyLock(key string) *sync.Mutex {
@@ -327,9 +343,13 @@ func (r *sourceResolver) invalidate(key string) {
 	defer lock.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if entry, ok := r.entries[key]; ok {
+	prefix := key + "\x00"
+	for cacheKey, entry := range r.entries {
+		if cacheKey != key && !strings.HasPrefix(cacheKey, prefix) {
+			continue
+		}
 		clear(entry.value)
-		delete(r.entries, key)
+		delete(r.entries, cacheKey)
 	}
 }
 

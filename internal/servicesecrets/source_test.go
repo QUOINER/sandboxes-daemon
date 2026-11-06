@@ -101,8 +101,13 @@ func TestCommandSourceCancellationCleansUpProcess(t *testing.T) {
 func TestSourceResolverCacheModesAndInvalidation(t *testing.T) {
 	resolver := newSourceResolver()
 	key := "github/global"
-	resolver.cache(key, []byte("cached-value"), time.Now().Add(time.Minute))
-	value, err := resolver.resolve(context.Background(), key, Source{Command: testFailCommand()})
+	source := Source{Command: testFailCommand()}
+	cacheKey, err := sourceCacheKey(key, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver.cache(cacheKey, []byte("cached-value"), time.Now().Add(time.Minute))
+	value, err := resolver.resolve(context.Background(), key, source)
 	if err != nil || string(value) != "cached-value" {
 		t.Fatalf("cache hit value=%q err=%v", value, err)
 	}
@@ -127,6 +132,34 @@ func TestSourceResolverCacheModesAndInvalidation(t *testing.T) {
 	defer resolver.mu.Unlock()
 	if len(resolver.entries) != 0 {
 		t.Fatalf("invalidate left %d cache entries", len(resolver.entries))
+	}
+}
+
+func TestSourceCacheDoesNotReuseCredentialAfterSourceChanges(t *testing.T) {
+	resolver := newSourceResolver()
+	account := "github/global"
+	oldSource := Source{Command: "old-source", Refresh: "55m"}
+	oldKey, err := sourceCacheKey(account, oldSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver.cache(oldKey, []byte("old-synthetic-token"), time.Now().Add(time.Hour))
+
+	newSource := Source{Command: testPrintCommand(), Refresh: "55m"}
+	value, err := resolver.resolve(context.Background(), account, newSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clear(value)
+	if string(value) != "synthetic-value" {
+		t.Fatalf("new source resolved to %q; old-source cache was reused", value)
+	}
+
+	resolver.invalidate(account)
+	resolver.mu.Lock()
+	defer resolver.mu.Unlock()
+	if len(resolver.entries) != 0 {
+		t.Fatalf("source rotation invalidation left %d cached credentials", len(resolver.entries))
 	}
 }
 
