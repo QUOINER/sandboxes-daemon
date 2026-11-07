@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -450,20 +449,55 @@ func resolverEnvironment(source Source) []string {
 	return env
 }
 
-type commandOutput struct {
-	data []byte
-	err  error
+var errResolverOutputLimit = errors.New("secret resolver output exceeded its limit")
+
+type boundedCommandCapture struct {
+	mu          sync.Mutex
+	data        []byte
+	limit       int
+	exceeded    bool
+	signalLimit func()
+}
+
+func (w *boundedCommandCapture) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	if w.exceeded {
+		w.mu.Unlock()
+		return 0, errResolverOutputLimit
+	}
+	remaining := w.limit - len(w.data)
+	if len(p) > remaining {
+		if remaining > 0 {
+			w.data = append(w.data, p[:remaining]...)
+		}
+		w.exceeded = true
+		signal := w.signalLimit
+		w.mu.Unlock()
+		if signal != nil {
+			signal()
+		}
+		return remaining, errResolverOutputLimit
+	}
+	w.data = append(w.data, p...)
+	w.mu.Unlock()
+	return len(p), nil
+}
+
+func (w *boundedCommandCapture) take() ([]byte, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	data, exceeded := w.data, w.exceeded
+	w.data = nil
+	return data, exceeded
 }
 
 func boundedCommandOutput(ctx context.Context, command *exec.Cmd) (stdout, stderr []byte, retErr error) {
-	stdoutPipe, err := command.StdoutPipe()
-	if err != nil {
-		return nil, nil, errors.New("open secret resolver output")
-	}
-	stderrPipe, err := command.StderrPipe()
-	if err != nil {
-		return nil, nil, errors.New("open secret resolver error output")
-	}
+	outputLimit := make(chan struct{})
+	var signalLimit sync.Once
+	stdoutCapture := &boundedCommandCapture{limit: maxResolvedSecret, signalLimit: func() { signalLimit.Do(func() { close(outputLimit) }) }}
+	stderrCapture := &boundedCommandCapture{limit: maxResolverStderr, signalLimit: func() { signalLimit.Do(func() { close(outputLimit) }) }}
+	command.Stdout = stdoutCapture
+	command.Stderr = stderrCapture
 	terminate, cleanup, err := startResolverProcess(command)
 	if err != nil {
 		return nil, nil, errors.New("start secret resolver")
@@ -477,10 +511,6 @@ func boundedCommandOutput(ctx context.Context, command *exec.Cmd) (stdout, stder
 			retErr = errors.Join(retErr, errors.New("clean up secret resolver process"))
 		}
 	}()
-	stdoutCh := make(chan commandOutput, 1)
-	stderrCh := make(chan commandOutput, 1)
-	go readCommandOutput(stdoutPipe, maxResolvedSecret, terminate, stdoutCh)
-	go readCommandOutput(stderrPipe, maxResolverStderr, terminate, stderrCh)
 	stopWatch := make(chan struct{})
 	watcherDone := make(chan struct{})
 	go func() {
@@ -488,37 +518,28 @@ func boundedCommandOutput(ctx context.Context, command *exec.Cmd) (stdout, stder
 		select {
 		case <-ctx.Done():
 			_ = terminate()
-			_ = stdoutPipe.Close()
-			_ = stderrPipe.Close()
+		case <-outputLimit:
+			_ = terminate()
 		case <-stopWatch:
 		}
 	}()
 	waitErr := command.Wait()
-	stdoutResult := <-stdoutCh
-	stderrResult := <-stderrCh
 	close(stopWatch)
 	<-watcherDone
-	stdout, stderr = stdoutResult.data, stderrResult.data
+	stdout, stdoutExceeded := stdoutCapture.take()
+	stderr, stderrExceeded := stderrCapture.take()
 	if ctx.Err() != nil {
 		clear(stdout)
 		clear(stderr)
 		return nil, nil, ctx.Err()
 	}
-	if stdoutResult.err != nil || stderrResult.err != nil {
+	if stdoutExceeded || stderrExceeded {
 		clear(stdout)
 		clear(stderr)
-		return nil, nil, errors.New("secret resolver output exceeded its limit")
+		return nil, nil, errResolverOutputLimit
 	}
 	if waitErr != nil {
 		return stdout, stderr, waitErr
 	}
 	return stdout, stderr, nil
-}
-
-func readCommandOutput(reader io.Reader, limit int, terminate func() error, output chan<- commandOutput) {
-	data, err := io.ReadAll(io.LimitReader(reader, int64(limit+1)))
-	if err == nil && len(data) > limit {
-		err = errors.Join(errors.New("output limit exceeded"), terminate())
-	}
-	output <- commandOutput{data: data, err: err}
 }
