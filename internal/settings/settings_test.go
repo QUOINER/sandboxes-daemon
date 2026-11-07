@@ -11,7 +11,7 @@ import (
 func TestLoadDefaultsAndFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.toml")
 	values, err := Load(path)
-	if err != nil || values != (Values{}) {
+	if err != nil || values.DNSUpstream != "" || values.DefaultPolicyProfile != "" || values.DefaultCPUs != 0 || values.DefaultMemoryMiB != 0 || values.DockerVolumeSize != "" || len(values.MCPRemoteAllowedHosts) != 0 {
 		t.Fatalf("missing file = %+v, %v", values, err)
 	}
 	body := `# host settings
@@ -20,6 +20,7 @@ default_policy_profile = "balanced"
 default_cpus = 4
 default_memory_mib = 2048
 docker_volume_size = "20g"
+mcp_remote_allowed_hosts = "mcp.example.com,api.example.com"
 `
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -35,8 +36,19 @@ docker_volume_size = "20g"
 		t.Fatal(err)
 	}
 	if values.DNSUpstream != "1.1.1.1:53" || values.DefaultPolicyProfile != "balanced" ||
-		values.DefaultCPUs != 4 || values.DefaultMemoryMiB != 2048 || values.DockerVolumeSize != "20g" {
+		values.DefaultCPUs != 4 || values.DefaultMemoryMiB != 2048 || values.DockerVolumeSize != "20g" ||
+		strings.Join(values.MCPRemoteAllowedHosts, ",") != "mcp.example.com,api.example.com" {
 		t.Fatalf("values=%+v", values)
+	}
+}
+
+func TestParseHostListFailsClosed(t *testing.T) {
+	for _, value := range []string{"*.example.com", "127.0.0.1", "example.com,,api.example.com", "example.com,EXAMPLE.com", "-bad.example.com", "example.com:8443"} {
+		t.Run(value, func(t *testing.T) {
+			if _, err := parseHostList(value); err == nil {
+				t.Fatalf("accepted invalid host list %q", value)
+			}
+		})
 	}
 }
 

@@ -25,24 +25,25 @@ import (
 )
 
 type options struct {
-	socketPath           string
-	stateDir             string
-	containerdPath       string
-	ctrPath              string
-	runtimeName          string
-	snapshotter          string
-	image                string
-	fifoDir              string
-	gvproxyPath          string
-	runDir               string
-	proxyHelperPath      string
-	dnsUpstream          string
-	settingsPath         string
-	defaultPolicyProfile string
-	defaultCPUs          uint32
-	defaultMemoryMiB     uint32
-	dockerVolumeSize     string
-	showVersion          bool
+	socketPath            string
+	stateDir              string
+	containerdPath        string
+	ctrPath               string
+	runtimeName           string
+	snapshotter           string
+	image                 string
+	fifoDir               string
+	gvproxyPath           string
+	runDir                string
+	proxyHelperPath       string
+	dnsUpstream           string
+	settingsPath          string
+	defaultPolicyProfile  string
+	defaultCPUs           uint32
+	defaultMemoryMiB      uint32
+	dockerVolumeSize      string
+	mcpRemoteAllowedHosts []string
+	showVersion           bool
 }
 
 func main() {
@@ -71,19 +72,20 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	err = daemon.Run(ctx, daemon.Config{
-		SocketPath:           opts.socketPath,
-		StateDir:             opts.stateDir,
-		Backend:              backend,
-		DefaultImage:         opts.image,
-		Cleanup:              cleanup,
-		OAuthProviders:       dockerOAuthProviders(),
-		DNSUpstream:          opts.dnsUpstream,
-		DefaultPolicyProfile: opts.defaultPolicyProfile,
-		DefaultCPUs:          opts.defaultCPUs,
-		DefaultMemoryMiB:     opts.defaultMemoryMiB,
-		DockerVolumeSize:     opts.dockerVolumeSize,
-		GatewayLost:          lost,
-		ProxyHelperPath:      opts.proxyHelperPath,
+		SocketPath:            opts.socketPath,
+		StateDir:              opts.stateDir,
+		Backend:               backend,
+		DefaultImage:          opts.image,
+		Cleanup:               cleanup,
+		OAuthProviders:        dockerOAuthProviders(),
+		DNSUpstream:           opts.dnsUpstream,
+		DefaultPolicyProfile:  opts.defaultPolicyProfile,
+		DefaultCPUs:           opts.defaultCPUs,
+		DefaultMemoryMiB:      opts.defaultMemoryMiB,
+		DockerVolumeSize:      opts.dockerVolumeSize,
+		MCPRemoteAllowedHosts: opts.mcpRemoteAllowedHosts,
+		GatewayLost:           lost,
+		ProxyHelperPath:       opts.proxyHelperPath,
 	})
 	if err != nil {
 		slog.Error("daemon stopped", "error", err)
@@ -126,6 +128,7 @@ func parseOptions() options {
 	opts.defaultCPUs = values.DefaultCPUs
 	opts.defaultMemoryMiB = values.DefaultMemoryMiB
 	opts.dockerVolumeSize = values.DockerVolumeSize
+	opts.mcpRemoteAllowedHosts = values.MCPRemoteAllowedHosts
 	return opts
 }
 

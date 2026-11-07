@@ -65,7 +65,7 @@ func (s *SandboxServer) ListMCPServers(ctx context.Context, req *localv1.ListMCP
 	}
 	response := &localv1.ListMCPServersResponse{Servers: make([]*localv1.MCPServerSummary, 0, len(servers))}
 	for _, server := range servers {
-		response.Servers = append(response.Servers, &localv1.MCPServerSummary{Name: server.Name, Gateway: "local", Transport: "stdio", Loaded: server.Loaded, Usable: server.Usable})
+		response.Servers = append(response.Servers, &localv1.MCPServerSummary{Name: server.Name, Gateway: "local", Transport: summaryTransport(server.Transport), Loaded: server.Loaded, Usable: server.Usable})
 	}
 	return response, nil
 }
@@ -74,7 +74,16 @@ func (s *SandboxServer) MCPRegisterServer(ctx context.Context, req *localv1.MCPR
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "MCP registration request is required")
 	}
-	id, err := s.svc.RegisterMCPServer(ctx, req.GetName(), req.GetCommand(), req.GetArguments(), req.GetWorkingDirectory())
+	var id string
+	var err error
+	if req.GetUrl() != "" {
+		if req.GetCommand() != "" {
+			return nil, status.Error(codes.InvalidArgument, "set either command or url, not both")
+		}
+		id, err = s.svc.RegisterRemoteMCPServer(ctx, req.GetName(), req.GetUrl(), req.GetHeaders())
+	} else {
+		id, err = s.svc.RegisterMCPServer(ctx, req.GetName(), req.GetCommand(), req.GetArguments(), req.GetWorkingDirectory())
+	}
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -89,7 +98,7 @@ func (s *SandboxServer) MCPApproveRegistration(ctx context.Context, req *localv1
 	if err != nil {
 		return nil, status.Error(codes.FailedPrecondition, "trusted MCP approval was unavailable, denied, or expired")
 	}
-	return &localv1.MCPApproveRegistrationResponse{Server: &localv1.MCPServerSummary{Name: server.Name, Gateway: "local", Transport: "stdio", Loaded: false, Usable: true}}, nil
+	return &localv1.MCPApproveRegistrationResponse{Server: &localv1.MCPServerSummary{Name: server.Name, Gateway: "local", Transport: summaryTransport(server.Transport), Loaded: false, Usable: true}}, nil
 }
 
 func (s *SandboxServer) MCPRemoveServer(ctx context.Context, req *localv1.MCPRemoveServerRequest) (*localv1.MCPRemoveServerResponse, error) {
@@ -843,4 +852,11 @@ func (s *SandboxServer) CheckPolicy(ctx context.Context, req *localv1.CheckPolic
 		return nil, err
 	}
 	return &localv1.CheckPolicyResponse{Allowed: decision.Allowed, RuleId: decision.RuleID, Reason: decision.Reason}, nil
+}
+
+func summaryTransport(transport string) string {
+	if transport == "" {
+		return "stdio"
+	}
+	return transport
 }

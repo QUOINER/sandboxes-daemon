@@ -92,6 +92,28 @@ func TestDuplicateName(t *testing.T) {
 	}
 }
 
+func TestRemoteMCPUsesExplicitHostAllowlist(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "mcp-allowlist.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	defer func() { _ = svc.Close() }()
+	svc.SetMCPRemoteAllowlist([]string{"mcp.example.test"})
+	if _, err := svc.RegisterRemoteMCPServer(ctx, "allowed", "https://mcp.example.test/mcp", nil); err != nil {
+		t.Fatalf("allowed remote host rejected: %v", err)
+	}
+	if _, err := svc.RegisterRemoteMCPServer(ctx, "blocked", "https://other.example.test/mcp", nil); err == nil {
+		t.Fatal("host outside the administrator allowlist was accepted")
+	}
+	svc.SetMCPRemoteAllowlist(nil)
+	if _, err := svc.RegisterRemoteMCPServer(ctx, "revoked", "https://mcp.example.test/mcp", nil); err == nil {
+		t.Fatal("empty/revoked host policy still allowed registration")
+	}
+}
+
 func TestCreateBakesValidatedEnv(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
