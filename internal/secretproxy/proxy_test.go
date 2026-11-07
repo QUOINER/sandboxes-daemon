@@ -996,3 +996,67 @@ func TestUnixProxyRejectsSymlinkParentDirectory(t *testing.T) {
 		t.Fatal("listenPrivateUnix accepted a symlink parent directory")
 	}
 }
+
+// TestUnixProxyCAEndpointRequiresChannelToken covers a previously untested
+// fail-closed path: host CA trust material must not be served to a guest that
+// does not present the per-sandbox channel token.
+func TestUnixProxyCAEndpointRequiresChannelToken(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "kqproxy-ca-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "proxy.sock")
+	token := strings.Repeat("c", 64)
+	wrongToken := strings.Repeat("d", 64)
+	manager := New()
+	if _, err := manager.StartUnixRoutes(context.Background(), "ca-token-test", map[string]RouteConfig{
+		"openai": {
+			Service: Service{Upstream: "https://api.openai.com", Header: "Authorization", Prefix: "Bearer "},
+			Token:   token,
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+			CACert:  []byte("synthetic-ca-pem"),
+		},
+	}, socket); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "unix", socket)
+	}}}
+
+	positive, err := http.NewRequest(http.MethodGet, "http://broker/__rheic/proxy/ca/openai", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	positive.Header.Set(TokenHeader, token)
+	response, err := client.Do(positive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if readErr != nil || response.StatusCode != http.StatusOK || string(body) != "synthetic-ca-pem" {
+		t.Fatalf("positive CA response status=%d body=%q err=%v", response.StatusCode, body, readErr)
+	}
+
+	for _, receivedToken := range []string{"", wrongToken} {
+		negative, err := http.NewRequest(http.MethodGet, "http://broker/__rheic/proxy/ca/openai", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if receivedToken != "" {
+			negative.Header.Set(TokenHeader, receivedToken)
+		}
+		response, err := client.Do(negative)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusForbidden {
+			t.Fatalf("CA response with token %q status=%d, want %d", receivedToken, response.StatusCode, http.StatusForbidden)
+		}
+	}
+}
