@@ -1,12 +1,9 @@
 name: release
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Existing immutable module tag to build and attest
-        required: true
-        type: string
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
@@ -23,13 +20,15 @@ jobs:
       artifact-metadata: write
     env:
       GOTOOLCHAIN: local
-      TAG: ${{ inputs.tag }}
+      TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Fetch protected main for ancestry validation
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
       - name: Verify pinned Go toolchain
         run: test "$(go version)" = "go version go1.27.3 linux/amd64"
       - name: Validate release tag
@@ -65,10 +64,10 @@ jobs:
         run: sha256sum dist/* > dist/SHA256SUMS
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
-          subject-path: dist/*
+          subject-path: dist/sandboxesd-darwin-arm64,dist/sandboxesd-darwin-amd64,dist/sandboxesd-linux-arm64,dist/sandboxesd-linux-amd64
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: dist/sandboxesd-*
+          subject-path: dist/sandboxesd-darwin-arm64,dist/sandboxesd-darwin-amd64,dist/sandboxesd-linux-arm64,dist/sandboxesd-linux-amd64
           sbom-path: dist/sandboxesd.cdx.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -83,12 +82,28 @@ jobs:
     permissions:
       contents: write
     env:
-      TAG: ${{ inputs.tag }}
+      TAG: ${{ github.ref_name }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Revalidate release tag before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tag_commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          [[ "$tag_commit" == "$(git rev-parse HEAD)" ]]
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$tag_commit" origin/main
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-assets
           path: dist
+      - name: Verify downloaded release assets
+        run: sha256sum -c dist/SHA256SUMS
       - name: Publish release assets without replacing existing files
         env:
           GH_TOKEN: ${{ github.token }}
@@ -101,8 +116,8 @@ jobs:
           for asset in dist/*; do
             name=${asset##*/}
             digest=$(sha256sum "$asset" | cut -d ' ' -f 1)
-            existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
-              --jq ".assets[] | select(.name == \"$name\") | (.digest // \"UNKNOWN\")")
+            existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" | \
+              jq -r --arg name "$name" '.assets[] | select(.name == $name) | (.digest // "UNKNOWN")')
             if [[ -z "$existing" ]]; then
               gh release upload "$TAG" "$asset"
             elif [[ "$existing" == "sha256:$digest" ]]; then
