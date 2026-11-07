@@ -235,3 +235,21 @@ func TestProxyAuthorityPersistsAndMintsHostBoundLeaf(t *testing.T) {
 		t.Fatal("minted a leaf for an untrusted registry host")
 	}
 }
+
+func TestTokenRequestAcceptsRepeatedScopes(t *testing.T) {
+	query := "service=fixture&scope=repository:rheic/acceptance:pull&scope=repository:rheic/acceptance:pull%2Cpush"
+	repository, actions, ok, valid := parseTokenRequestScope(query, "fixture")
+	if !valid || !ok || repository != "rheic/acceptance" {
+		t.Fatalf("scope = %q %v %v %v", repository, actions, ok, valid)
+	}
+	if _, hasPull := actions[registryActionPull]; !hasPull {
+		t.Fatal("pull action missing")
+	}
+	if _, hasPush := actions[registryActionPush]; !hasPush {
+		t.Fatal("push action missing")
+	}
+	other := "service=fixture&scope=repository:one:pull&scope=repository:two:pull"
+	if _, _, ok, valid := parseTokenRequestScope(other, "fixture"); !valid || ok {
+		t.Fatal("multi-repository token request accepted")
+	}
+}

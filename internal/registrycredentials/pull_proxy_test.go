@@ -573,3 +573,16 @@ func TestConfiguredRegistryConnectAndRealmAllowlist(t *testing.T) {
 		t.Fatal("authority signed an unconfigured host")
 	}
 }
+
+func TestRealmPathWinsOnSharedRegistryHost(t *testing.T) {
+	proxy := &PullProxy{
+		authority: "registry.example.test",
+		realms:    []registryauth.Realm{{Host: "registry.example.test", Path: "/token"}},
+	}
+	if realm, ok := proxy.realmForPath("REGISTRY.example.test.", "/token"); !ok || realm.Path != "/token" {
+		t.Fatalf("realm dispatch = %+v, %v", realm, ok)
+	}
+	if _, ok := proxy.realmForPath("registry.example.test", "/v2/repo/manifests/v1"); ok {
+		t.Fatal("manifest path treated as a token request")
+	}
+}
