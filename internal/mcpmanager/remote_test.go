@@ -52,7 +52,8 @@ func TestPrepareRemoteServerFailsClosed(t *testing.T) {
 		{name: "non-default port", rawURL: "https://mcp.example.com:8443/mcp", wantErr: "port"},
 		{name: "query", rawURL: "https://mcp.example.com/mcp?x=1", wantErr: "query"},
 		{name: "fragment", rawURL: "https://mcp.example.com/mcp#x", wantErr: "query"},
-		{name: "authorization header", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer x"}, wantErr: "host vault"},
+		{name: "authorization header", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer x"}, wantErr: "host-vault"},
+		{name: "malformed placeholder", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer ${}"}, wantErr: "placeholder"},
 		{name: "crlf header value", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Test": "a\r\nb"}, wantErr: "header value"},
 	}
 	for _, tc := range cases {
@@ -98,7 +99,7 @@ func TestRemoteRegistrationApprovalAndPolicyRevocation(t *testing.T) {
 	provider := &approvingProvider{}
 	manager.SetApprovalProvider(provider)
 
-	id, err := manager.RegisterRemote(ctx, "remote-fixture", "https://mcp.example.com/mcp", map[string]string{"X-Team": "docs"})
+	id, err := manager.RegisterRemote(ctx, "remote-fixture", "https://mcp.example.com/mcp", map[string]string{"Authorization": "Bearer ${token}"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,6 +109,10 @@ func TestRemoteRegistrationApprovalAndPolicyRevocation(t *testing.T) {
 	}
 	if summary.Name != "remote-fixture" {
 		t.Fatalf("summary = %+v", summary)
+	}
+	stored, err := state.GetSetting(ctx, "mcp_stdio_servers_v1")
+	if err != nil || strings.Contains(stored, "synthetic-remote-token") || !strings.Contains(stored, "${token}") {
+		t.Fatalf("registry contains secret or lost placeholder: value=%q err=%v", stored, err)
 	}
 	if len(provider.requests) != 1 || provider.requests[0].URL != "https://mcp.example.com:443/mcp" {
 		t.Fatalf("approval requests = %+v", provider.requests)
@@ -130,7 +135,13 @@ func TestRemoteSessionAgainstStreamableServer(t *testing.T) {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "fixture-result"}}}, nil
 	})
 	streamableHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
+	var authorizationSeen int
 	httpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer synthetic-remote-token" {
+			t.Errorf("authorization = %q, want host-vault token", r.Header.Get("Authorization"))
+		} else {
+			authorizationSeen++
+		}
 		// The SDK rejects a non-loopback Host on its loopback test listener.
 		r.Host = "127.0.0.1"
 		streamableHandler.ServeHTTP(w, r)
@@ -158,7 +169,15 @@ func TestRemoteSessionAgainstStreamableServer(t *testing.T) {
 	// Pin the test CA; production uses the system trust store.
 	manager.SetRemoteTLSConfig(&tls.Config{InsecureSkipVerify: true}) // #nosec G402 -- self-signed controlled httptest endpoint.
 
-	registered := Server{Name: "remote-fixture", Transport: transportRemote, URL: "https://mcp.example.test:443"}
+	registered := Server{Name: "remote-fixture", Transport: transportRemote, URL: "https://mcp.example.test:443", Headers: map[string]string{"Authorization": "Bearer ${token}"}}
+	var secretResolutions int
+	manager.SetRemoteSecretResolver(func(_ context.Context, serverName, placeholder string) ([]byte, error) {
+		if serverName != "remote-fixture" || placeholder != "token" {
+			t.Errorf("resolver request = %q/%q", serverName, placeholder)
+		}
+		secretResolutions++
+		return []byte("synthetic-remote-token"), nil
+	})
 	session, err := manager.startRemoteSession(context.Background(), registered)
 	if err != nil {
 		t.Fatal(err)
@@ -173,6 +192,9 @@ func TestRemoteSessionAgainstStreamableServer(t *testing.T) {
 	}
 	if len(result.Content) != 1 {
 		t.Fatalf("content = %+v", result.Content)
+	}
+	if authorizationSeen == 0 || secretResolutions != authorizationSeen {
+		t.Fatalf("authorization requests=%d vault resolutions=%d", authorizationSeen, secretResolutions)
 	}
 }
 

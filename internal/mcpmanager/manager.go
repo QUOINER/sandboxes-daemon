@@ -113,6 +113,18 @@ type Manager struct {
 	remoteTLSConfig *tls.Config
 	remoteLookup    func(context.Context, string, string) ([]netip.Addr, error)
 	remoteDial      func(context.Context, string, string) (net.Conn, error)
+	remoteSecrets   RemoteSecretResolver
+}
+
+// RemoteSecretResolver resolves one MCP header placeholder from the host vault.
+// Implementations must return only the requested secret and redact errors.
+type RemoteSecretResolver func(context.Context, string, string) ([]byte, error)
+
+// SetRemoteSecretResolver configures host-side lookup for remote MCP headers.
+func (m *Manager) SetRemoteSecretResolver(resolver RemoteSecretResolver) {
+	m.mu.Lock()
+	m.remoteSecrets = resolver
+	m.mu.Unlock()
 }
 
 func (m *Manager) SetApprovalProvider(provider ApprovalProvider) {

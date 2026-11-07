@@ -8,6 +8,7 @@ import (
 	"github.com/rheic/sandboxes-core/sandbox"
 
 	"github.com/rheic/sandboxes-daemon/internal/mcpmanager"
+	"github.com/rheic/sandboxes-daemon/internal/servicesecrets"
 )
 
 func (s *Service) mcpRegistry(ctx context.Context) (*mcpmanager.Manager, error) {
@@ -22,6 +23,12 @@ func (s *Service) mcpRegistry(ctx context.Context) (*mcpmanager.Manager, error) 
 	}
 	manager.SetRemoteAllowlist(s.mcpRemoteHosts)
 	manager.SetApprovalProvider(s.mcpApprover)
+	manager.SetRemoteSecretResolver(func(ctx context.Context, serverName, placeholder string) ([]byte, error) {
+		if s.serviceSecrets == nil {
+			return nil, servicesecrets.ErrNotFound
+		}
+		return s.serviceSecrets.Resolve(ctx, "mcp:"+serverName+":"+placeholder, servicesecrets.ScopeGlobal, "")
+	})
 	s.mcpManager = manager
 	return manager, nil
 }
