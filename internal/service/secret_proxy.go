@@ -349,6 +349,21 @@ func (s *Service) buildProxyRoutes(ctx context.Context, sb sandbox.Sandbox, serv
 	routes := make(map[string]secretproxy.RouteConfig, len(serviceNames))
 	runtimeRoutes := make([]string, 0, len(serviceNames))
 	for _, serviceName := range serviceNames {
+		if serviceName == privateRegistryProxyService {
+			scope, err := s.privateRegistryScopeFor(ctx, sb.ID)
+			if err != nil {
+				clearRouteSecrets(routes)
+				return nil, nil, err
+			}
+			route, runtimeRoute, err := s.buildPrivateRegistryProxy(ctx, sb, scope)
+			if err != nil {
+				clearRouteSecrets(routes)
+				return nil, nil, err
+			}
+			routes[serviceName] = route
+			runtimeRoutes = append(runtimeRoutes, runtimeRoute)
+			continue
+		}
 		if serviceName == dockerHubProxyService {
 			route, runtimeRoute, err := s.buildDockerHubProxy(ctx, sb, registryScope)
 			if err != nil {
@@ -505,7 +520,7 @@ func encodeProxyServices(services []string) string {
 }
 
 func proxyRouteConfigured(service string) bool {
-	if service == dockerHubProxyService {
+	if service == dockerHubProxyService || service == privateRegistryProxyService {
 		return true
 	}
 	_, ok := proxyContract(service)

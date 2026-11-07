@@ -74,3 +74,42 @@ func TestLoadRejectsUnsafeAndUnknown(t *testing.T) {
 		t.Fatalf("permissions error=%v", err)
 	}
 }
+
+func TestRegistryPrivateSettings(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("settings ACLs are covered by TestLoadDefaultsAndFile on Windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "settings.toml")
+	valid := `registry_private_host = "registry.example.test"
+registry_private_service = "registry.example.test"
+registry_private_realms = "auth.example.test/token"
+registry_private_redirects = "cdn.example.test"
+`
+	if err := os.WriteFile(path, []byte(valid), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	values, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values.RegistryPrivateHost != "registry.example.test" || len(values.RegistryPrivateRealms) != 1 || values.RegistryPrivateRealms[0] != "auth.example.test/token" {
+		t.Fatalf("values = %+v", values)
+	}
+	for name, content := range map[string]string{
+		"missing service":  `registry_private_host = "registry.example.test"` + "\n" + `registry_private_realms = "auth.example.test/token"`,
+		"missing realms":   `registry_private_host = "registry.example.test"` + "\n" + `registry_private_service = "svc"`,
+		"missing slash":    `registry_private_host = "registry.example.test"` + "\n" + `registry_private_service = "svc"` + "\n" + `registry_private_realms = "auth.example.test"`,
+		"orphan redirects": `registry_private_redirects = "cdn.example.test"`,
+		"wildcard host":    `registry_private_host = "*.example.test"` + "\n" + `registry_private_service = "svc"` + "\n" + `registry_private_realms = "auth.example.test/token"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatal("invalid settings accepted")
+			}
+		})
+	}
+}

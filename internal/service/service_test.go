@@ -1229,14 +1229,14 @@ func TestStartDockerProfileEnablesOnlyConfiguredRegistryMirror(t *testing.T) {
 	backend := &fakeRuntime{}
 	svc := &Service{backend: backend}
 	handle := runtime.Handle{ID: "owned"}
-	if err := svc.startDockerProfile(context.Background(), handle, false); err != nil {
+	if err := svc.startDockerProfile(context.Background(), handle, false, false); err != nil {
 		t.Fatal(err)
 	}
 	withoutMirror := strings.Join(backend.lastExec.Argv, " ")
 	if strings.Contains(withoutMirror, "--registry-mirror=") {
 		t.Fatal("registry mirror enabled without a scoped credential route")
 	}
-	if err := svc.startDockerProfile(context.Background(), handle, true); err != nil {
+	if err := svc.startDockerProfile(context.Background(), handle, true, false); err != nil {
 		t.Fatal(err)
 	}
 	withMirror := strings.Join(backend.lastExec.Argv, " ")
@@ -2295,5 +2295,50 @@ func TestResetGlobalPolicyClearsRulesAndProfile(t *testing.T) {
 	storedAllow, storedDeny, err := svc.GlobalPolicy(ctx)
 	if err != nil || len(storedAllow) != 0 || len(storedDeny) != 0 {
 		t.Fatalf("stored global policy not cleared: %+v %+v %v", storedAllow, storedDeny, err)
+	}
+}
+
+func TestSetPrivateRegistryValidation(t *testing.T) {
+	svc := &Service{}
+	if err := svc.SetPrivateRegistry("registry.example.test", "svc", []string{"auth.example.test/token"}, []string{"cdn.example.test"}); err != nil {
+		t.Fatal(err)
+	}
+	if svc.privateRegistryHost != "registry.example.test" || svc.privateRegistryRealms[0].Path != "/token" {
+		t.Fatalf("private registry config = %+v", svc)
+	}
+	for name, call := range map[string]func() error{
+		"wildcard host": func() error {
+			return svc.SetPrivateRegistry("*.example.test", "svc", []string{"auth.example.test/token"}, nil)
+		},
+		"missing service": func() error {
+			return svc.SetPrivateRegistry("registry.example.test", "", []string{"auth.example.test/token"}, nil)
+		},
+		"missing realm": func() error { return svc.SetPrivateRegistry("registry.example.test", "svc", nil, nil) },
+		"bad realm host": func() error {
+			return svc.SetPrivateRegistry("registry.example.test", "svc", []string{"bad host/token"}, nil)
+		},
+		"orphan config": func() error { return svc.SetPrivateRegistry("", "svc", nil, nil) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); err == nil {
+				t.Fatal("invalid private registry config accepted")
+			}
+		})
+	}
+}
+
+func TestStartDockerProfilePrivateRegistryUsesProxyEnvWithoutMirror(t *testing.T) {
+	backend := &fakeRuntime{}
+	svc := &Service{backend: backend}
+	handle := runtime.Handle{ID: "owned"}
+	if err := svc.startDockerProfile(context.Background(), handle, false, true); err != nil {
+		t.Fatal(err)
+	}
+	argv := strings.Join(backend.lastExec.Argv, " ")
+	if !strings.Contains(argv, "HTTPS_PROXY=http://127.0.0.1:43135") {
+		t.Fatalf("private registry proxy env missing: %s", argv)
+	}
+	if strings.Contains(argv, "--registry-mirror=") {
+		t.Fatalf("private registry unexpectedly enabled a Docker Hub mirror: %s", argv)
 	}
 }
