@@ -2342,3 +2342,11 @@ func TestStartDockerProfilePrivateRegistryUsesProxyEnvWithoutMirror(t *testing.T
 		t.Fatalf("private registry unexpectedly enabled a Docker Hub mirror: %s", argv)
 	}
 }
+
+func TestSingleProxyEndpointSelectsPrivateRegistry(t *testing.T) {
+	svc := &Service{privateRegistryHost: "registry.example.test"}
+	port, host := svc.singleProxyEndpoint([]string{privateRegistryProxyService}, []string{"registry-private=registry.example.test:43135"})
+	if port != privateRegistryGuestPort || host != "registry.example.test" {
+		t.Fatalf("endpoint = %d %q", port, host)
+	}
+}

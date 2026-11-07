@@ -1177,6 +1177,12 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	state := sandbox.Stopped
 	var handle runtime.Handle
 	var proxyConfig proxyRuntimeConfig
+	if privateRegistryScope != "" {
+		// The route builder resolves the private registry scope from settings.
+		if err := s.store.SetSetting(ctx, privateRegistrySettingKey(sbID), string(privateRegistryScope)); err != nil {
+			return operation.Operation{}, err
+		}
+	}
 	if len(proxyServiceNames) != 0 {
 		proxyConfig, err = s.proxyChannelConfig(ctx, sandbox.Sandbox{ID: sbID, Name: name}, proxyServiceNames, registryScope)
 		if err != nil {

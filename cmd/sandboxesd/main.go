@@ -43,6 +43,10 @@ type options struct {
 	defaultMemoryMiB      uint32
 	dockerVolumeSize      string
 	mcpRemoteAllowedHosts []string
+	registryPrivateHost   string
+	registryPrivateSvc    string
+	registryPrivateRealms []string
+	registryPrivateRedirs []string
 	showVersion           bool
 }
 
@@ -72,20 +76,24 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	err = daemon.Run(ctx, daemon.Config{
-		SocketPath:            opts.socketPath,
-		StateDir:              opts.stateDir,
-		Backend:               backend,
-		DefaultImage:          opts.image,
-		Cleanup:               cleanup,
-		OAuthProviders:        dockerOAuthProviders(),
-		DNSUpstream:           opts.dnsUpstream,
-		DefaultPolicyProfile:  opts.defaultPolicyProfile,
-		DefaultCPUs:           opts.defaultCPUs,
-		DefaultMemoryMiB:      opts.defaultMemoryMiB,
-		DockerVolumeSize:      opts.dockerVolumeSize,
-		MCPRemoteAllowedHosts: opts.mcpRemoteAllowedHosts,
-		GatewayLost:           lost,
-		ProxyHelperPath:       opts.proxyHelperPath,
+		SocketPath:               opts.socketPath,
+		StateDir:                 opts.stateDir,
+		Backend:                  backend,
+		DefaultImage:             opts.image,
+		Cleanup:                  cleanup,
+		OAuthProviders:           dockerOAuthProviders(),
+		DNSUpstream:              opts.dnsUpstream,
+		DefaultPolicyProfile:     opts.defaultPolicyProfile,
+		DefaultCPUs:              opts.defaultCPUs,
+		DefaultMemoryMiB:         opts.defaultMemoryMiB,
+		DockerVolumeSize:         opts.dockerVolumeSize,
+		MCPRemoteAllowedHosts:    opts.mcpRemoteAllowedHosts,
+		RegistryPrivateHost:      opts.registryPrivateHost,
+		RegistryPrivateService:   opts.registryPrivateSvc,
+		RegistryPrivateRealms:    opts.registryPrivateRealms,
+		RegistryPrivateRedirects: opts.registryPrivateRedirs,
+		GatewayLost:              lost,
+		ProxyHelperPath:          opts.proxyHelperPath,
 	})
 	if err != nil {
 		slog.Error("daemon stopped", "error", err)
@@ -129,6 +137,10 @@ func parseOptions() options {
 	opts.defaultMemoryMiB = values.DefaultMemoryMiB
 	opts.dockerVolumeSize = values.DockerVolumeSize
 	opts.mcpRemoteAllowedHosts = values.MCPRemoteAllowedHosts
+	opts.registryPrivateHost = values.RegistryPrivateHost
+	opts.registryPrivateSvc = values.RegistryPrivateService
+	opts.registryPrivateRealms = values.RegistryPrivateRealms
+	opts.registryPrivateRedirs = values.RegistryPrivateRedirects
 	return opts
 }
 
