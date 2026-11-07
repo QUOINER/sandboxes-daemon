@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -85,10 +86,33 @@ func startResolverProcess(command *exec.Cmd) (func() error, func() error, error)
 	}
 	cleanup := func() error {
 		terminateErr := terminate()
+		waitErr := waitForResolverJobExit(job, 5*time.Second)
 		closeErr := windows.CloseHandle(job)
-		return errors.Join(terminateErr, closeErr)
+		return errors.Join(terminateErr, waitErr, closeErr)
 	}
 	return terminate, cleanup, nil
+}
+
+func waitForResolverJobExit(job windows.Handle, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var info resolverJobAccountingInfo
+		if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation,
+			uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), nil); err != nil {
+			return errors.New("query secret resolver job state")
+		}
+		if info.ActiveProcesses == 0 {
+			return nil
+		}
+		select {
+		case <-deadline.C:
+			return errors.New("secret resolver job did not exit during cleanup")
+		case <-ticker.C:
+		}
+	}
 }
 
 func suspendedPrimaryThread(processID uint32) (windows.Handle, error) {

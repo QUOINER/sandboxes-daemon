@@ -75,13 +75,15 @@ func TestCommandSourceIsStoredAndResolvedOnHost(t *testing.T) {
 }
 
 func TestCommandSourceHidesProviderErrorsUnlessRequested(t *testing.T) {
-	_, err := resolveSource(context.Background(), Source{Command: testFailCommand()})
-	if err == nil || strings.Contains(err.Error(), "synthetic-provider-error") {
-		t.Fatalf("default error = %v, want generic error without provider output", err)
-	}
-	_, err = resolveSource(context.Background(), Source{Command: testFailCommand(), ShowError: true})
-	if err == nil || !strings.Contains(err.Error(), "synthetic-provider-error") {
-		t.Fatalf("show-error result = %v, want explicit provider stderr", err)
+	for i := range 20 {
+		_, err := resolveSource(context.Background(), Source{Command: testFailCommand()})
+		if err == nil || strings.Contains(err.Error(), "synthetic-provider-error") {
+			t.Fatalf("iteration %d default error = %v, want generic error without provider output", i, err)
+		}
+		_, err = resolveSource(context.Background(), Source{Command: testFailCommand(), ShowError: true})
+		if err == nil || !strings.Contains(err.Error(), "synthetic-provider-error") {
+			t.Fatalf("iteration %d show-error result = %v, want explicit provider stderr", i, err)
+		}
 	}
 }
 
