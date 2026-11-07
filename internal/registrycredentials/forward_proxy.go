@@ -686,6 +686,7 @@ func (p *PullProxy) finishRegistryRedirect(w http.ResponseWriter, method string,
 			return
 		}
 	}
+	_ = response.Body.Close()
 	copyForwardHeaders(w.Header(), response.Header, true)
 	w.WriteHeader(response.StatusCode)
 }

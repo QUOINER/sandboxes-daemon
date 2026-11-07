@@ -13,6 +13,16 @@ import (
 	"time"
 )
 
+type closeTrackingBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *closeTrackingBody) Close() error {
+	b.closed = true
+	return nil
+}
+
 func TestForwardRegistryTransportRestrictsAuthorityAndOperationKinds(t *testing.T) {
 	transport, err := NewForwardRegistryTransport("registry-1.docker.io", []netip.Prefix{netip.MustParsePrefix("1.1.1.1/32")}, nil)
 	if err != nil {
@@ -220,9 +230,13 @@ func TestConfiguredPrivateBlobRedirectTraversesForwardTLSPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	registryResponse := &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: http.Header{"Location": []string{location}}, Body: http.NoBody}
+	redirectBody := &closeTrackingBody{Reader: strings.NewReader("")}
+	registryResponse := &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: http.Header{"Location": []string{location}}, Body: redirectBody}
 	registryWriter := httptest.NewRecorder()
 	proxy.finishRegistryRedirect(registryWriter, http.MethodGet, endpoint, registryResponse)
+	if !redirectBody.closed {
+		t.Fatal("registry redirect response body was not closed")
+	}
 	if registryWriter.Code != http.StatusTemporaryRedirect || registryWriter.Header().Get("Location") != location {
 		t.Fatalf("configured registry redirect status=%d location=%q", registryWriter.Code, registryWriter.Header().Get("Location"))
 	}
