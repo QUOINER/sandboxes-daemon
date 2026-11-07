@@ -117,21 +117,28 @@ func NewPullProxy(store *Store, cfg PullProxyConfig) (*PullProxy, error) {
 	if _, _, err := validateScope(ScopeSandbox, cfg.SandboxName); err != nil {
 		return nil, errors.New("invalid pull proxy sandbox identity")
 	}
-	redirectAuthorities := cfg.RedirectAuthorities
-	if len(redirectAuthorities) == 0 && strings.EqualFold(authority, "registry-1.docker.io") {
-		redirectAuthorities = []string{dockerHubBlobAuthority}
-	}
-	for _, redirectAuthority := range redirectAuthorities {
-		if _, ok := normalizedRedirectHost(redirectAuthority); !ok {
-			return nil, errors.New("invalid pull proxy redirect authority")
-		}
+	redirectHosts, err := configuredRedirectHosts(authority, cfg.RedirectAuthorities)
+	if err != nil {
+		return nil, err
 	}
 	return &PullProxy{store: store, registry: registry, authority: authority, sandboxName: cfg.SandboxName, credentialScope: cfg.CredentialScope,
 		service: cfg.Service, realms: append([]registryauth.Realm(nil), cfg.Realms...), registryTransport: cfg.RegistryTransport,
 		tokenTransport: cfg.TokenTransport, transportFactory: cfg.TransportFactory, limiter: cfg.Limiter,
 		maxBytes: cfg.MaxBytes, inflight: make(chan struct{}, 4), tlsAuthority: cfg.TLSAuthority,
 		tunnelSlots: make(chan struct{}, 8), tokens: make(map[string]tokenGrant), uploads: make(map[string]uploadSession),
-		blobRedirects: make(map[string]blobRedirectSession), redirectHosts: redirectHostSet(redirectAuthorities)}, nil
+		blobRedirects: make(map[string]blobRedirectSession), redirectHosts: redirectHosts}, nil
+}
+
+func configuredRedirectHosts(authority string, authorities []string) (map[string]struct{}, error) {
+	if len(authorities) == 0 && strings.EqualFold(authority, "registry-1.docker.io") {
+		authorities = []string{dockerHubBlobAuthority}
+	}
+	for _, authority := range authorities {
+		if _, ok := normalizedRedirectHost(authority); !ok {
+			return nil, errors.New("invalid pull proxy redirect authority")
+		}
+	}
+	return redirectHostSet(authorities), nil
 }
 
 func validPullProxyConfig(store *Store, cfg PullProxyConfig) bool {
