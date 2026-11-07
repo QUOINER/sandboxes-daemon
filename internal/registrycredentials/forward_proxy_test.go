@@ -210,9 +210,10 @@ func TestBlobRedirectRejectsExpiredAndUntrustedSessions(t *testing.T) {
 }
 
 func TestConfiguredPrivateBlobRedirectTraversesForwardTLSPath(t *testing.T) {
-	const location = "https://CDN.private.test.:443/v2/team/image/blobs/sha256:abcd?sig=synthetic"
+	const location = "https://CDN.private.test.:443/v2/team%2Fimage/blobs/sha256:abcd?sig=synthetic"
 	redirectTransport := pullRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.Host != "cdn.private.test" || request.URL.Query().Get("sig") != "synthetic" {
+		if request.URL.Host != "cdn.private.test" || request.URL.EscapedPath() != "/v2/team%2Fimage/blobs/sha256:abcd" ||
+			request.URL.Query().Get("sig") != "synthetic" {
 			t.Fatalf("unexpected blob redirect request: %s", request.URL.Redacted())
 		}
 		if got := request.Header.Get("Authorization"); got != "" {
