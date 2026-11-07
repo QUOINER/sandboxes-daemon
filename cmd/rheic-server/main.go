@@ -1,0 +1,344 @@
+package main
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	goruntime "runtime"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/rheic/sandboxes-daemon/internal/controlplane"
+)
+
+func main() {
+	if err := run(); err != nil {
+		slog.Error("self-hosted control plane stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	if goruntime.GOOS != "darwin" && goruntime.GOOS != "linux" {
+		return errors.New("self-hosted control-plane preview currently supports macOS and Linux only")
+	}
+	if len(os.Args) > 1 && os.Args[1] == "keygen" {
+		return generatePolicyKey(os.Args[2:])
+	}
+	if len(os.Args) > 1 && os.Args[1] == "sign-policy" {
+		return signPolicy(os.Args[2:])
+	}
+	return runServer(os.Args[1:])
+}
+
+type serverOptions struct {
+	listen     string
+	dbPath     string
+	tokenPath  string
+	publicKey  string
+	certPath   string
+	privateKey string
+}
+
+func runServer(args []string) error {
+	flags := flag.NewFlagSet("rheic-server", flag.ContinueOnError)
+	listen := flags.String("listen", "127.0.0.1:8443", "HTTPS listen address")
+	dbPath := flags.String("db", "rheic-server.db", "SQLite database path")
+	tokenPath := flags.String("admin-token-file", "", "file with a random 32-byte-or-longer admin bearer token (mode 0600)")
+	publicKeyPath := flags.String("policy-public-key", "", "base64 Ed25519 policy-signing public key file")
+	certPath := flags.String("tls-cert", "", "TLS certificate PEM")
+	keyPath := flags.String("tls-key", "", "TLS private key PEM")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *tokenPath == "" || *publicKeyPath == "" || *certPath == "" || *keyPath == "" {
+		return errors.New("--admin-token-file, --policy-public-key, --tls-cert, and --tls-key are required")
+	}
+	return serve(serverOptions{listen: *listen, dbPath: *dbPath, tokenPath: *tokenPath, publicKey: *publicKeyPath, certPath: *certPath, privateKey: *keyPath})
+}
+
+func serve(options serverOptions) error {
+	token, err := readPrivateFile(options.tokenPath)
+	if err != nil {
+		return fmt.Errorf("read admin token: %w", err)
+	}
+	token = []byte(strings.TrimSpace(string(token)))
+	if len(token) < 32 {
+		return errors.New("admin token must contain at least 32 bytes")
+	}
+	encodedKey, err := os.ReadFile(options.publicKey)
+	if err != nil {
+		return fmt.Errorf("read policy public key: %w", err)
+	}
+	publicKey, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(encodedKey)))
+	if err != nil || len(publicKey) != ed25519.PublicKeySize {
+		return errors.New("policy public key must be a base64 Ed25519 public key")
+	}
+	certificate, err := loadTLSCertificate(options.certPath, options.privateKey)
+	if err != nil {
+		return fmt.Errorf("load TLS certificate: %w", err)
+	}
+	if err := prepareDatabasePath(options.dbPath); err != nil {
+		return err
+	}
+	service, err := controlplane.New(controlplane.Config{DBPath: options.dbPath, AdminToken: token, PolicyKey: ed25519.PublicKey(publicKey)})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := service.Close(); err != nil {
+			slog.Error("close control-plane database", "error", err)
+		}
+	}()
+	server := &http.Server{
+		Addr:              options.listen,
+		Handler:           secureHeaders(service.Handler()),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{certificate}},
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+	slog.Info("self-hosted control plane listening", "address", options.listen)
+	if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve HTTPS: %w", err)
+	}
+	return nil
+}
+
+func loadTLSCertificate(certPath, keyPath string) (tls.Certificate, error) {
+	certInfo, err := os.Lstat(certPath)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("inspect certificate file: %w", err)
+	}
+	if !certInfo.Mode().IsRegular() || certInfo.Mode()&os.ModeSymlink != 0 {
+		return tls.Certificate{}, errors.New("certificate must be a regular file")
+	}
+	//nolint:gosec // The operator configures this public certificate path; it is not secret material.
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("read certificate file: %w", err)
+	}
+	keyPEM, err := readPrivateFile(keyPath)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("read TLS private key: %w", err)
+	}
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("parse certificate pair: %w", err)
+	}
+	return pair, nil
+}
+
+func generatePolicyKey(args []string) error {
+	flags := flag.NewFlagSet("rheic-server keygen", flag.ContinueOnError)
+	prefix := flags.String("prefix", "", "output prefix for .private and .public files")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *prefix == "" || flags.NArg() != 0 {
+		return errors.New("keygen requires --prefix PATH")
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate policy key: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(*prefix), 0o700); err != nil {
+		return fmt.Errorf("create key directory: %w", err)
+	}
+	if err := writeNewFile(*prefix+".private", privateKey, 0o600); err != nil {
+		return err
+	}
+	encodedPublic := []byte(base64.StdEncoding.EncodeToString(publicKey) + "\n")
+	if err := writeNewFile(*prefix+".public", encodedPublic, 0o644); err != nil {
+		_ = os.Remove(*prefix + ".private")
+		return err
+	}
+	fmt.Printf("Created %s.private (keep offline) and %s.public\n", *prefix, *prefix)
+	return nil
+}
+
+func signPolicy(args []string) error {
+	flags := flag.NewFlagSet("rheic-server sign-policy", flag.ContinueOnError)
+	inputPath := flags.String("input", "", "unsigned policy payload JSON")
+	keyPath := flags.String("private-key", "", "offline Ed25519 private key file (mode 0600)")
+	outputPath := flags.String("output", "", "signed bundle output file; stdout when omitted")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *inputPath == "" || *keyPath == "" || flags.NArg() != 0 {
+		return errors.New("sign-policy requires --input FILE and --private-key FILE")
+	}
+	privateKey, err := readPrivateFile(*keyPath)
+	if err != nil {
+		return fmt.Errorf("read policy private key: %w", err)
+	}
+	if len(privateKey) != ed25519.PrivateKeySize {
+		return errors.New("policy private key has invalid size")
+	}
+	input, err := os.Open(*inputPath)
+	if err != nil {
+		return fmt.Errorf("open policy payload: %w", err)
+	}
+	defer func() {
+		if err := input.Close(); err != nil {
+			slog.Error("close policy payload", "error", err)
+		}
+	}()
+	decoder := json.NewDecoder(io.LimitReader(input, 1<<20))
+	decoder.DisallowUnknownFields()
+	var payload controlplane.PolicyPayload
+	if err := decoder.Decode(&payload); err != nil {
+		return fmt.Errorf("decode policy payload: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("policy payload contains trailing JSON")
+	}
+	canonical, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode policy payload: %w", err)
+	}
+	bundle := controlplane.SignedPolicyBundle{Payload: payload, Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(ed25519.PrivateKey(privateKey), canonical))}
+	encoded, err := json.MarshalIndent(bundle, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode signed policy: %w", err)
+	}
+	encoded = append(encoded, '\n')
+	if *outputPath == "" {
+		_, err = os.Stdout.Write(encoded)
+		return err
+	}
+	return writeNewFile(*outputPath, encoded, 0o600)
+}
+
+func writeNewFile(path string, content []byte, mode os.FileMode) error {
+	//nolint:gosec // The operator supplies the output path for generated local key and bundle files.
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", path, err)
+	}
+	if _, err := file.Write(content); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("close %s: %w", path, err)
+	}
+	return nil
+}
+
+func readPrivateFile(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return nil, errors.New("must be a regular file accessible only by its owner")
+	}
+	//nolint:gosec // The operator supplies this path for a locally protected key or token file.
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	openedInfo, err := file.Stat()
+	if err != nil || !os.SameFile(info, openedInfo) {
+		_ = file.Close()
+		return nil, errors.New("private file changed while opening")
+	}
+	defer func() {
+		if err := file.Close(); err != nil {
+			slog.Error("close private input file", "error", err)
+		}
+	}()
+	content, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil {
+		return nil, err
+	}
+	if len(content) > 4096 {
+		return nil, errors.New("private file exceeds 4096-byte limit")
+	}
+	return content, nil
+}
+
+func prepareDatabasePath(path string) error {
+	if path == ":memory:" {
+		return errors.New("persistent SQLite path is required")
+	}
+	if err := ensurePrivateDatabaseDirectory(filepath.Dir(path)); err != nil {
+		return err
+	}
+	return secureDatabaseFile(path)
+}
+
+func ensurePrivateDatabaseDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return fmt.Errorf("create database directory: %w", err)
+	}
+	dirInfo, err := os.Lstat(path)
+	if err != nil || !dirInfo.IsDir() || dirInfo.Mode().Perm()&0o077 != 0 {
+		return errors.New("database directory must be a private directory with mode 0700")
+	}
+	return nil
+}
+
+func secureDatabaseFile(path string) error {
+	priorInfo, statErr := os.Lstat(path)
+	if statErr == nil && (!priorInfo.Mode().IsRegular() || priorInfo.Mode()&os.ModeSymlink != 0) {
+		return errors.New("database path must be a regular file, not a symlink or special file")
+	}
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect database path: %w", statErr)
+	}
+	//nolint:gosec // This is the operator-configured local SQLite database path.
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("create database file: %w", err)
+	}
+	return secureOpenDatabaseFile(file, priorInfo, statErr)
+}
+
+func secureOpenDatabaseFile(file *os.File, priorInfo os.FileInfo, statErr error) error {
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("secure database file: %w", err)
+	}
+	openedInfo, err := file.Stat()
+	if err != nil || (statErr == nil && !os.SameFile(priorInfo, openedInfo)) {
+		_ = file.Close()
+		return errors.New("database file changed while opening")
+	}
+	return file.Close()
+}
+
+func secureHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
+}
