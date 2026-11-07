@@ -28,6 +28,7 @@ import (
 	"github.com/rheic/sandboxes-core/operation"
 	"github.com/rheic/sandboxes-core/sandbox"
 	gatewaypolicy "github.com/rheic/sandboxes-gateway/policy"
+	"github.com/rheic/sandboxes-gateway/registryauth"
 	runtime "github.com/rheic/sandboxes-runtime"
 
 	"github.com/rheic/sandboxes-daemon/internal/mcpmanager"
@@ -50,37 +51,41 @@ const (
 
 // Service coordinates durable sandbox state and operations.
 type Service struct {
-	store                *store.Store
-	journal              *operation.Journal
-	backend              runtime.Backend
-	registryCredentials  *registrycredentials.Store
-	registryPullLimiter  *registrycredentials.PullLimiter
-	serviceSecrets       *servicesecrets.Store
-	secretProxies        *secretproxy.Manager
-	proxyHelperPath      string
-	proxyTempDir         string
-	oauthProviders       map[string]OAuthProvider
-	oauthVaultStore      oauthsession.Vault
-	oauthRefresh         *oauthsession.RefreshCoordinator
-	dockerHubAuth        http.RoundTripper
-	DefaultImage         string
-	DefaultCPUs          uint32
-	DefaultMemoryMiB     uint32
-	DefaultPolicyProfile string
-	DockerVolumeDir      string
-	DockerVolumeSize     string
-	MkfsExt4             string
-	now                  func() time.Time
-	createGates          [64]chan struct{}
-	lifecycleGates       [64]chan struct{}
-	credentialGates      [64]chan struct{}
-	execMu               sync.Mutex
-	execSessions         map[string]map[*execSession]struct{}
-	globalPolicyMu       sync.Mutex
-	mcpMu                sync.Mutex
-	mcpManager           *mcpmanager.Manager
-	mcpApprover          mcpmanager.ApprovalProvider
-	mcpRemoteHosts       []string
+	store                    *store.Store
+	journal                  *operation.Journal
+	backend                  runtime.Backend
+	registryCredentials      *registrycredentials.Store
+	registryPullLimiter      *registrycredentials.PullLimiter
+	serviceSecrets           *servicesecrets.Store
+	secretProxies            *secretproxy.Manager
+	proxyHelperPath          string
+	proxyTempDir             string
+	oauthProviders           map[string]OAuthProvider
+	oauthVaultStore          oauthsession.Vault
+	oauthRefresh             *oauthsession.RefreshCoordinator
+	dockerHubAuth            http.RoundTripper
+	DefaultImage             string
+	DefaultCPUs              uint32
+	DefaultMemoryMiB         uint32
+	DefaultPolicyProfile     string
+	DockerVolumeDir          string
+	DockerVolumeSize         string
+	MkfsExt4                 string
+	now                      func() time.Time
+	createGates              [64]chan struct{}
+	lifecycleGates           [64]chan struct{}
+	credentialGates          [64]chan struct{}
+	execMu                   sync.Mutex
+	execSessions             map[string]map[*execSession]struct{}
+	globalPolicyMu           sync.Mutex
+	mcpMu                    sync.Mutex
+	mcpManager               *mcpmanager.Manager
+	mcpApprover              mcpmanager.ApprovalProvider
+	mcpRemoteHosts           []string
+	privateRegistryHost      string
+	privateRegistrySvc       string
+	privateRegistryRealms    []registryauth.Realm
+	privateRegistryRedirects []string
 }
 
 const dockerHubRegistry = "docker.io"
@@ -1074,7 +1079,7 @@ type CreateRequest struct {
 
 // Create creates a stopped sandbox and a completed create operation.
 //
-//nolint:gocyclo,cyclop,gocognit,funlen // Create is the orchestration boundary for validation, idempotency, runtime startup and persistence.
+//nolint:gocyclo,cyclop,gocognit,funlen,maintidx // Create is the orchestration boundary for validation, idempotency, runtime startup and persistence.
 func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Operation, error) {
 	name := strings.TrimSpace(req.Name)
 	if !validSandboxName(name) {
@@ -1108,6 +1113,17 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		}
 		if registryScope != "" {
 			proxyServiceNames = append(proxyServiceNames, dockerHubProxyService)
+			sort.Strings(proxyServiceNames)
+		}
+	}
+	privateRegistryScope := registrycredentials.Scope("")
+	if req.Privileged && s.privateRegistryConfigured() {
+		privateRegistryScope, err = s.availablePrivateRegistryScope(ctx, name, true)
+		if err != nil {
+			return operation.Operation{}, fmt.Errorf("inspect private registry sandbox credential: %w", err)
+		}
+		if privateRegistryScope != "" {
+			proxyServiceNames = append(proxyServiceNames, privateRegistryProxyService)
 			sort.Strings(proxyServiceNames)
 		}
 	}
@@ -1192,7 +1208,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		if err != nil {
 			return operation.Operation{}, errors.Join(err, cleanupProxy())
 		}
-		if err := s.ensureDockerProfile(ctx, req.Privileged, registryScope != "", handle); err != nil {
+		if err := s.ensureDockerProfile(ctx, req.Privileged, registryScope != "", privateRegistryScope != "", handle); err != nil {
 			return operation.Operation{}, errors.Join(err, s.cleanupCreateFailure(ctx, handle, errors.New("docker profile startup failed")), cleanupProxy())
 		}
 		state = sandbox.Running
@@ -1203,6 +1219,11 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	}
 	if len(proxyServiceNames) != 0 {
 		if err := s.store.SetSetting(ctx, proxyServiceSettingKey(sbID), encodeProxyServices(proxyServiceNames)); err != nil {
+			return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), s.stopProxyChannel(name, sbID, true))
+		}
+	}
+	if privateRegistryScope != "" {
+		if err := s.store.SetSetting(ctx, privateRegistrySettingKey(sbID), string(privateRegistryScope)); err != nil {
 			return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), s.stopProxyChannel(name, sbID, true))
 		}
 	}
@@ -1227,6 +1248,9 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		}
 		if registryScope != "" {
 			_ = s.store.DeleteSetting(ctx, registryProxySettingKey(sbID))
+		}
+		if privateRegistryScope != "" {
+			_ = s.store.DeleteSetting(ctx, privateRegistrySettingKey(sbID))
 		}
 		return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), cleanupProxy())
 	}
@@ -2148,7 +2172,11 @@ func (s *Service) startRuntimeSandbox(ctx context.Context, sb sandbox.Sandbox) e
 	} else if err != nil {
 		return err
 	}
-	return s.startDockerProfile(ctx, handle, registryScope != "")
+	privateScope, err := s.privateRegistryScopeFor(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
+	return s.startDockerProfile(ctx, handle, registryScope != "", privateScope != "")
 }
 
 func dockerSettingKey(id string) string { return "sandbox.docker." + id }
@@ -2443,23 +2471,29 @@ func parseVolumeSize(value string) (int64, error) {
 	return size, nil
 }
 
-func (s *Service) ensureDockerProfile(ctx context.Context, enabled bool, registryMirror bool, handle runtime.Handle) error {
+func (s *Service) ensureDockerProfile(ctx context.Context, enabled bool, registryMirror, privateRegistry bool, handle runtime.Handle) error {
 	if !enabled {
 		return nil
 	}
-	return s.startDockerProfile(ctx, handle, registryMirror)
+	return s.startDockerProfile(ctx, handle, registryMirror, privateRegistry)
 }
 
-func (s *Service) startDockerProfile(ctx context.Context, handle runtime.Handle, registryMirror bool) error {
+func (s *Service) startDockerProfile(ctx context.Context, handle runtime.Handle, registryMirror, privateRegistry bool) error {
 	native, ok := s.backend.(runtime.NativeExecutor)
 	if !ok {
 		return errors.New("runtime does not support native docker profile startup")
 	}
 	registryMirrorArg := ""
 	registryProxyEnv := ""
-	if registryMirror {
-		registryMirrorArg = " --registry-mirror=" + registryMirrorURL
-		registryProxyEnv = `export HTTP_PROXY=http://127.0.0.1:43134 HTTPS_PROXY=http://127.0.0.1:43134
+	proxyPort := uint16(43134)
+	if privateRegistry {
+		proxyPort = privateRegistryGuestPort
+	}
+	if registryMirror || privateRegistry {
+		if registryMirror {
+			registryMirrorArg = " --registry-mirror=" + registryMirrorURL
+		}
+		registryProxyEnv = `export HTTP_PROXY=http://127.0.0.1:` + strconv.Itoa(int(proxyPort)) + ` HTTPS_PROXY=http://127.0.0.1:` + strconv.Itoa(int(proxyPort)) + `
 export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY"
 export NO_PROXY=localhost,127.0.0.1,::1
 export no_proxy="$NO_PROXY"

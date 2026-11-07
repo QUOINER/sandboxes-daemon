@@ -39,6 +39,12 @@ type Config struct {
 	DefaultMemoryMiB      uint32
 	DockerVolumeSize      string
 	MCPRemoteAllowedHosts []string
+	// RegistryPrivate configures one allowlisted private registry reached
+	// through the guest registry proxy (ADR-0006).
+	RegistryPrivateHost      string
+	RegistryPrivateService   string
+	RegistryPrivateRealms    []string
+	RegistryPrivateRedirects []string
 	// GatewayLost reports sandboxes whose gateway exited unexpectedly.
 	GatewayLost     <-chan string
 	ProxyHelperPath string
@@ -46,12 +52,17 @@ type Config struct {
 
 // configureService applies host configuration, wires credential storage and
 // starts the gateway-loss watcher.
-func configureService(ctx context.Context, cfg Config, svc *service.Service) (func() error, error) {
-	applyConfig(svc, cfg)
+func configureService(ctx context.Context, cfg *Config, svc *service.Service) (func() error, error) {
+	applyConfig(svc, *cfg)
 	svc.SetSecretProxyRuntime(cfg.ProxyHelperPath, "/tmp")
 	credentialCleanup, err := configureCredentialStores(svc)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.RegistryPrivateHost != "" {
+		if err := svc.SetPrivateRegistry(cfg.RegistryPrivateHost, cfg.RegistryPrivateService, cfg.RegistryPrivateRealms, cfg.RegistryPrivateRedirects); err != nil {
+			return nil, err
+		}
 	}
 	if cfg.DefaultImage != "" {
 		svc.DefaultImage = cfg.DefaultImage
@@ -85,6 +96,8 @@ func recoverLostGateways(ctx context.Context, svc *service.Service, events <-cha
 }
 
 // Run starts the daemon and blocks until ctx is canceled.
+//
+//nolint:gocritic // Config is constructed once at the process boundary; copying it is intentional.
 func Run(ctx context.Context, cfg Config) (runErr error) {
 	if cfg.SocketPath == "" || cfg.StateDir == "" {
 		return fmt.Errorf("socket path and state dir are required")
@@ -106,7 +119,7 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 
 	svc := service.New(st, cfg.Backend)
 	defer func() { runErr = errors.Join(runErr, svc.Close()) }()
-	credentialCleanup, err := configureService(ctx, cfg, svc)
+	credentialCleanup, err := configureService(ctx, &cfg, svc)
 	if err != nil {
 		return err
 	}
@@ -140,6 +153,7 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	return nil
 }
 
+//nolint:gocritic // Config is a value object assembled by the caller.
 func applyConfig(svc *service.Service, cfg Config) {
 	if cfg.DefaultCPUs != 0 {
 		svc.DefaultCPUs = cfg.DefaultCPUs
@@ -179,6 +193,7 @@ func registerLocalServices(grpcServer *grpc.Server, svc *service.Service) {
 	localv1.RegisterSecretServiceServer(grpcServer, server.NewSecret(svc))
 }
 
+//nolint:gocritic // Config is a value object assembled by the caller.
 func configureOAuth(svc *service.Service, cfg Config) {
 	svc.SetOAuthProviders(cfg.OAuthProviders)
 	if cfg.OAuthVault != nil {

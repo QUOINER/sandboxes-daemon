@@ -21,6 +21,12 @@ type Values struct {
 	DefaultCPUs           uint32
 	DefaultMemoryMiB      uint32
 	DockerVolumeSize      string
+	// RegistryPrivate configures one explicitly allowlisted private registry
+	// reached through the guest registry proxy. Empty disables the feature.
+	RegistryPrivateHost      string
+	RegistryPrivateService   string
+	RegistryPrivateRealms    []string
+	RegistryPrivateRedirects []string
 }
 
 // DefaultPath returns ~/.config/rheic/settings.toml, honoring XDG_CONFIG_HOME.
@@ -86,9 +92,56 @@ func validateValues(values Values) error {
 	if values.DefaultMemoryMiB > 32768 {
 		return errors.New("settings default_memory_mib must be at most 32768")
 	}
+	return validateRegistryPrivate(values)
+}
+
+func validateRegistryPrivate(values Values) error {
+	if values.RegistryPrivateHost == "" {
+		if values.RegistryPrivateService != "" || len(values.RegistryPrivateRealms) != 0 || len(values.RegistryPrivateRedirects) != 0 {
+			return errors.New("settings registry_private_* require registry_private_host")
+		}
+		return nil
+	}
+	if !validDNSHost(values.RegistryPrivateHost) {
+		return errors.New("settings registry_private_host must be an exact DNS hostname")
+	}
+	if values.RegistryPrivateService == "" || len(values.RegistryPrivateService) > 253 || strings.ContainsAny(values.RegistryPrivateService, " \t\r\n") {
+		return errors.New("settings registry_private_service is required and must be a token")
+	}
+	if len(values.RegistryPrivateRealms) == 0 {
+		return errors.New("settings registry_private_realms is required")
+	}
 	return nil
 }
 
+func parseRegistryRealms(value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	seen := make(map[string]struct{})
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		host, path, found := strings.Cut(part, "/")
+		host = strings.ToLower(strings.TrimSpace(host))
+		if !found || !validDNSHost(host) || path == "" || strings.ContainsAny(path, "?#\\") || strings.Contains(path, "..") {
+			return nil, errors.New("registry_private_realms must be a comma-separated list of HOST/PATH")
+		}
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		entry := host + path
+		if _, exists := seen[entry]; exists {
+			return nil, errors.New("registry_private_realms contains a duplicate entry")
+		}
+		seen[entry] = struct{}{}
+		out = append(out, entry)
+	}
+	return out, nil
+}
+
+//nolint:gocyclo,cyclop // flat settings key dispatch; helpers own the per-key validation.
 func parse(r io.Reader, values *Values) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 4096), 64*1024)
@@ -125,12 +178,38 @@ func parse(r io.Reader, values *Values) error {
 			}
 		case "docker_volume_size":
 			values.DockerVolumeSize = value
+		case "registry_private_host", "registry_private_service", "registry_private_realms", "registry_private_redirects":
+			if err := parseRegistryPrivateSetting(values, key, value); err != nil {
+				return fmt.Errorf("settings line %d: %w", lineNumber, err)
+			}
 		default:
 			return fmt.Errorf("settings line %d: unknown key %q", lineNumber, key)
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("read settings: %w", err)
+	}
+	return nil
+}
+
+func parseRegistryPrivateSetting(values *Values, key, value string) error {
+	switch key {
+	case "registry_private_host":
+		values.RegistryPrivateHost = strings.ToLower(strings.TrimSpace(value))
+	case "registry_private_service":
+		values.RegistryPrivateService = strings.TrimSpace(value)
+	case "registry_private_realms":
+		realms, err := parseRegistryRealms(value)
+		if err != nil {
+			return err
+		}
+		values.RegistryPrivateRealms = realms
+	case "registry_private_redirects":
+		redirects, err := parseHostList(value)
+		if err != nil {
+			return err
+		}
+		values.RegistryPrivateRedirects = redirects
 	}
 	return nil
 }
