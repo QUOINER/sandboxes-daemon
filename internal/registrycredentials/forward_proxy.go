@@ -44,7 +44,11 @@ func (p *PullProxy) serveForwardRequest(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "TLS host does not match CONNECT target", http.StatusMisdirectedRequest)
 		return
 	}
-	host := strings.ToLower(strings.TrimSuffix(r.TLS.ServerName, "."))
+	host, ok := normalizedRedirectHost(r.TLS.ServerName)
+	if !ok {
+		http.Error(w, "invalid TLS host", http.StatusMisdirectedRequest)
+		return
+	}
 	// A registry may serve its token endpoint on the registry host itself, so
 	// an exact realm path wins over the registry route on the same host.
 	if realm, ok := p.realmForPath(host, r.URL.Path); ok {
@@ -669,7 +673,7 @@ func (p *PullProxy) finishRegistryRedirect(w http.ResponseWriter, method string,
 		http.Error(w, "registry write redirect is unsupported", http.StatusBadGateway)
 		return
 	}
-	redirect, err := validatePullRedirect(endpoint, response.Header.Get("Location"), p.authority)
+	redirect, err := p.validatePullRedirect(endpoint, response.Header.Get("Location"))
 	if err != nil {
 		_ = response.Body.Close()
 		http.Error(w, "registry redirect is untrusted", http.StatusBadGateway)
@@ -682,6 +686,7 @@ func (p *PullProxy) finishRegistryRedirect(w http.ResponseWriter, method string,
 			return
 		}
 	}
+	_ = response.Body.Close()
 	copyForwardHeaders(w.Header(), response.Header, true)
 	w.WriteHeader(response.StatusCode)
 }
@@ -870,10 +875,16 @@ func (p *PullProxy) serveBlobRedirectRequest(w http.ResponseWriter, r *http.Requ
 }
 
 func (p *PullProxy) recordBlobRedirect(endpoint *url.URL) error {
-	if endpoint == nil || !strings.EqualFold(endpoint.Scheme, registryHTTPScheme) || !trustedPullRedirectHost(endpoint.Host) || endpoint.User != nil || endpoint.Fragment != "" {
+	if endpoint == nil || !strings.EqualFold(endpoint.Scheme, registryHTTPScheme) || endpoint.User != nil || endpoint.Fragment != "" {
 		return errors.New("invalid blob redirect session")
 	}
-	key := endpoint.String()
+	host, ok := normalizedRedirectHost(endpoint.Host)
+	if !ok || !p.isRedirectHost(host) {
+		return errors.New("invalid blob redirect session")
+	}
+	canonical := *endpoint
+	canonical.Host = host
+	key := canonical.String()
 	p.stateMu.Lock()
 	defer p.stateMu.Unlock()
 	if p.blobRedirects == nil {
@@ -893,13 +904,16 @@ func (p *PullProxy) recordBlobRedirect(endpoint *url.URL) error {
 }
 
 func (p *PullProxy) consumeBlobRedirect(endpoint *url.URL) bool {
-	if endpoint == nil || !strings.EqualFold(endpoint.Scheme, registryHTTPScheme) {
+	if endpoint == nil || !strings.EqualFold(endpoint.Scheme, registryHTTPScheme) || endpoint.User != nil || endpoint.Fragment != "" {
 		return false
 	}
-	if !p.isRedirectHost(endpoint.Host) {
+	host, ok := normalizedRedirectHost(endpoint.Host)
+	if !ok || !p.isRedirectHost(host) {
 		return false
 	}
-	key := endpoint.String()
+	canonical := *endpoint
+	canonical.Host = host
+	key := canonical.String()
 	p.stateMu.Lock()
 	defer p.stateMu.Unlock()
 	session, ok := p.blobRedirects[key]
@@ -917,8 +931,12 @@ func (p *PullProxy) consumeBlobRedirect(endpoint *url.URL) bool {
 }
 
 func (p *PullProxy) fetchBlobRedirect(ctx context.Context, r *http.Request, host string) (*http.Response, error) {
-	if p.transportFactory == nil {
+	if p.transportFactory == nil || r == nil || r.URL == nil {
 		return nil, errors.New("blob redirect transport factory is unavailable")
+	}
+	host, ok := normalizedRedirectHost(host)
+	if !ok || !p.isRedirectHost(host) {
+		return nil, errors.New("blob redirect authority is not allowed")
 	}
 	transport, err := p.transportFactory.Redirect(ctx, host)
 	if err != nil {
@@ -931,7 +949,7 @@ func (p *PullProxy) fetchBlobRedirect(ctx context.Context, r *http.Request, host
 	}
 	request.Header.Set("Accept-Encoding", "identity")
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return client.Do(request) // #nosec G704 -- factory permits only the pinned Docker Hub blob redirect host.
+	return client.Do(request) // #nosec G704 -- factory enforces configured host allowlisting with policy-checked DNS pins.
 }
 
 func (p *PullProxy) writeBlobRedirect(w http.ResponseWriter, method string, response *http.Response) {

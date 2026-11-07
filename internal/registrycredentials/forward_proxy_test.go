@@ -1,14 +1,27 @@
 package registrycredentials
 
 import (
+	"crypto/tls"
 	"crypto/x509"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 )
+
+type closeTrackingBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *closeTrackingBody) Close() error {
+	b.closed = true
+	return nil
+}
 
 func TestForwardRegistryTransportRestrictsAuthorityAndOperationKinds(t *testing.T) {
 	transport, err := NewForwardRegistryTransport("registry-1.docker.io", []netip.Prefix{netip.MustParsePrefix("1.1.1.1/32")}, nil)
@@ -144,7 +157,7 @@ func TestUploadSessionBindsExactIssuedLocation(t *testing.T) {
 }
 
 func TestBlobRedirectRequiresExactRegistryIssuedURL(t *testing.T) {
-	proxy := &PullProxy{}
+	proxy := &PullProxy{redirectHosts: redirectHostSet([]string{dockerHubBlobAuthority})}
 	issued, err := url.Parse("https://production.cloudfront.docker.com/v2/blobs/sha256:abc?sig=synthetic")
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +191,7 @@ func TestBlobRedirectRequiresExactRegistryIssuedURL(t *testing.T) {
 }
 
 func TestBlobRedirectRejectsExpiredAndUntrustedSessions(t *testing.T) {
-	proxy := &PullProxy{blobRedirects: make(map[string]blobRedirectSession)}
+	proxy := &PullProxy{blobRedirects: make(map[string]blobRedirectSession), redirectHosts: redirectHostSet([]string{dockerHubBlobAuthority})}
 	expired, err := url.Parse("https://production.cloudfront.docker.com/blob?sig=expired")
 	if err != nil {
 		t.Fatal(err)
@@ -193,6 +206,73 @@ func TestBlobRedirectRejectsExpiredAndUntrustedSessions(t *testing.T) {
 	}
 	if err := proxy.recordBlobRedirect(untrusted); err == nil {
 		t.Fatal("recorded a redirect to an untrusted host")
+	}
+}
+
+func TestConfiguredPrivateBlobRedirectTraversesForwardTLSPath(t *testing.T) {
+	const location = "https://CDN.private.test.:443/v2/team/image/blobs/sha256:abcd?sig=synthetic"
+	redirectTransport := pullRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host != "cdn.private.test" || request.URL.Query().Get("sig") != "synthetic" {
+			t.Fatalf("unexpected blob redirect request: %s", request.URL.Redacted())
+		}
+		if got := request.Header.Get("Authorization"); got != "" {
+			t.Fatalf("registry bearer crossed to blob host: %q", got)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("blob")), ContentLength: 4}, nil
+	})
+	proxy := &PullProxy{
+		authority: "registry.private.test", redirectHosts: redirectHostSet([]string{"CDN.private.test."}),
+		maxBytes: 64, limiter: NewPullLimiter(),
+		transportFactory: pullRedirectFactory{redirect: redirectTransport, authority: "cdn.private.test"},
+		blobRedirects:    make(map[string]blobRedirectSession),
+	}
+	endpoint, err := url.Parse("https://registry.private.test/v2/team/image/blobs/sha256:abcd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	redirectBody := &closeTrackingBody{Reader: strings.NewReader("")}
+	registryResponse := &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: http.Header{"Location": []string{location}}, Body: redirectBody}
+	registryWriter := httptest.NewRecorder()
+	proxy.finishRegistryRedirect(registryWriter, http.MethodGet, endpoint, registryResponse)
+	if !redirectBody.closed {
+		t.Fatal("registry redirect response body was not closed")
+	}
+	if registryWriter.Code != http.StatusTemporaryRedirect || registryWriter.Header().Get("Location") != location {
+		t.Fatalf("configured registry redirect status=%d location=%q", registryWriter.Code, registryWriter.Header().Get("Location"))
+	}
+
+	request := httptest.NewRequest(http.MethodGet, location, http.NoBody)
+	request.TLS = &tls.ConnectionState{ServerName: "cdn.private.test"}
+	request.Header.Set("Authorization", "Bearer guest-token")
+	blobWriter := httptest.NewRecorder()
+	proxy.serveForwardRequest(blobWriter, request)
+	if blobWriter.Code != http.StatusOK || blobWriter.Body.String() != "blob" {
+		t.Fatalf("configured TLS redirect status=%d body=%q", blobWriter.Code, blobWriter.Body.String())
+	}
+}
+
+func TestForwardTLSPathRejectsUnconfiguredPrivateRedirect(t *testing.T) {
+	proxy := &PullProxy{authority: "registry.private.test", redirectHosts: redirectHostSet(nil)}
+	endpoint, err := url.Parse("https://registry.private.test/v2/team/image/blobs/sha256:abcd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	registryWriter := httptest.NewRecorder()
+	proxy.finishRegistryRedirect(registryWriter, http.MethodGet, endpoint, &http.Response{
+		StatusCode: http.StatusTemporaryRedirect,
+		Header:     http.Header{"Location": []string{"https://cdn.private.test/blob?sig=synthetic"}},
+		Body:       http.NoBody,
+	})
+	if registryWriter.Code != http.StatusBadGateway {
+		t.Fatalf("unconfigured registry redirect status=%d", registryWriter.Code)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "https://cdn.private.test/blob?sig=synthetic", http.NoBody)
+	request.TLS = &tls.ConnectionState{ServerName: "cdn.private.test"}
+	blobWriter := httptest.NewRecorder()
+	proxy.serveForwardRequest(blobWriter, request)
+	if blobWriter.Code != http.StatusForbidden {
+		t.Fatalf("unconfigured TLS redirect status=%d", blobWriter.Code)
 	}
 }
 
