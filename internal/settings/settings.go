@@ -15,11 +15,12 @@ import (
 
 // Values are the supported user overrides. Zero means "not set".
 type Values struct {
-	DNSUpstream          string
-	DefaultPolicyProfile string
-	DefaultCPUs          uint32
-	DefaultMemoryMiB     uint32
-	DockerVolumeSize     string
+	DNSUpstream           string
+	MCPRemoteAllowedHosts []string
+	DefaultPolicyProfile  string
+	DefaultCPUs           uint32
+	DefaultMemoryMiB      uint32
+	DockerVolumeSize      string
 }
 
 // DefaultPath returns ~/.config/rheic/settings.toml, honoring XDG_CONFIG_HOME.
@@ -111,20 +112,17 @@ func parse(r io.Reader, values *Values) error {
 		switch key {
 		case "dns_upstream":
 			values.DNSUpstream = value
+		case "mcp_remote_allowed_hosts", "mcp.remote.allowedHosts":
+			values.MCPRemoteAllowedHosts, err = parseHostList(value)
+			if err != nil {
+				return fmt.Errorf("settings line %d: %w", lineNumber, err)
+			}
 		case "default_policy_profile":
 			values.DefaultPolicyProfile = value
-		case "default_cpus":
-			parsed, err := parseUint(key, value, 64)
-			if err != nil {
-				return err
+		case "default_cpus", "default_memory_mib":
+			if err := parseDefaultResource(values, key, value); err != nil {
+				return fmt.Errorf("settings line %d: %w", lineNumber, err)
 			}
-			values.DefaultCPUs = uint32(parsed) //nolint:gosec // parsed with 32 bits and bounded below.
-		case "default_memory_mib":
-			parsed, err := parseUint(key, value, 32)
-			if err != nil {
-				return err
-			}
-			values.DefaultMemoryMiB = uint32(parsed) //nolint:gosec // parsed with 32 bits and bounded below.
 		case "docker_volume_size":
 			values.DockerVolumeSize = value
 		default:
@@ -135,6 +133,70 @@ func parse(r io.Reader, values *Values) error {
 		return fmt.Errorf("read settings: %w", err)
 	}
 	return nil
+}
+
+func parseDefaultResource(values *Values, key, value string) error {
+	parsed, err := parseUint(key, value, 32)
+	if err != nil {
+		return err
+	}
+	if key == "default_cpus" {
+		if parsed > 64 {
+			return errors.New("default_cpus must be at most 64")
+		}
+		values.DefaultCPUs = uint32(parsed)
+		return nil
+	}
+	values.DefaultMemoryMiB = uint32(parsed) //nolint:gosec // ParseUint uses 32 bits and validateValues applies the 32768 MiB limit.
+	return nil
+}
+
+func parseHostList(value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	seen := make(map[string]struct{})
+	hosts := strings.Split(value, ",")
+	for i := range hosts {
+		host := strings.ToLower(strings.TrimSpace(hosts[i]))
+		if !validDNSHost(host) {
+			return nil, errors.New("mcp_remote_allowed_hosts must be a comma-separated list of exact DNS hostnames")
+		}
+		if _, exists := seen[host]; exists {
+			return nil, errors.New("mcp_remote_allowed_hosts contains a duplicate hostname")
+		}
+		seen[host] = struct{}{}
+		hosts[i] = host
+	}
+	return hosts, nil
+}
+
+func validDNSHost(host string) bool {
+	if host == "" || len(host) > 253 || strings.Contains(host, "*") || strings.HasSuffix(host, ".") {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !validDNSLabel(label) {
+			return false
+		}
+	}
+	return true
+}
+
+func validDNSLabel(label string) bool {
+	if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+		return false
+	}
+	for _, char := range label {
+		valid := char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '-'
+		if !valid {
+			return false
+		}
+	}
+	return true
 }
 
 func parseValue(raw string) (string, error) {

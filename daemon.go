@@ -33,11 +33,12 @@ type Config struct {
 	OAuthProviders map[string]service.OAuthProvider
 	OAuthVault     oauthsession.Vault
 	// Settings are optional host-side overrides loaded before the daemon starts.
-	DNSUpstream          string
-	DefaultPolicyProfile string
-	DefaultCPUs          uint32
-	DefaultMemoryMiB     uint32
-	DockerVolumeSize     string
+	DNSUpstream           string
+	DefaultPolicyProfile  string
+	DefaultCPUs           uint32
+	DefaultMemoryMiB      uint32
+	DockerVolumeSize      string
+	MCPRemoteAllowedHosts []string
 	// GatewayLost reports sandboxes whose gateway exited unexpectedly.
 	GatewayLost     <-chan string
 	ProxyHelperPath string
@@ -147,6 +148,7 @@ func applyConfig(svc *service.Service, cfg Config) {
 		svc.DefaultMemoryMiB = cfg.DefaultMemoryMiB
 	}
 	svc.DefaultPolicyProfile = cfg.DefaultPolicyProfile
+	svc.SetMCPRemoteAllowlist(cfg.MCPRemoteAllowedHosts)
 	if cfg.DockerVolumeSize != "" {
 		svc.DockerVolumeSize = cfg.DockerVolumeSize
 	}

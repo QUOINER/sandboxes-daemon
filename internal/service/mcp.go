@@ -20,9 +20,21 @@ func (s *Service) mcpRegistry(ctx context.Context) (*mcpmanager.Manager, error) 
 	if err != nil {
 		return nil, err
 	}
+	manager.SetRemoteAllowlist(s.mcpRemoteHosts)
 	manager.SetApprovalProvider(s.mcpApprover)
 	s.mcpManager = manager
 	return manager, nil
+}
+
+// SetMCPRemoteAllowlist installs the explicit host administrator policy used
+// by remote MCP. An empty list keeps remote registration disabled.
+func (s *Service) SetMCPRemoteAllowlist(hosts []string) {
+	s.mcpMu.Lock()
+	defer s.mcpMu.Unlock()
+	s.mcpRemoteHosts = append([]string(nil), hosts...)
+	if s.mcpManager != nil {
+		s.mcpManager.SetRemoteAllowlist(hosts)
+	}
 }
 
 // SetMCPApprovalProvider installs a trusted host-side consent mechanism.

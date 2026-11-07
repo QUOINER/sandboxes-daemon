@@ -80,6 +80,7 @@ type Service struct {
 	mcpMu                sync.Mutex
 	mcpManager           *mcpmanager.Manager
 	mcpApprover          mcpmanager.ApprovalProvider
+	mcpRemoteHosts       []string
 }
 
 const dockerHubRegistry = "docker.io"

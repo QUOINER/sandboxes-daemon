@@ -51,9 +51,12 @@ sandboxesd --state "$HOME/.sandboxes" \
 
 `--settings` defaults to `~/.config/rheic/settings.toml`. Supported overrides
 are `dns_upstream`, `default_policy_profile`, `default_cpus`,
-`default_memory_mib` and `docker_volume_size`. The file is strict, mode-checked
-and never contains secrets. DNS and existing gateways need a daemon restart;
-new sandboxes use the policy profile and resource defaults.
+`default_memory_mib`, `docker_volume_size` and `mcp_remote_allowed_hosts`. The
+last is a comma-separated exact DNS host allowlist for remote MCP, for example
+`mcp_remote_allowed_hosts = "mcp.example.com,api.example.com"`; wildcards and
+IP literals are rejected, and an empty value disables remote MCP. The file is
+strict, mode-checked and never contains secrets. Settings need a daemon restart
+to take effect; new sandboxes use the policy profile and resource defaults.
 
 Service proxy references require the matching static guest helper artifact.
 Build it with `make build-proxy-helper` and pass
