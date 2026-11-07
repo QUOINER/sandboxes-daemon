@@ -87,6 +87,45 @@ func TestCommandSourceHidesProviderErrorsUnlessRequested(t *testing.T) {
 	}
 }
 
+func TestBoundedCommandCaptureEnforcesLimit(t *testing.T) {
+	var signals int
+	capture := &boundedCommandCapture{
+		limit: 4,
+		signalLimit: func() {
+			signals++
+		},
+	}
+	if n, err := capture.Write([]byte("1234")); n != 4 || err != nil {
+		t.Fatalf("write at limit = (%d, %v), want (4, nil)", n, err)
+	}
+	if n, err := capture.Write([]byte("5")); n != 0 || !errors.Is(err, errResolverOutputLimit) {
+		t.Fatalf("write beyond limit = (%d, %v), want (0, output limit)", n, err)
+	}
+	if n, err := capture.Write([]byte("6")); n != 0 || !errors.Is(err, errResolverOutputLimit) {
+		t.Fatalf("write after limit = (%d, %v), want (0, output limit)", n, err)
+	}
+	data, exceeded := capture.take()
+	if string(data) != "1234" || !exceeded {
+		t.Fatalf("captured data = %q, exceeded = %v; want bounded prefix and exceeded", data, exceeded)
+	}
+	if signals != 1 {
+		t.Fatalf("limit signal count = %d, want 1", signals)
+	}
+	clear(data)
+}
+
+func TestBoundedCommandCaptureTruncatesOverflowingWrite(t *testing.T) {
+	capture := &boundedCommandCapture{limit: 4}
+	if n, err := capture.Write([]byte("12345")); n != 4 || !errors.Is(err, errResolverOutputLimit) {
+		t.Fatalf("overflowing write = (%d, %v), want (4, output limit)", n, err)
+	}
+	data, exceeded := capture.take()
+	if string(data) != "1234" || !exceeded {
+		t.Fatalf("captured data = %q, exceeded = %v; want bounded prefix and exceeded", data, exceeded)
+	}
+	clear(data)
+}
+
 func TestCommandSourceCancellationCleansUpProcess(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
