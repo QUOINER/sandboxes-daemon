@@ -1060,3 +1060,89 @@ func TestUnixProxyCAEndpointRequiresChannelToken(t *testing.T) {
 		}
 	}
 }
+
+// TestUnixProxyCAEndpointBindsTokenToRequestedRoute covers a distinct
+// fail-closed guarantee beyond requiring a channel token: a token minted for
+// one configured route must not unlock CA trust material for a different route.
+func TestUnixProxyCAEndpointBindsTokenToRequestedRoute(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "kqproxy-ca-route-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "proxy.sock")
+	tokenA := strings.Repeat("a", 64)
+	tokenB := strings.Repeat("b", 64)
+	manager := New()
+	if _, err := manager.StartUnixRoutes(context.Background(), "ca-route-token-test", map[string]RouteConfig{
+		"openai": {
+			Service: Service{Upstream: "https://api.openai.com", Header: "Authorization", Prefix: "Bearer "},
+			Token:   tokenA,
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+			CACert:  []byte("synthetic-ca-a"),
+		},
+		"anthropic": {
+			Service: Service{Upstream: "https://api.anthropic.com", Header: "x-api-key"},
+			Token:   tokenB,
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+			CACert:  []byte("synthetic-ca-b"),
+		},
+	}, socket); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+
+	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var dialer net.Dialer
+		return dialer.DialContext(ctx, "unix", socket)
+	}}
+	t.Cleanup(transport.CloseIdleConnections)
+	client := &http.Client{Transport: transport}
+
+	for _, tc := range []struct {
+		service string
+		token   string
+		want    int
+		body    string
+	}{
+		{service: "openai", token: tokenA, want: http.StatusOK, body: "synthetic-ca-a"},
+		{service: "anthropic", token: tokenB, want: http.StatusOK, body: "synthetic-ca-b"},
+	} {
+		request, err := http.NewRequest(http.MethodGet, "http://broker/__rheic/proxy/ca/"+tc.service, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set(TokenHeader, tc.token)
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if readErr != nil || response.StatusCode != tc.want || string(body) != tc.body {
+			t.Fatalf("service=%s positive CA status=%d body=%q err=%v", tc.service, response.StatusCode, body, readErr)
+		}
+	}
+
+	for _, tc := range []struct {
+		service string
+		token   string
+	}{
+		{service: "openai", token: tokenB},
+		{service: "anthropic", token: tokenA},
+	} {
+		request, err := http.NewRequest(http.MethodGet, "http://broker/__rheic/proxy/ca/"+tc.service, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set(TokenHeader, tc.token)
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusForbidden {
+			t.Fatalf("service=%s with foreign route token status=%d, want %d", tc.service, response.StatusCode, http.StatusForbidden)
+		}
+	}
+}
