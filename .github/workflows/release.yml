@@ -52,7 +52,7 @@ jobs:
             out="dist/sandboxesd-${os}-${arch}"
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
               -ldflags="-s -w -X github.com/rheic/sandboxes-daemon/internal/version.Version=$VERSION" -o "$out" ./cmd/sandboxesd
-            sha256sum "$out" > "$out.sha256"
+            (cd dist && sha256sum "${out#dist/}") > "$out.sha256"
           done
           actual=$(dist/sandboxesd-linux-amd64 --version)
           [[ "$actual" == "$VERSION" ]]
@@ -61,7 +61,7 @@ jobs:
       - name: Generate SBOM
         run: cyclonedx-gomod mod -json -licenses -type library -output dist/sandboxesd.cdx.json .
       - name: Generate checksums
-        run: sha256sum dist/* > dist/SHA256SUMS
+        run: (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: dist/sandboxesd-darwin-arm64,dist/sandboxesd-darwin-amd64,dist/sandboxesd-linux-arm64,dist/sandboxesd-linux-amd64
@@ -103,7 +103,7 @@ jobs:
           name: release-assets
           path: dist
       - name: Verify downloaded release assets
-        run: sha256sum -c dist/SHA256SUMS
+        run: (cd dist && sha256sum -c SHA256SUMS)
       - name: Publish release assets without replacing existing files
         env:
           GH_TOKEN: ${{ github.token }}
