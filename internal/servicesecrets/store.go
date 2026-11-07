@@ -168,14 +168,20 @@ func (s *Store) Delete(ctx context.Context, service string, scope Scope, sandbox
 }
 
 func validate(service string, scope Scope, sandboxName string) (Summary, error) {
-	service = strings.ToLower(strings.TrimSpace(service))
-	if !validService(service) {
+	service = strings.TrimSpace(service)
+	if !strings.Contains(service, ":") {
+		service = strings.ToLower(service)
+	}
+	if !validService(service) && !validMCPHeaderSecretService(service) {
 		return Summary{}, fmt.Errorf("%w: unsupported service %q", ErrInvalid, service)
 	}
 	if scope == "" {
 		scope = ScopeGlobal
 	}
 	sandboxName = strings.TrimSpace(sandboxName)
+	if validMCPHeaderSecretService(service) && scope != ScopeGlobal {
+		return Summary{}, fmt.Errorf("%w: MCP header secrets must use global scope", ErrInvalid)
+	}
 	switch scope {
 	case ScopeGlobal:
 		if sandboxName != "" {
@@ -189,6 +195,33 @@ func validate(service string, scope Scope, sandboxName string) (Summary, error) 
 		return Summary{}, fmt.Errorf("%w: scope must be global or sandbox", ErrInvalid)
 	}
 	return Summary{Service: service, Scope: scope, SandboxName: sandboxName}, nil
+}
+
+func validMCPHeaderSecretService(service string) bool {
+	parts := strings.Split(service, ":")
+	if len(parts) != 3 || parts[0] != "mcp" || !validMCPNamePart(parts[1], true) {
+		return false
+	}
+	return validMCPNamePart(parts[2], false)
+}
+
+func validMCPNamePart(value string, allowDot bool) bool {
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for index, char := range value {
+		if !validMCPSecretCharacter(char, allowDot) || index == 0 && (char == '-' || char == '_' || char == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+func validMCPSecretCharacter(char rune, allowDot bool) bool {
+	if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-' {
+		return true
+	}
+	return allowDot && char == '.'
 }
 
 func validService(service string) bool {

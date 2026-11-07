@@ -55,6 +55,32 @@ func TestStoreRoundTripAndScopes(t *testing.T) {
 	}
 }
 
+func TestMCPHeaderSecretUsesExactGlobalVaultKey(t *testing.T) {
+	backend := &fakeBackend{items: make(map[string]string)}
+	store, err := NewStore(NativeVault{Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	key := "mcp:CaseSensitive.Server:api_token"
+	if _, err := store.Save(ctx, key, ScopeGlobal, "", []byte("synthetic-mcp-secret")); err != nil {
+		t.Fatal(err)
+	}
+	secret, err := store.Resolve(ctx, key, ScopeGlobal, "")
+	if err != nil || string(secret) != "synthetic-mcp-secret" {
+		t.Fatalf("secret=%q err=%v", secret, err)
+	}
+	clear(secret)
+	if _, err := store.Save(ctx, key, ScopeSandbox, "owned-fixture", []byte("x")); err == nil {
+		t.Fatal("accepted sandbox-scoped MCP header secret")
+	}
+	for _, invalid := range []string{"mcp:../server:token", "mcp:server:../token", "mcp:server:token:extra", "MCP:server:token"} {
+		if _, err := store.Save(ctx, invalid, ScopeGlobal, "", []byte("x")); err == nil {
+			t.Errorf("accepted invalid MCP vault key %q", invalid)
+		}
+	}
+}
+
 func TestStoreRejectsUnsafeInputs(t *testing.T) {
 	store, _ := NewStore(NativeVault{Backend: &fakeBackend{items: make(map[string]string)}})
 	ctx := context.Background()
