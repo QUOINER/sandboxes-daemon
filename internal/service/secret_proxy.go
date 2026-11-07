@@ -293,7 +293,7 @@ func (s *Service) proxyChannelConfig(ctx context.Context, sb sandbox.Sandbox, se
 	clearRouteSecrets(routes)
 	prepared = true
 	config := proxyRuntimeConfig{port: proxySocketPort, socketPath: socketPath, helperPath: s.proxyHelperPath, routes: runtimeRoutes}
-	config.guestPort, config.serviceHost = singleProxyEndpoint(serviceNames, runtimeRoutes)
+	config.guestPort, config.serviceHost = s.singleProxyEndpoint(serviceNames, runtimeRoutes)
 	return config, nil
 }
 
@@ -306,12 +306,15 @@ func hasServiceSecretRoute(serviceNames []string) bool {
 	return false
 }
 
-func singleProxyEndpoint(serviceNames, runtimeRoutes []string) (uint16, string) {
+func (s *Service) singleProxyEndpoint(serviceNames, runtimeRoutes []string) (uint16, string) {
 	if len(runtimeRoutes) != 1 || len(serviceNames) != 1 {
 		return 0, ""
 	}
 	if serviceNames[0] == dockerHubProxyService {
 		return dockerHubGuestPort, dockerHubRegistryHost
+	}
+	if serviceNames[0] == privateRegistryProxyService {
+		return privateRegistryGuestPort, s.privateRegistryHost
 	}
 	if contract, ok := proxyContract(serviceNames[0]); ok {
 		return contract.guestPort, contract.upstreamHost

@@ -242,7 +242,9 @@ func (f privateRegistryTransportFactory) prefixes(ctx context.Context, host stri
 	for _, address := range addresses {
 		address = address.Unmap()
 		if !address.IsValid() || address.IsLoopback() || address.IsLinkLocalUnicast() || address.IsUnspecified() || address.IsMulticast() {
-			return nil, errors.New("private registry resolved to an unsupported address")
+			// A hostname may resolve to loopback in addition to reachable
+			// addresses; skip the unusable entry and keep the verified set.
+			continue
 		}
 		decision, err := f.service.checkResolvedEgress(ctx, f.sandboxID, host, address)
 		if err != nil {
@@ -265,8 +267,11 @@ func (f privateRegistryTransportFactory) prefixes(ctx context.Context, host stri
 }
 
 func (s *Service) buildPrivateRegistryProxy(ctx context.Context, sb sandbox.Sandbox, scope registrycredentials.Scope) (secretproxy.RouteConfig, string, error) {
-	if !s.privateRegistryConfigured() || (scope != registrycredentials.ScopeSandbox && scope != registrycredentials.ScopeAllSandboxes) {
-		return secretproxy.RouteConfig{}, "", fmt.Errorf("%w: private registry broker is unavailable", core.ErrConflict)
+	if !s.privateRegistryConfigured() {
+		return secretproxy.RouteConfig{}, "", fmt.Errorf("%w: private registry is not configured (%q)", core.ErrConflict, s.privateRegistryHost)
+	}
+	if scope != registrycredentials.ScopeSandbox && scope != registrycredentials.ScopeAllSandboxes {
+		return secretproxy.RouteConfig{}, "", fmt.Errorf("%w: private registry scope %q is invalid", core.ErrConflict, scope)
 	}
 	ca, err := s.registryCredentials.ProxyCA(ctx)
 	if err != nil {
