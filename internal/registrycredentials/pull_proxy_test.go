@@ -81,6 +81,11 @@ func TestNewPullProxyRejectsInvalidRedirectAuthority(t *testing.T) {
 	if err == nil {
 		t.Fatal("NewPullProxy accepted a non-HTTPS registry redirect authority")
 	}
+	for _, invalid := range []string{"*", "cdn..private.test", "-cdn.private.test", "cdn.private.test:"} {
+		if _, ok := normalizedRedirectHost(invalid); ok {
+			t.Errorf("normalizedRedirectHost(%q) accepted an invalid DNS authority", invalid)
+		}
+	}
 }
 
 func TestForwardProxyConnectTerminatesTLSForBoundHostOnly(t *testing.T) {

@@ -387,11 +387,14 @@ func normalizedRedirectHost(authority string) (string, bool) {
 	if err != nil || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
 		return "", false
 	}
+	if strings.HasSuffix(parsed.Host, ":") {
+		return "", false
+	}
 	if port := parsed.Port(); port != "" && port != "443" {
 		return "", false
 	}
 	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
-	if host == "" || net.ParseIP(host) != nil {
+	if net.ParseIP(host) != nil || !validRegistryHostname(host) {
 		return "", false
 	}
 	return host, true
