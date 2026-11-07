@@ -121,6 +121,11 @@ func NewPullProxy(store *Store, cfg PullProxyConfig) (*PullProxy, error) {
 	if len(redirectAuthorities) == 0 && strings.EqualFold(authority, "registry-1.docker.io") {
 		redirectAuthorities = []string{dockerHubBlobAuthority}
 	}
+	for _, redirectAuthority := range redirectAuthorities {
+		if _, ok := normalizedRedirectHost(redirectAuthority); !ok {
+			return nil, errors.New("invalid pull proxy redirect authority")
+		}
+	}
 	return &PullProxy{store: store, registry: registry, authority: authority, sandboxName: cfg.SandboxName, credentialScope: cfg.CredentialScope,
 		service: cfg.Service, realms: append([]registryauth.Realm(nil), cfg.Realms...), registryTransport: cfg.RegistryTransport,
 		tokenTransport: cfg.TokenTransport, transportFactory: cfg.TransportFactory, limiter: cfg.Limiter,
@@ -522,16 +527,19 @@ func (p *PullProxy) allowedConnectHost(host string) bool {
 }
 
 func (p *PullProxy) isRedirectHost(host string) bool {
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	_, ok := p.redirectHosts[host]
+	host, ok := normalizedRedirectHost(host)
+	if !ok {
+		return false
+	}
+	_, ok = p.redirectHosts[host]
 	return ok
 }
 
 func redirectHostSet(hosts []string) map[string]struct{} {
 	set := make(map[string]struct{}, len(hosts))
 	for _, host := range hosts {
-		host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-		if host != "" {
+		if normalized, ok := normalizedRedirectHost(strings.TrimSpace(host)); ok {
+			host = normalized
 			set[host] = struct{}{}
 		}
 	}

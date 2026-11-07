@@ -44,7 +44,11 @@ func (p *PullProxy) serveForwardRequest(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "TLS host does not match CONNECT target", http.StatusMisdirectedRequest)
 		return
 	}
-	host := strings.ToLower(strings.TrimSuffix(r.TLS.ServerName, "."))
+	host, ok := normalizedRedirectHost(r.TLS.ServerName)
+	if !ok {
+		http.Error(w, "invalid TLS host", http.StatusMisdirectedRequest)
+		return
+	}
 	// A registry may serve its token endpoint on the registry host itself, so
 	// an exact realm path wins over the registry route on the same host.
 	if realm, ok := p.realmForPath(host, r.URL.Path); ok {
@@ -926,8 +930,12 @@ func (p *PullProxy) consumeBlobRedirect(endpoint *url.URL) bool {
 }
 
 func (p *PullProxy) fetchBlobRedirect(ctx context.Context, r *http.Request, host string) (*http.Response, error) {
-	if p.transportFactory == nil {
+	if p.transportFactory == nil || r == nil || r.URL == nil {
 		return nil, errors.New("blob redirect transport factory is unavailable")
+	}
+	host, ok := normalizedRedirectHost(host)
+	if !ok || !p.isRedirectHost(host) {
+		return nil, errors.New("blob redirect authority is not allowed")
 	}
 	transport, err := p.transportFactory.Redirect(ctx, host)
 	if err != nil {

@@ -70,6 +70,19 @@ func TestNewPullProxyRedirectDefaultsAreRegistryScoped(t *testing.T) {
 	}
 }
 
+func TestNewPullProxyRejectsInvalidRedirectAuthority(t *testing.T) {
+	_, err := NewPullProxy(&Store{}, PullProxyConfig{
+		Registry: "registry.private.test", Authority: "registry.private.test", SandboxName: "synthetic-sandbox",
+		CredentialScope: ScopeSandbox, Service: "registry.fixture",
+		Realms:              []registryauth.Realm{{Host: "auth.private.test", Path: "/token"}},
+		RedirectAuthorities: []string{"cdn.private.test:8443"}, TransportFactory: pullRedirectFactory{},
+		Limiter: NewPullLimiter(), MaxBytes: 1024,
+	})
+	if err == nil {
+		t.Fatal("NewPullProxy accepted a non-HTTPS registry redirect authority")
+	}
+}
+
 func TestForwardProxyConnectTerminatesTLSForBoundHostOnly(t *testing.T) {
 	authority, err := generateProxyAuthority()
 	if err != nil {
