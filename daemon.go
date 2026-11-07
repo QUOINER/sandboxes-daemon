@@ -104,6 +104,7 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	defer func() { _ = st.Close() }()
 
 	svc := service.New(st, cfg.Backend)
+	defer func() { runErr = errors.Join(runErr, svc.Close()) }()
 	credentialCleanup, err := configureService(ctx, cfg, svc)
 	if err != nil {
 		return err
@@ -121,7 +122,9 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 		return fmt.Errorf("listen local daemon endpoint: %w", err)
 	}
 
-	grpcServer := grpc.NewServer()
+	// The MCP contract caps JSON results at 4 MiB. Allow bounded protobuf
+	// framing overhead while keeping all daemon responses size-limited.
+	grpcServer := grpc.NewServer(grpc.MaxSendMsgSize(5 << 20))
 	defer grpcServer.Stop()
 	registerLocalServices(grpcServer, svc)
 

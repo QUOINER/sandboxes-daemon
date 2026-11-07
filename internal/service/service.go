@@ -30,6 +30,7 @@ import (
 	gatewaypolicy "github.com/rheic/sandboxes-gateway/policy"
 	runtime "github.com/rheic/sandboxes-runtime"
 
+	"github.com/rheic/sandboxes-daemon/internal/mcpmanager"
 	"github.com/rheic/sandboxes-daemon/internal/oauthsession"
 	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
 	"github.com/rheic/sandboxes-daemon/internal/secretproxy"
@@ -76,6 +77,9 @@ type Service struct {
 	execMu               sync.Mutex
 	execSessions         map[string]map[*execSession]struct{}
 	globalPolicyMu       sync.Mutex
+	mcpMu                sync.Mutex
+	mcpManager           *mcpmanager.Manager
+	mcpApprover          mcpmanager.ApprovalProvider
 }
 
 const dockerHubRegistry = "docker.io"
