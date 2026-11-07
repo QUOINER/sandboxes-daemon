@@ -29,6 +29,7 @@ type ProxyAuthority struct {
 	certificate *x509.Certificate
 	signer      *ecdsa.PrivateKey
 	pem         []byte
+	hosts       map[string]struct{}
 }
 
 // ProxyCA returns a stable host signing authority, generating and saving one
@@ -170,7 +171,7 @@ func (a *ProxyAuthority) Certificate() []byte {
 // Leaf creates a short-lived server certificate signed by the host authority.
 func (a *ProxyAuthority) Leaf(host string, now time.Time) (tlsCertificate tls.Certificate, err error) {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	if a == nil || a.certificate == nil || a.signer == nil || !trustedProxyHostname(host) {
+	if a == nil || a.certificate == nil || a.signer == nil || !a.allowsHost(host) {
 		return tls.Certificate{}, errors.New("invalid registry proxy certificate request")
 	}
 	serial, err := randomSerial()
@@ -207,7 +208,42 @@ func (a *ProxyAuthority) Leaf(host string, now time.Time) (tlsCertificate tls.Ce
 	return tlsCertificate, nil
 }
 
-func trustedProxyHostname(host string) bool {
+func defaultProxyHosts() map[string]struct{} {
+	return map[string]struct{}{
+		"registry-1.docker.io": {},
+		dockerHubAuthAuthority: {},
+		dockerHubBlobAuthority: {},
+	}
+}
+
+// AllowHosts extends the hosts this authority may sign certificates for. The
+// caller must enforce the same allowlist on the CONNECT/SNI path.
+func (a *ProxyAuthority) AllowHosts(hosts ...string) {
+	if a == nil {
+		return
+	}
+	if a.hosts == nil {
+		a.hosts = defaultProxyHosts()
+	}
+	for _, host := range hosts {
+		host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+		if host != "" {
+			a.hosts[host] = struct{}{}
+		}
+	}
+}
+
+func (a *ProxyAuthority) allowsHost(host string) bool {
+	if a == nil {
+		return false
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if a.hosts != nil {
+		_, ok := a.hosts[host]
+		return ok
+	}
+	// Legacy authorities constructed without an allowlist keep the Docker Hub
+	// host set; any configured authority populates hosts via AllowHosts.
 	switch host {
 	case "registry-1.docker.io", dockerHubAuthAuthority, dockerHubBlobAuthority:
 		return true

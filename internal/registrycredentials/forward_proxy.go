@@ -45,16 +45,19 @@ func (p *PullProxy) serveForwardRequest(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	host := strings.ToLower(strings.TrimSuffix(r.TLS.ServerName, "."))
-	switch host {
-	case dockerHubAuthAuthority:
-		p.serveTokenRequest(w, r)
-	case p.authority:
-		p.serveRegistryForward(w, r, host)
-	case dockerHubBlobAuthority:
-		p.serveBlobRedirectRequest(w, r, host)
-	default:
-		http.Error(w, "registry proxy host is not authorized", http.StatusForbidden)
+	if realm, ok := p.authRealm(host); ok {
+		p.serveTokenRequest(w, r, realm)
+		return
 	}
+	if strings.EqualFold(host, p.authority) {
+		p.serveRegistryForward(w, r, host)
+		return
+	}
+	if p.isRedirectHost(host) {
+		p.serveBlobRedirectRequest(w, r, host)
+		return
+	}
+	http.Error(w, "registry proxy host is not authorized", http.StatusForbidden)
 }
 
 func requestHostMatchesTLS(r *http.Request) bool {
@@ -71,8 +74,8 @@ func requestHostMatchesTLS(r *http.Request) bool {
 	return host == strings.ToLower(strings.TrimSuffix(r.TLS.ServerName, "."))
 }
 
-func (p *PullProxy) serveTokenRequest(w http.ResponseWriter, r *http.Request) {
-	repository, actions, status := requestedTokenScope(r, p.service)
+func (p *PullProxy) serveTokenRequest(w http.ResponseWriter, r *http.Request, realm registryauth.Realm) {
+	repository, actions, status := requestedTokenScope(r, p.service, realm.Path)
 	if status != http.StatusOK {
 		message := "registry token request is invalid"
 		if status == http.StatusForbidden {
@@ -91,7 +94,7 @@ func (p *PullProxy) serveTokenRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer p.limiter.release()
-	transport, err := p.tokenTransportFor(ctx, registryauth.Realm{Host: dockerHubAuthAuthority, Path: registryTokenPath})
+	transport, err := p.tokenTransportFor(ctx, realm)
 	if err != nil {
 		http.Error(w, "registry authentication unavailable", http.StatusBadGateway)
 		return
@@ -105,8 +108,8 @@ func (p *PullProxy) serveTokenRequest(w http.ResponseWriter, r *http.Request) {
 	writeSentinelToken(w, p, repository, actions)
 }
 
-func requestedTokenScope(r *http.Request, service string) (string, map[string]struct{}, int) {
-	if !validTokenRequestEnvelope(r) {
+func requestedTokenScope(r *http.Request, service, tokenPath string) (string, map[string]struct{}, int) {
+	if !validTokenRequestEnvelope(r, tokenPath) {
 		return "", nil, http.StatusForbidden
 	}
 	repository, actions, ok, valid := parseTokenRequestScope(r.URL.RawQuery, service)
@@ -119,8 +122,8 @@ func requestedTokenScope(r *http.Request, service string) (string, map[string]st
 	return repository, actions, http.StatusOK
 }
 
-func validTokenRequestEnvelope(r *http.Request) bool {
-	return r != nil && r.URL != nil && r.Method == http.MethodGet && r.URL.Path == registryTokenPath && r.URL.RawPath == "" &&
+func validTokenRequestEnvelope(r *http.Request, tokenPath string) bool {
+	return r != nil && r.URL != nil && r.Method == http.MethodGet && r.URL.Path == tokenPath && r.URL.RawPath == "" &&
 		r.URL.Opaque == "" && r.URL.Fragment == "" && r.URL.User == nil && r.ContentLength == 0 && len(r.TransferEncoding) == 0
 }
 
@@ -371,14 +374,15 @@ func (p *PullProxy) writeRegistryChallenge(w http.ResponseWriter, operation regi
 	if operation.action == registryActionPush {
 		scope = "repository:" + operation.repository + ":pull,push"
 	}
-	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm=%q,service=%q,scope=%q`, "https://"+dockerHubAuthAuthority+registryTokenPath, p.service, scope))
+	realm := p.realms[0]
+	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm=%q,service=%q,scope=%q`, "https://"+realm.Host+realm.Path, p.service, scope))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
 	_, _ = io.WriteString(w, `{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}`)
 }
 
 func (p *PullProxy) exchangeOperationToken(ctx context.Context, operation registryOperation) (string, error) {
-	transport, err := p.tokenTransportFor(ctx, registryauth.Realm{Host: dockerHubAuthAuthority, Path: registryTokenPath})
+	transport, err := p.tokenTransportFor(ctx, p.realms[0])
 	if err != nil {
 		return "", err
 	}
@@ -857,7 +861,10 @@ func (p *PullProxy) recordBlobRedirect(endpoint *url.URL) error {
 }
 
 func (p *PullProxy) consumeBlobRedirect(endpoint *url.URL) bool {
-	if endpoint == nil || !strings.EqualFold(endpoint.Scheme, registryHTTPScheme) || !strings.EqualFold(endpoint.Host, dockerHubBlobAuthority) {
+	if endpoint == nil || !strings.EqualFold(endpoint.Scheme, registryHTTPScheme) {
+		return false
+	}
+	if !p.isRedirectHost(endpoint.Host) {
 		return false
 	}
 	key := endpoint.String()

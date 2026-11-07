@@ -157,11 +157,12 @@ func (s *Service) buildDockerHubProxy(ctx context.Context, sb sandbox.Sandbox, s
 	proxy, err := registrycredentials.NewPullProxy(s.registryCredentials, registrycredentials.PullProxyConfig{
 		Registry: dockerHubRegistry, Authority: dockerHubRegistryHost, SandboxName: sb.Name,
 		CredentialScope: scope, Service: dockerHubTokenService,
-		Realms:           []registryauth.Realm{{Host: dockerHubAuthHost, Path: "/token"}},
-		TransportFactory: sandboxRegistryTransportFactory{service: s, sandboxID: sb.ID},
-		Limiter:          s.registryPullLimiter,
-		MaxBytes:         16 << 30,
-		TLSAuthority:     ca,
+		Realms:              []registryauth.Realm{{Host: dockerHubAuthHost, Path: "/token"}},
+		TransportFactory:    sandboxRegistryTransportFactory{service: s, sandboxID: sb.ID},
+		Limiter:             s.registryPullLimiter,
+		MaxBytes:            16 << 30,
+		TLSAuthority:        ca,
+		RedirectAuthorities: []string{"production.cloudfront.docker.com"},
 	})
 	if err != nil {
 		return secretproxy.RouteConfig{}, "", fmt.Errorf("configure Docker Hub pull broker: %w", err)

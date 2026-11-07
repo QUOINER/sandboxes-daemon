@@ -40,6 +40,7 @@ type PullProxy struct {
 	tokens            map[string]tokenGrant
 	uploads           map[string]uploadSession
 	blobRedirects     map[string]blobRedirectSession
+	redirectHosts     map[string]struct{}
 }
 
 type tokenGrant struct {
@@ -89,6 +90,9 @@ type PullProxyConfig struct {
 	Limiter           *PullLimiter
 	MaxBytes          int64
 	TLSAuthority      *ProxyAuthority
+	// RedirectAuthorities are the exact hostnames allowed to serve registry
+	// blob redirects. Empty defaults to the Docker Hub CDN for compatibility.
+	RedirectAuthorities []string
 }
 
 // NewPullProxy requires a sandbox-scoped or all-sandboxes credential; host-only
@@ -118,7 +122,7 @@ func NewPullProxy(store *Store, cfg PullProxyConfig) (*PullProxy, error) {
 		tokenTransport: cfg.TokenTransport, transportFactory: cfg.TransportFactory, limiter: cfg.Limiter,
 		maxBytes: cfg.MaxBytes, inflight: make(chan struct{}, 4), tlsAuthority: cfg.TLSAuthority,
 		tunnelSlots: make(chan struct{}, 8), tokens: make(map[string]tokenGrant), uploads: make(map[string]uploadSession),
-		blobRedirects: make(map[string]blobRedirectSession)}, nil
+		blobRedirects: make(map[string]blobRedirectSession), redirectHosts: redirectHostSet(cfg.RedirectAuthorities)}, nil
 }
 
 func validPullProxyConfig(store *Store, cfg PullProxyConfig) bool {
@@ -473,10 +477,48 @@ func (p *PullProxy) serveTLSConnection(ctx context.Context, conn net.Conn, host 
 }
 
 func (p *PullProxy) allowedConnectHost(host string) bool {
-	if strings.EqualFold(host, p.authority) || strings.EqualFold(host, "auth.docker.io") {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if strings.EqualFold(host, p.authority) {
 		return true
 	}
-	return strings.EqualFold(host, "production.cloudfront.docker.com")
+	if _, ok := p.authRealm(host); ok {
+		return true
+	}
+	_, ok := p.redirectHosts[host]
+	return ok
+}
+
+func (p *PullProxy) isRedirectHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if p.redirectHosts != nil {
+		_, ok := p.redirectHosts[host]
+		return ok
+	}
+	return host == dockerHubBlobAuthority
+}
+
+func redirectHostSet(hosts []string) map[string]struct{} {
+	if len(hosts) == 0 {
+		hosts = []string{dockerHubBlobAuthority}
+	}
+	set := make(map[string]struct{}, len(hosts))
+	for _, host := range hosts {
+		host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+		if host != "" {
+			set[host] = struct{}{}
+		}
+	}
+	return set
+}
+
+func (p *PullProxy) authRealm(host string) (registryauth.Realm, bool) {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, realm := range p.realms {
+		if strings.EqualFold(realm.Host, host) {
+			return realm, true
+		}
+	}
+	return registryauth.Realm{}, false
 }
 
 type singleConnListener struct {
