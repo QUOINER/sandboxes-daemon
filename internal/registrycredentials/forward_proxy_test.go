@@ -190,6 +190,43 @@ func TestBlobRedirectRequiresExactRegistryIssuedURL(t *testing.T) {
 	}
 }
 
+func TestBlobRedirectPreservesEmptyQueryMarker(t *testing.T) {
+	const host = "cdn.private.test"
+	transport := pullRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		if !request.URL.ForceQuery || !strings.HasSuffix(request.URL.String(), "?") {
+			t.Fatalf("outbound blob request lost empty query marker: %q", request.URL.String())
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody, ContentLength: 0}, nil
+	})
+	proxy := &PullProxy{
+		redirectHosts:    redirectHostSet([]string{host}),
+		transportFactory: pullRedirectFactory{redirect: transport, authority: host},
+		limiter:          NewPullLimiter(), maxBytes: 8, blobRedirects: make(map[string]blobRedirectSession),
+	}
+	issued, err := url.Parse("https://" + host + "/blob?")
+	if err != nil || !issued.ForceQuery {
+		t.Fatalf("parse issued empty-query redirect: url=%v err=%v", issued, err)
+	}
+	if err := proxy.recordBlobRedirect(issued); err != nil {
+		t.Fatal(err)
+	}
+	withoutMarker := httptest.NewRequest(http.MethodGet, "https://"+host+"/blob", http.NoBody)
+	denied := httptest.NewRecorder()
+	proxy.serveBlobRedirectRequest(denied, withoutMarker, host)
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("URL without issued empty-query marker returned %d", denied.Code)
+	}
+	withMarker := httptest.NewRequest(http.MethodGet, "https://"+host+"/blob?", http.NoBody)
+	if !withMarker.URL.ForceQuery {
+		t.Fatal("test request did not preserve the empty query marker")
+	}
+	allowed := httptest.NewRecorder()
+	proxy.serveBlobRedirectRequest(allowed, withMarker, host)
+	if allowed.Code != http.StatusOK {
+		t.Fatalf("registry-issued empty-query redirect returned %d: %s", allowed.Code, allowed.Body.String())
+	}
+}
+
 func TestBlobRedirectRejectsExpiredAndUntrustedSessions(t *testing.T) {
 	proxy := &PullProxy{blobRedirects: make(map[string]blobRedirectSession), redirectHosts: redirectHostSet([]string{dockerHubBlobAuthority})}
 	expired, err := url.Parse("https://production.cloudfront.docker.com/blob?sig=expired")
@@ -210,9 +247,10 @@ func TestBlobRedirectRejectsExpiredAndUntrustedSessions(t *testing.T) {
 }
 
 func TestConfiguredPrivateBlobRedirectTraversesForwardTLSPath(t *testing.T) {
-	const location = "https://CDN.private.test.:443/v2/team/image/blobs/sha256:abcd?sig=synthetic"
+	const location = "https://CDN.private.test.:443/v2/team%2Fimage/blobs/sha256:abcd?sig=synthetic"
 	redirectTransport := pullRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.Host != "cdn.private.test" || request.URL.Query().Get("sig") != "synthetic" {
+		if request.URL.Host != "cdn.private.test" || request.URL.EscapedPath() != "/v2/team%2Fimage/blobs/sha256:abcd" ||
+			request.URL.Query().Get("sig") != "synthetic" {
 			t.Fatalf("unexpected blob redirect request: %s", request.URL.Redacted())
 		}
 		if got := request.Header.Get("Authorization"); got != "" {

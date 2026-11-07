@@ -850,7 +850,8 @@ func (p *PullProxy) serveBlobRedirectRequest(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "invalid blob redirect URL", http.StatusBadRequest)
 		return
 	}
-	endpoint := &url.URL{Scheme: registryHTTPScheme, Host: host, Path: r.URL.Path, RawPath: r.URL.RawPath, RawQuery: r.URL.RawQuery}
+	endpoint := &url.URL{Scheme: registryHTTPScheme, Host: host, Path: r.URL.Path, RawPath: r.URL.RawPath,
+		RawQuery: r.URL.RawQuery, ForceQuery: r.URL.ForceQuery}
 	if !p.consumeBlobRedirect(endpoint) {
 		http.Error(w, "blob redirect was not authorized by the registry", http.StatusForbidden)
 		return
@@ -942,7 +943,8 @@ func (p *PullProxy) fetchBlobRedirect(ctx context.Context, r *http.Request, host
 	if err != nil {
 		return nil, err
 	}
-	endpoint := &url.URL{Scheme: registryHTTPScheme, Host: host, Path: r.URL.Path, RawQuery: r.URL.RawQuery}
+	endpoint := &url.URL{Scheme: registryHTTPScheme, Host: host, Path: r.URL.Path, RawPath: r.URL.RawPath,
+		RawQuery: r.URL.RawQuery, ForceQuery: r.URL.ForceQuery}
 	request, err := http.NewRequestWithContext(ctx, r.Method, endpoint.String(), http.NoBody)
 	if err != nil {
 		return nil, err
