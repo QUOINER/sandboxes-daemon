@@ -176,6 +176,34 @@ func (s *Service) AccountCredentialsPresent(ctx context.Context, name string) (b
 	return false, nil
 }
 
+// AccountRefreshMetadata reports presence-only refresh metadata for a host
+// account credential: whether a refresh token is stored and whether the
+// daemon holds trusted provider configuration to coordinate its rotation.
+// It never returns token material or expiry values.
+func (s *Service) AccountRefreshMetadata(ctx context.Context, name string) (refreshPresent bool, refreshCoordinated bool, err error) {
+	providerConfigured := false
+	if name != dockerAccountProvider {
+		if _, ok := s.oauthProviders[name]; !ok {
+			return false, false, ErrOAuthProviderUnavailable
+		}
+		providerConfigured = true
+	}
+	release, err := s.acquireCredentialGate(ctx, accountGateKey(name))
+	if err != nil {
+		return false, false, err
+	}
+	defer release()
+	sink, err := oauthsession.NewVaultSink(s.oauthVault(), name)
+	if err != nil {
+		return false, false, errors.New("OAuth host keychain is unavailable")
+	}
+	refreshPresent, err = sink.HasRefreshToken(ctx)
+	if err != nil || !refreshPresent {
+		return false, false, err
+	}
+	return true, providerConfigured, nil
+}
+
 // BeginDeviceAccountLogin validates account availability and obtains a
 // short-lived device authorization without opening the browser or polling.
 // The caller receives only user-facing verification data; deviceCode remains

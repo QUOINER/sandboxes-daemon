@@ -91,6 +91,30 @@ func (s *VaultSink) HasTokens(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+// HasRefreshToken reports only whether the stored record carries a non-empty
+// refresh token. The decoded payload is cleared before returning; token values
+// never leave this method.
+func (s *VaultSink) HasRefreshToken(ctx context.Context) (bool, error) {
+	value, err := s.vault.Get(ctx, oauthVaultService, s.account)
+	if errors.Is(err, registrycredentials.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, errors.New("inspect OAuth credential presence failed")
+	}
+	payload := []byte(value)
+	defer clear(payload)
+	var record struct {
+		Tokens struct {
+			RefreshToken string `json:"refresh_token"`
+		} `json:"tokens"`
+	}
+	if json.Unmarshal(payload, &record) != nil {
+		return false, errors.New("invalid stored OAuth tokens")
+	}
+	return record.Tokens.RefreshToken != "", nil
+}
+
 // Delete removes only this provider's vault record.
 func (s *VaultSink) Delete(ctx context.Context) error {
 	if err := s.vault.Delete(ctx, oauthVaultService, s.account); err != nil {
