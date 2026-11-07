@@ -41,6 +41,7 @@ jobs:
           head_commit=$(git rev-parse HEAD)
           [[ "$tag_commit" == "$head_commit" ]]
           git merge-base --is-ancestor "$tag_commit" origin/main
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
       - name: Build release binaries
         shell: bash
         run: |
@@ -51,9 +52,11 @@ jobs:
             arch=${target#*/}
             out="dist/sandboxesd-${os}-${arch}"
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
-              -ldflags='-s -w' -o "$out" ./cmd/sandboxesd
+              -ldflags="-s -w -X github.com/rheic/sandboxes-daemon/internal/version.Version=$VERSION" -o "$out" ./cmd/sandboxesd
             sha256sum "$out" > "$out.sha256"
           done
+          actual=$(dist/sandboxesd-linux-amd64 --version)
+          [[ "$actual" == "$VERSION" ]]
       - name: Install CycloneDX generator
         run: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
       - name: Generate SBOM
