@@ -17,7 +17,7 @@ import (
 	"github.com/rheic/sandboxes-gateway/registryauth"
 )
 
-// PullProxy is a host-side Docker Hub registry handler bound to an identity
+// PullProxy is a host-side registry handler bound to an identity
 // selected by trusted host code. Its forward path supports scoped pull and push
 // through TLS interception; it must only be exposed to its bound sandbox.
 type PullProxy struct {
@@ -91,7 +91,7 @@ type PullProxyConfig struct {
 	MaxBytes          int64
 	TLSAuthority      *ProxyAuthority
 	// RedirectAuthorities are the exact hostnames allowed to serve registry
-	// blob redirects. Empty defaults to the Docker Hub CDN for compatibility.
+	// blob redirects. Empty uses the Docker Hub CDN default only for Docker Hub.
 	RedirectAuthorities []string
 }
 
@@ -117,12 +117,16 @@ func NewPullProxy(store *Store, cfg PullProxyConfig) (*PullProxy, error) {
 	if _, _, err := validateScope(ScopeSandbox, cfg.SandboxName); err != nil {
 		return nil, errors.New("invalid pull proxy sandbox identity")
 	}
+	redirectAuthorities := cfg.RedirectAuthorities
+	if len(redirectAuthorities) == 0 && strings.EqualFold(authority, "registry-1.docker.io") {
+		redirectAuthorities = []string{dockerHubBlobAuthority}
+	}
 	return &PullProxy{store: store, registry: registry, authority: authority, sandboxName: cfg.SandboxName, credentialScope: cfg.CredentialScope,
 		service: cfg.Service, realms: append([]registryauth.Realm(nil), cfg.Realms...), registryTransport: cfg.RegistryTransport,
 		tokenTransport: cfg.TokenTransport, transportFactory: cfg.TransportFactory, limiter: cfg.Limiter,
 		maxBytes: cfg.MaxBytes, inflight: make(chan struct{}, 4), tlsAuthority: cfg.TLSAuthority,
 		tunnelSlots: make(chan struct{}, 8), tokens: make(map[string]tokenGrant), uploads: make(map[string]uploadSession),
-		blobRedirects: make(map[string]blobRedirectSession), redirectHosts: redirectHostSet(cfg.RedirectAuthorities)}, nil
+		blobRedirects: make(map[string]blobRedirectSession), redirectHosts: redirectHostSet(redirectAuthorities)}, nil
 }
 
 func validPullProxyConfig(store *Store, cfg PullProxyConfig) bool {
@@ -133,8 +137,8 @@ func validPullProxyConfig(store *Store, cfg PullProxyConfig) bool {
 		(cfg.CredentialScope == ScopeSandbox || cfg.CredentialScope == ScopeAllSandboxes)
 }
 
-// ServeHTTP accepts either unauthenticated loopback-mirror pulls or requests
-// inside a verified Docker Hub TLS tunnel. It never returns a host bearer.
+// ServeHTTP accepts unauthenticated loopback-mirror pulls or requests inside a
+// verified registry TLS tunnel. It never returns a host bearer.
 func (p *PullProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodConnect {
 		p.serveConnect(w, r)
@@ -315,7 +319,7 @@ func (p *PullProxy) followPullRedirects(ctx context.Context, registryClient *htt
 		}
 		location := resp.Header.Get("Location")
 		_ = resp.Body.Close()
-		current, err = validatePullRedirect(current, location, p.authority)
+		current, err = p.validatePullRedirect(current, location)
 		if err != nil {
 			return nil, err
 		}
@@ -345,18 +349,47 @@ func (p *PullProxy) redirectClient(ctx context.Context, registryClient *http.Cli
 	return &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, "", nil
 }
 
+func (p *PullProxy) validatePullRedirect(current *url.URL, location string) (*url.URL, error) {
+	return validatePullRedirectWithAllowlist(current, location, p.authority, p.isRedirectHost)
+}
+
 func validatePullRedirect(current *url.URL, location, registryAuthority string) (*url.URL, error) {
+	return validatePullRedirectWithAllowlist(current, location, registryAuthority, trustedPullRedirectHost)
+}
+
+func validatePullRedirectWithAllowlist(current *url.URL, location, registryAuthority string, redirectAllowed func(string) bool) (*url.URL, error) {
+	if current == nil || redirectAllowed == nil {
+		return nil, errors.New("registry redirect validator is unavailable")
+	}
 	if strings.TrimSpace(location) == "" {
 		return nil, errors.New("registry redirect location is empty")
 	}
 	next, err := current.Parse(location)
-	if err != nil || next.Scheme != registryHTTPScheme || next.User != nil || next.Fragment != "" || next.Opaque != "" || next.Hostname() == "" {
+	if err != nil || next.Scheme != registryHTTPScheme || next.User != nil || next.Fragment != "" || next.Opaque != "" {
 		return nil, errors.New("invalid registry redirect")
 	}
-	if !strings.EqualFold(next.Host, registryAuthority) && !trustedPullRedirectHost(next.Host) {
+	redirectHost, ok := normalizedRedirectHost(next.Host)
+	registryHost, registryOK := normalizedRedirectHost(registryAuthority)
+	if !ok || !registryOK || (!strings.EqualFold(redirectHost, registryHost) && !redirectAllowed(redirectHost)) {
 		return nil, errors.New("untrusted registry redirect authority")
 	}
+	next.Host = redirectHost
 	return next, nil
+}
+
+func normalizedRedirectHost(authority string) (string, bool) {
+	parsed, err := url.Parse("https://" + authority)
+	if err != nil || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
+		return "", false
+	}
+	if port := parsed.Port(); port != "" && port != "443" {
+		return "", false
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	if host == "" || net.ParseIP(host) != nil {
+		return "", false
+	}
+	return host, true
 }
 
 func trustedPullRedirectHost(host string) bool {
@@ -490,17 +523,11 @@ func (p *PullProxy) allowedConnectHost(host string) bool {
 
 func (p *PullProxy) isRedirectHost(host string) bool {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	if p.redirectHosts != nil {
-		_, ok := p.redirectHosts[host]
-		return ok
-	}
-	return host == dockerHubBlobAuthority
+	_, ok := p.redirectHosts[host]
+	return ok
 }
 
 func redirectHostSet(hosts []string) map[string]struct{} {
-	if len(hosts) == 0 {
-		hosts = []string{dockerHubBlobAuthority}
-	}
 	set := make(map[string]struct{}, len(hosts))
 	for _, host := range hosts {
 		host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))

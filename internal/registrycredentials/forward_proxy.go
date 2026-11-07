@@ -669,7 +669,7 @@ func (p *PullProxy) finishRegistryRedirect(w http.ResponseWriter, method string,
 		http.Error(w, "registry write redirect is unsupported", http.StatusBadGateway)
 		return
 	}
-	redirect, err := validatePullRedirect(endpoint, response.Header.Get("Location"), p.authority)
+	redirect, err := p.validatePullRedirect(endpoint, response.Header.Get("Location"))
 	if err != nil {
 		_ = response.Body.Close()
 		http.Error(w, "registry redirect is untrusted", http.StatusBadGateway)
@@ -870,10 +870,16 @@ func (p *PullProxy) serveBlobRedirectRequest(w http.ResponseWriter, r *http.Requ
 }
 
 func (p *PullProxy) recordBlobRedirect(endpoint *url.URL) error {
-	if endpoint == nil || !strings.EqualFold(endpoint.Scheme, registryHTTPScheme) || !trustedPullRedirectHost(endpoint.Host) || endpoint.User != nil || endpoint.Fragment != "" {
+	if endpoint == nil || !strings.EqualFold(endpoint.Scheme, registryHTTPScheme) || endpoint.User != nil || endpoint.Fragment != "" {
 		return errors.New("invalid blob redirect session")
 	}
-	key := endpoint.String()
+	host, ok := normalizedRedirectHost(endpoint.Host)
+	if !ok || !p.isRedirectHost(host) {
+		return errors.New("invalid blob redirect session")
+	}
+	canonical := *endpoint
+	canonical.Host = host
+	key := canonical.String()
 	p.stateMu.Lock()
 	defer p.stateMu.Unlock()
 	if p.blobRedirects == nil {
@@ -893,13 +899,16 @@ func (p *PullProxy) recordBlobRedirect(endpoint *url.URL) error {
 }
 
 func (p *PullProxy) consumeBlobRedirect(endpoint *url.URL) bool {
-	if endpoint == nil || !strings.EqualFold(endpoint.Scheme, registryHTTPScheme) {
+	if endpoint == nil || !strings.EqualFold(endpoint.Scheme, registryHTTPScheme) || endpoint.User != nil || endpoint.Fragment != "" {
 		return false
 	}
-	if !p.isRedirectHost(endpoint.Host) {
+	host, ok := normalizedRedirectHost(endpoint.Host)
+	if !ok || !p.isRedirectHost(host) {
 		return false
 	}
-	key := endpoint.String()
+	canonical := *endpoint
+	canonical.Host = host
+	key := canonical.String()
 	p.stateMu.Lock()
 	defer p.stateMu.Unlock()
 	session, ok := p.blobRedirects[key]
@@ -931,7 +940,7 @@ func (p *PullProxy) fetchBlobRedirect(ctx context.Context, r *http.Request, host
 	}
 	request.Header.Set("Accept-Encoding", "identity")
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return client.Do(request) // #nosec G704 -- factory permits only the pinned Docker Hub blob redirect host.
+	return client.Do(request) // #nosec G704 -- factory enforces configured host allowlisting with policy-checked DNS pins.
 }
 
 func (p *PullProxy) writeBlobRedirect(w http.ResponseWriter, method string, response *http.Response) {

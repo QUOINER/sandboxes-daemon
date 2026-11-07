@@ -26,10 +26,48 @@ type pullRoundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f pullRoundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-type pullRedirectFactory struct{ redirect http.RoundTripper }
+type pullRedirectFactory struct {
+	redirect  http.RoundTripper
+	authority string
+}
 
 func (pullRedirectFactory) Registry(context.Context, string) (http.RoundTripper, error) {
 	return nil, errors.New("unused")
+}
+
+func TestNewPullProxyRedirectDefaultsAreRegistryScoped(t *testing.T) {
+	tests := []struct {
+		name      string
+		registry  string
+		authority string
+		realms    []registryauth.Realm
+		redirects []string
+		wantCDN   bool
+	}{
+		{name: "Docker Hub default", registry: "docker.io", authority: "registry-1.docker.io", realms: []registryauth.Realm{{Host: "auth.docker.io", Path: "/token"}}, wantCDN: true},
+		{name: "private registry default denies", registry: "registry.private.test", authority: "registry.private.test", realms: []registryauth.Realm{{Host: "auth.private.test", Path: "/token"}}},
+		{name: "private registry explicit allow", registry: "registry.private.test", authority: "registry.private.test", realms: []registryauth.Realm{{Host: "auth.private.test", Path: "/token"}}, redirects: []string{"cdn.private.test"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			proxy, err := NewPullProxy(&Store{}, PullProxyConfig{
+				Registry: test.registry, Authority: test.authority, SandboxName: "synthetic-sandbox",
+				CredentialScope: ScopeSandbox, Service: "registry.fixture", Realms: test.realms,
+				RedirectAuthorities: test.redirects, TransportFactory: pullRedirectFactory{},
+				Limiter: NewPullLimiter(), MaxBytes: 1024,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotCDN := proxy.isRedirectHost(dockerHubBlobAuthority)
+			if gotCDN != test.wantCDN {
+				t.Fatalf("Docker Hub CDN allowed = %v, want %v", gotCDN, test.wantCDN)
+			}
+			if len(test.redirects) != 0 && !proxy.isRedirectHost(test.redirects[0]) {
+				t.Fatal("explicit private redirect allowlist was not applied")
+			}
+		})
+	}
 }
 
 func TestForwardProxyConnectTerminatesTLSForBoundHostOnly(t *testing.T) {
@@ -37,7 +75,7 @@ func TestForwardProxyConnectTerminatesTLSForBoundHostOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy := &PullProxy{authority: "registry-1.docker.io", tlsAuthority: authority, tunnelSlots: make(chan struct{}, 8)}
+	proxy := &PullProxy{authority: "registry-1.docker.io", redirectHosts: redirectHostSet([]string{dockerHubBlobAuthority}), tlsAuthority: authority, tunnelSlots: make(chan struct{}, 8)}
 	server := httptest.NewServer(proxy)
 	defer server.Close()
 	roots := x509.NewCertPool()
@@ -116,7 +154,11 @@ func (pullRedirectFactory) Token(context.Context, registryauth.Realm) (http.Roun
 	return nil, errors.New("unused")
 }
 func (f pullRedirectFactory) Redirect(_ context.Context, authority string) (http.RoundTripper, error) {
-	if authority != "production.cloudfront.docker.com" {
+	want := f.authority
+	if want == "" {
+		want = "production.cloudfront.docker.com"
+	}
+	if authority != want {
 		return nil, errors.New("unexpected redirect authority")
 	}
 	return f.redirect, nil
@@ -138,7 +180,7 @@ func TestPullProxyRedirectDropsBearerAndRejectsUntrustedAuthority(t *testing.T) 
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Length": []string{"4"}}, Body: io.NopCloser(strings.NewReader("blob")), ContentLength: 4}, nil
 	})
-	p := &PullProxy{authority: "registry-1.docker.io", transportFactory: pullRedirectFactory{redirect: blobTransport}, maxBytes: 8}
+	p := &PullProxy{authority: "registry-1.docker.io", redirectHosts: redirectHostSet([]string{dockerHubBlobAuthority}), transportFactory: pullRedirectFactory{redirect: blobTransport}, maxBytes: 8}
 	client := &http.Client{Transport: registryTransport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	endpoint, _ := url.Parse("https://registry-1.docker.io/v2/library/test/blobs/sha256:abcd")
 	resp, err := p.followPullRedirects(context.Background(), client, httptest.NewRequest(http.MethodGet, "http://guest/v2/library/test/blobs/sha256:abcd", http.NoBody), endpoint, "registry-token")
@@ -152,6 +194,56 @@ func TestPullProxyRedirectDropsBearerAndRejectsUntrustedAuthority(t *testing.T) 
 	}
 	if trustedPullRedirectHost("attacker.example") || trustedPullRedirectHost("production.cloudfront.docker.com:444") {
 		t.Fatal("untrusted pull redirect host accepted")
+	}
+}
+
+func TestPullProxyUsesConfiguredPrivateRedirectAndDropsBearer(t *testing.T) {
+	registryRequests, redirectRequests := 0, 0
+	registryTransport := pullRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		registryRequests++
+		if got := r.Header.Get("Authorization"); got != "Bearer registry-token" {
+			t.Fatalf("registry authorization = %q", got)
+		}
+		return &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: http.Header{"Location": []string{"https://cdn.private.test/blob?sig=synthetic"}}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	redirectTransport := pullRoundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		redirectRequests++
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Fatalf("registry bearer crossed to configured redirect host: %q", got)
+		}
+		if r.URL.Host != "cdn.private.test" || r.URL.Query().Get("sig") != "synthetic" {
+			t.Fatalf("unexpected redirect request: %s", r.URL.Redacted())
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Length": []string{"4"}}, Body: io.NopCloser(strings.NewReader("blob")), ContentLength: 4}, nil
+	})
+	p := &PullProxy{
+		authority: "registry.private.test", maxBytes: 8,
+		redirectHosts:    map[string]struct{}{"cdn.private.test": {}},
+		transportFactory: pullRedirectFactory{redirect: redirectTransport, authority: "cdn.private.test"},
+	}
+	client := &http.Client{Transport: registryTransport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	endpoint, _ := url.Parse("https://registry.private.test/v2/team/image/blobs/sha256:abcd")
+	resp, err := p.followPullRedirects(context.Background(), client, httptest.NewRequest(http.MethodGet, "http://guest/v2/team/image/blobs/sha256:abcd", http.NoBody), endpoint, "registry-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != "blob" || registryRequests != 1 || redirectRequests != 1 {
+		t.Fatalf("configured redirect result body=%q err=%v registry=%d redirect=%d", body, err, registryRequests, redirectRequests)
+	}
+
+	for _, location := range []string{
+		"https://attacker.private.test/blob",
+		"https://cdn.private.test:444/blob",
+		"http://cdn.private.test/blob",
+	} {
+		if _, err := p.validatePullRedirect(endpoint, location); err == nil {
+			t.Errorf("accepted unsafe configured redirect %q", location)
+		}
+	}
+	if _, err := (&PullProxy{authority: "registry.private.test"}).validatePullRedirect(endpoint, "https://cdn.private.test/blob"); err == nil {
+		t.Fatal("unconfigured private redirect host was accepted")
 	}
 }
 
