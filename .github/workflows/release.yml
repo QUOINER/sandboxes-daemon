@@ -4,28 +4,45 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to build and sign
+        description: Existing immutable module tag to build and attest
         required: true
+        type: string
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-24.04
+    container:
+      image: docker.io/library/golang:1.27.3-bookworm@sha256:dc0963f32053e4bc451d24d87e3892d42d01021b61f093e98eb95c0352bb84b0
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     env:
       GOTOOLCHAIN: local
+      TAG: ${{ inputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.tag }}
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.27.3'
-          cache: true
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify pinned Go toolchain
+        run: test "$(go version)" = "go version go1.27.3 linux/amd64"
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tag_commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          head_commit=$(git rev-parse HEAD)
+          [[ "$tag_commit" == "$head_commit" ]]
+          git merge-base --is-ancestor "$tag_commit" origin/main
       - name: Build release binaries
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -37,26 +54,58 @@ jobs:
               -ldflags='-s -w' -o "$out" ./cmd/sandboxesd
             sha256sum "$out" > "$out.sha256"
           done
-          cd dist && sha256sum * > SHA256SUMS
       - name: Install CycloneDX generator
         run: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.12.0
       - name: Generate SBOM
         run: cyclonedx-gomod mod -json -licenses -type library -output dist/sandboxesd.cdx.json .
-      - name: Publish release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag='${{ inputs.tag }}'
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
-          else
-            gh release create "$tag" dist/* --verify-tag --title "$tag" --generate-notes
-          fi
-      - uses: actions/attest-build-provenance@v2
+      - name: Generate checksums
+        run: sha256sum dist/* > dist/SHA256SUMS
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: dist/*
-      - uses: actions/attest@v4
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/sandboxesd-*
           sbom-path: dist/sandboxesd.cdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-assets
+          path: dist
+      - name: Publish release assets without replacing existing files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          fi
+          for asset in dist/*; do
+            name=${asset##*/}
+            digest=$(sha256sum "$asset" | cut -d ' ' -f 1)
+            existing=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+              --jq ".assets[] | select(.name == \"$name\") | (.digest // \"UNKNOWN\")")
+            if [[ -z "$existing" ]]; then
+              gh release upload "$TAG" "$asset"
+            elif [[ "$existing" == "sha256:$digest" ]]; then
+              echo "Release asset already matches: $name"
+            else
+              echo "Refusing to replace conflicting or unverifiable release asset: $name" >&2
+              exit 1
+            fi
+          done
