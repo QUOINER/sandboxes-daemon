@@ -1576,9 +1576,8 @@ func normalizeRules(rules []sandbox.NetworkRule) ([]sandbox.NetworkRule, error) 
 				return nil, fmt.Errorf("%w: %w", core.ErrConflict, err)
 			}
 		default:
-			ip, _, err := net.ParseCIDR(rule.CIDR)
-			if err != nil || ip.To4() == nil {
-				return nil, fmt.Errorf("%w: network rule CIDR must be IPv4", core.ErrConflict)
+			if err := validateRuleCIDR(rule.CIDR); err != nil {
+				return nil, err
 			}
 		}
 		key := rule.Protocol + "|" + rule.CIDR + "|" + rule.Domain + "|" + strconv.Itoa(int(rule.Port))
@@ -1590,6 +1589,17 @@ func normalizeRules(rules []sandbox.NetworkRule) ([]sandbox.NetworkRule, error) 
 		out = append(out, rule)
 	}
 	return out, nil
+}
+
+func validateRuleCIDR(cidr string) error {
+	ip, _, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return fmt.Errorf("%w: network rule CIDR is invalid", core.ErrConflict)
+	}
+	if ip.To4() == nil {
+		return fmt.Errorf("%w: IPv6 network rules require an IPv6-capable runtime", core.ErrConflict)
+	}
+	return nil
 }
 
 func normalizeDomainPattern(domain string) string {
