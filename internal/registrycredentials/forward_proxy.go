@@ -45,12 +45,18 @@ func (p *PullProxy) serveForwardRequest(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	host := strings.ToLower(strings.TrimSuffix(r.TLS.ServerName, "."))
-	if realm, ok := p.authRealm(host); ok {
+	// A registry may serve its token endpoint on the registry host itself, so
+	// an exact realm path wins over the registry route on the same host.
+	if realm, ok := p.realmForPath(host, r.URL.Path); ok {
 		p.serveTokenRequest(w, r, realm)
 		return
 	}
 	if strings.EqualFold(host, p.authority) {
 		p.serveRegistryForward(w, r, host)
+		return
+	}
+	if realm, ok := p.authRealm(host); ok {
+		p.serveTokenRequest(w, r, realm)
 		return
 	}
 	if p.isRedirectHost(host) {
@@ -129,11 +135,31 @@ func validTokenRequestEnvelope(r *http.Request, tokenPath string) bool {
 
 func parseTokenRequestScope(rawQuery, service string) (string, map[string]struct{}, bool, bool) {
 	values, err := url.ParseQuery(rawQuery)
-	if err != nil || !tokenQueryKeysAllowed(values) || values.Get("service") != service || len(values["service"]) != 1 || len(values["scope"]) != 1 {
+	if err != nil || !tokenQueryKeysAllowed(values) || values.Get("service") != service || len(values["service"]) != 1 || len(values["scope"]) == 0 {
 		return "", nil, false, false
 	}
-	repository, actions, ok := parseRepositoryScope(values.Get("scope"))
-	return repository, actions, ok, true
+	// Docker sends one scope parameter per requested grant; pull+push yields
+	// repeated scopes for the same repository.
+	repository := ""
+	actions := make(map[string]struct{})
+	for _, raw := range values["scope"] {
+		current, currentActions, ok := parseRepositoryScope(raw)
+		if !ok {
+			return "", nil, false, true
+		}
+		if repository == "" {
+			repository = current
+		} else if !strings.EqualFold(repository, current) {
+			return "", nil, false, true
+		}
+		for action := range currentActions {
+			actions[action] = struct{}{}
+		}
+	}
+	if repository == "" {
+		return "", nil, false, true
+	}
+	return repository, actions, true, true
 }
 
 func writeSentinelToken(w http.ResponseWriter, proxy *PullProxy, repository string, actions map[string]struct{}) {
@@ -161,7 +187,13 @@ func writeSentinelToken(w http.ResponseWriter, proxy *PullProxy, repository stri
 
 func tokenQueryKeysAllowed(values url.Values) bool {
 	for key, items := range values {
-		if len(items) != 1 || (key != "service" && key != "scope" && key != "account" && key != "client_id") {
+		if key == "scope" {
+			if len(items) == 0 {
+				return false
+			}
+			continue
+		}
+		if len(items) != 1 || (key != "service" && key != "account" && key != "client_id") {
 			return false
 		}
 	}

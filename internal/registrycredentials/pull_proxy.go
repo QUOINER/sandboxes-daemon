@@ -511,6 +511,16 @@ func redirectHostSet(hosts []string) map[string]struct{} {
 	return set
 }
 
+func (p *PullProxy) realmForPath(host, path string) (registryauth.Realm, bool) {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	for _, realm := range p.realms {
+		if strings.EqualFold(realm.Host, host) && realm.Path == path {
+			return realm, true
+		}
+	}
+	return registryauth.Realm{}, false
+}
+
 func (p *PullProxy) authRealm(host string) (registryauth.Realm, bool) {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	for _, realm := range p.realms {
