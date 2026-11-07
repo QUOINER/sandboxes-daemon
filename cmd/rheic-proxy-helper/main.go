@@ -204,10 +204,6 @@ func bootstrapProxyTrust(ctx context.Context, serviceHost string, routes []strin
 	return nil
 }
 
-func fetchProxyCA(ctx context.Context, transport http.RoundTripper) ([]byte, error) {
-	return fetchProxyCAForService(ctx, transport, "")
-}
-
 func fetchProxyCAForService(ctx context.Context, transport http.RoundTripper, service string) ([]byte, error) {
 	token, err := fetchTokenForService(ctx, transport, service)
 	if err != nil {
