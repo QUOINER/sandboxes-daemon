@@ -2315,10 +2315,10 @@ func TestResetGlobalPolicyClearsRulesAndProfile(t *testing.T) {
 
 func TestSetPrivateRegistryValidation(t *testing.T) {
 	svc := &Service{}
-	if err := svc.SetPrivateRegistry("registry.example.test", "svc", []string{"auth.example.test/token"}, []string{"cdn.example.test"}, nil); err != nil {
+	if err := svc.SetPrivateRegistry("registry.example.test", "svc", []string{"auth.example.test/token", "auth-alt.example.test/oauth/token"}, []string{"cdn.example.test"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if svc.privateRegistryHost != "registry.example.test" || svc.privateRegistryRealms[0].Path != "/token" {
+	if svc.privateRegistryHost != "registry.example.test" || len(svc.privateRegistryRealms) != 2 || svc.privateRegistryRealms[0].Path != "/token" || svc.privateRegistryRealms[1].Path != "/oauth/token" {
 		t.Fatalf("private registry config = %+v", svc)
 	}
 	for name, call := range map[string]func() error{
