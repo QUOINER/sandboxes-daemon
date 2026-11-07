@@ -15,6 +15,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/rheic/sandboxes-daemon/internal/network"
+	"github.com/rheic/sandboxes-daemon/internal/version"
 )
 
 // transportRemote selects the streamable HTTP MCP transport.
@@ -357,7 +358,7 @@ func (m *Manager) startRemoteSession(ctx context.Context, server Server) (*manag
 		DisableStandaloneSSE: true,
 		MaxEventSize:         5 << 20,
 	}
-	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "rheic-daemon", Version: "0.0.36"}, nil)
+	mcpClient := mcp.NewClient(&mcp.Implementation{Name: "rheic-daemon", Version: version.Version}, nil)
 	session, err := mcpClient.Connect(ctx, stream, nil)
 	if err != nil {
 		return nil, errors.New("remote MCP server connection failed")

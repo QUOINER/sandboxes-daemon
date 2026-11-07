@@ -27,6 +27,7 @@ import (
 	core "github.com/rheic/sandboxes-core"
 
 	"github.com/rheic/sandboxes-daemon/internal/mcpprocess"
+	"github.com/rheic/sandboxes-daemon/internal/version"
 )
 
 const (
@@ -744,7 +745,7 @@ func (m *Manager) startSession(ctx context.Context, server Server) (*managedSess
 	if err != nil {
 		return nil, errors.New("MCP server could not be started")
 	}
-	client := mcp.NewClient(&mcp.Implementation{Name: "rheic-daemon", Version: "0.0.36"}, nil)
+	client := mcp.NewClient(&mcp.Implementation{Name: "rheic-daemon", Version: version.Version}, nil)
 	session, err := client.Connect(ctx, &mcp.IOTransport{Reader: process.Stdout, Writer: process.Stdin, MaxLineLength: 5 << 20}, nil)
 	if err != nil {
 		_ = process.Close()
