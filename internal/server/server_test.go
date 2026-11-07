@@ -362,6 +362,51 @@ func TestDeviceLoginStreamWaitsForHandoffAndKeepsDeviceCodeHostSide(t *testing.T
 	}
 }
 
+func TestAccountStatusReportsPresenceOnlyRefreshMetadata(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "account-refresh-status.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	vault := &serverTestVault{values: map[string]string{
+		"com.rheic.oauth.v1/fixture": `{"tokens":{"access_token":"synthetic-access","token_type":"Bearer","refresh_token":"synthetic-refresh"}}`,
+	}}
+	svc := service.New(st, nil)
+	svc.SetOAuthVault(vault)
+	svc.SetOAuthProviders(map[string]service.OAuthProvider{"fixture": {}})
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	localv1.RegisterAccountServiceServer(grpcServer, NewAccount(svc))
+	go func() { _ = grpcServer.Serve(lis) }()
+	defer grpcServer.Stop()
+	conn, err := grpc.NewClient("passthrough:///bufnet",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	client := localv1.NewAccountServiceClient(conn)
+	resp, err := client.Status(ctx, &localv1.AccountServiceStatusRequest{Provider: "fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.GetCredentialPresent() || !resp.GetRefreshPresent() || !resp.GetRefreshCoordinated() {
+		t.Fatalf("status present=%t refresh=%t coordinated=%t", resp.GetCredentialPresent(), resp.GetRefreshPresent(), resp.GetRefreshCoordinated())
+	}
+	vault.mu.Lock()
+	vault.values["com.rheic.oauth.v1/fixture"] = `{"tokens":{"access_token":"synthetic-access","token_type":"Bearer"}}`
+	vault.mu.Unlock()
+	resp, err = client.Status(ctx, &localv1.AccountServiceStatusRequest{Provider: "fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.GetCredentialPresent() || resp.GetRefreshPresent() || resp.GetRefreshCoordinated() {
+		t.Fatalf("access-only status present=%t refresh=%t coordinated=%t", resp.GetCredentialPresent(), resp.GetRefreshPresent(), resp.GetRefreshCoordinated())
+	}
+}
+
 type serverTestVault struct {
 	mu     sync.Mutex
 	values map[string]string

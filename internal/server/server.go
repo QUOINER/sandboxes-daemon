@@ -271,7 +271,22 @@ func (s *AccountServer) Status(ctx context.Context, req *localv1.AccountServiceS
 		}
 		return nil, status.Error(codes.Unavailable, "OAuth host credential status is unavailable")
 	}
-	return &localv1.AccountServiceStatusResponse{Provider: provider, CredentialPresent: present}, nil
+	refreshPresent, refreshCoordinated, err := s.svc.AccountRefreshMetadata(ctx, provider)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, mapError(err)
+		}
+		if errors.Is(err, service.ErrOAuthProviderUnavailable) {
+			return nil, status.Error(codes.FailedPrecondition, "OAuth provider is not configured on this daemon")
+		}
+		return nil, status.Error(codes.Unavailable, "OAuth host credential status is unavailable")
+	}
+	return &localv1.AccountServiceStatusResponse{
+		Provider:           provider,
+		CredentialPresent:  present,
+		RefreshPresent:     refreshPresent,
+		RefreshCoordinated: refreshCoordinated,
+	}, nil
 }
 
 // Login stores registry credentials without returning or logging secret data.

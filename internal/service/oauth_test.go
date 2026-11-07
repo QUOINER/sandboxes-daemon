@@ -355,6 +355,41 @@ func TestAccountCredentialStatusReportsOAuthRecordPresence(t *testing.T) {
 	}
 }
 
+func TestAccountRefreshMetadataIsPresenceOnly(t *testing.T) {
+	ctx := context.Background()
+	vault := &memoryOAuthVault{values: make(map[string]string)}
+	st, err := store.Open(ctx, t.TempDir()+"/oauth-refresh-meta.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+	svc.SetOAuthVault(vault)
+	svc.SetOAuthProviders(map[string]OAuthProvider{"fixture": {}})
+	sink, err := oauthsession.NewVaultSink(vault, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refresh, coordinated, err := svc.AccountRefreshMetadata(ctx, "fixture"); err != nil || refresh || coordinated {
+		t.Fatalf("empty refresh metadata refresh=%t coordinated=%t err=%v", refresh, coordinated, err)
+	}
+	if err := sink.Save(ctx, oauthsession.Tokens{AccessToken: "synthetic-access", TokenType: "Bearer"}); err != nil {
+		t.Fatal(err)
+	}
+	if refresh, coordinated, err := svc.AccountRefreshMetadata(ctx, "fixture"); err != nil || refresh || coordinated {
+		t.Fatalf("access-only refresh metadata refresh=%t coordinated=%t err=%v", refresh, coordinated, err)
+	}
+	if err := sink.Save(ctx, oauthsession.Tokens{AccessToken: "synthetic-access", TokenType: "Bearer", RefreshToken: "synthetic-refresh"}); err != nil {
+		t.Fatal(err)
+	}
+	if refresh, coordinated, err := svc.AccountRefreshMetadata(ctx, "fixture"); err != nil || !refresh || !coordinated {
+		t.Fatalf("refresh metadata refresh=%t coordinated=%t err=%v", refresh, coordinated, err)
+	}
+	if _, _, err := svc.AccountRefreshMetadata(ctx, "unknown"); !errors.Is(err, ErrOAuthProviderUnavailable) {
+		t.Fatalf("unknown provider err=%v", err)
+	}
+}
+
 type dockerPATRoundTripper func(*http.Request) (*http.Response, error)
 
 func (f dockerPATRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
