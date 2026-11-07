@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/rheic/sandboxes-daemon/internal/network"
 )
 
 // transportRemote selects the streamable HTTP MCP transport.
@@ -57,6 +59,59 @@ func (m *Manager) remoteTLS() *tls.Config {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.remoteTLSConfig
+}
+
+func (m *Manager) remoteDialers() (func(context.Context, string, string) ([]netip.Addr, error), func(context.Context, string, string) (net.Conn, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lookup, dial := m.remoteLookup, m.remoteDial
+	if lookup == nil {
+		lookup = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+			return net.DefaultResolver.LookupNetIP(ctx, network, host)
+		}
+	}
+	return lookup, dial
+}
+
+func pinnedRemoteDialContext(ctx context.Context, dialer *net.Dialer, lookup func(context.Context, string, string) ([]netip.Addr, error), dial func(context.Context, string, string) (net.Conn, error), networkName, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, errors.New("invalid remote MCP dial address")
+	}
+	if parsed, err := netip.ParseAddr(host); err == nil {
+		if !network.IsPublicUnicast(parsed) {
+			return nil, errors.New("remote MCP destination is not public unicast")
+		}
+		return dialRemoteIP(ctx, dialer, dial, networkName, net.JoinHostPort(parsed.String(), port))
+	}
+	addresses, err := lookup(ctx, "ip", host)
+	if err != nil || len(addresses) == 0 {
+		return nil, errors.New("remote MCP DNS lookup failed")
+	}
+	for _, address := range addresses {
+		if !network.IsPublicUnicast(address) {
+			return nil, errors.New("remote MCP DNS resolved to a non-public address")
+		}
+	}
+	var lastErr error
+	for _, address := range addresses {
+		conn, err := dialRemoteIP(ctx, dialer, dial, networkName, net.JoinHostPort(address.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return nil, errors.New("remote MCP pinned dial failed: " + lastErr.Error())
+}
+
+func dialRemoteIP(ctx context.Context, dialer *net.Dialer, override func(context.Context, string, string) (net.Conn, error), networkName, address string) (net.Conn, error) {
+	if override != nil {
+		return override(ctx, networkName, address)
+	}
+	return dialer.DialContext(ctx, networkName, address)
 }
 
 // RegisterRemote queues a remote (streamable HTTP) MCP server for trusted
@@ -195,6 +250,7 @@ func (t headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // stream, bounded event size.
 func (m *Manager) startRemoteSession(ctx context.Context, server Server) (*managedSession, error) {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	lookup, dial := m.remoteDialers()
 	tlsConfig := m.remoteTLS()
 	if tlsConfig == nil {
 		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
@@ -208,8 +264,10 @@ func (m *Manager) startRemoteSession(ctx context.Context, server Server) (*manag
 		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 15 * time.Second,
-		DialContext:           dialer.DialContext,
-		TLSClientConfig:       tlsConfig,
+		DialContext: func(ctx context.Context, networkName, address string) (net.Conn, error) {
+			return pinnedRemoteDialContext(ctx, dialer, lookup, dial, networkName, address)
+		},
+		TLSClientConfig: tlsConfig,
 	}
 	var roundTripper http.RoundTripper = transport
 	if len(server.Headers) > 0 {

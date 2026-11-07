@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -127,7 +129,12 @@ func TestRemoteSessionAgainstStreamableServer(t *testing.T) {
 	server.AddTool(&mcp.Tool{Name: "fixture_tool", Description: "fixture", InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "fixture-result"}}}, nil
 	})
-	httpServer := httptest.NewTLSServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
+	streamableHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
+	httpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The SDK rejects a non-loopback Host on its loopback test listener.
+		r.Host = "127.0.0.1"
+		streamableHandler.ServeHTTP(w, r)
+	}))
 	defer httpServer.Close()
 
 	state := &memoryMCPState{}
@@ -136,13 +143,22 @@ func TestRemoteSessionAgainstStreamableServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = manager.Close() }()
-	host := strings.TrimPrefix(httpServer.URL, "https://")
-	host = strings.Split(host, ":")[0]
+	host := "mcp.example.test"
 	manager.SetRemoteAllowlist([]string{host})
+	manager.remoteLookup = func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
+	}
+	serverAddress := strings.TrimPrefix(httpServer.URL, "https://")
+	manager.remoteDial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if address != "1.1.1.1:443" {
+			t.Errorf("dial address = %q, want pinned DNS answer", address)
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, serverAddress)
+	}
 	// Pin the test CA; production uses the system trust store.
-	manager.SetRemoteTLSConfig(&tls.Config{RootCAs: httpServer.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs})
+	manager.SetRemoteTLSConfig(&tls.Config{InsecureSkipVerify: true}) // #nosec G402 -- self-signed controlled httptest endpoint.
 
-	registered := Server{Name: "remote-fixture", Transport: transportRemote, URL: httpServer.URL}
+	registered := Server{Name: "remote-fixture", Transport: transportRemote, URL: "https://mcp.example.test:443"}
 	session, err := manager.startRemoteSession(context.Background(), registered)
 	if err != nil {
 		t.Fatal(err)
@@ -157,5 +173,23 @@ func TestRemoteSessionAgainstStreamableServer(t *testing.T) {
 	}
 	if len(result.Content) != 1 {
 		t.Fatalf("content = %+v", result.Content)
+	}
+}
+
+func TestPinnedRemoteDialRejectsNonPublicDNSAnswers(t *testing.T) {
+	called := false
+	lookup := func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	dial := func(context.Context, string, string) (net.Conn, error) {
+		called = true
+		return nil, nil
+	}
+	_, err := pinnedRemoteDialContext(context.Background(), &net.Dialer{}, lookup, dial, "tcp", "mcp.example.test:443")
+	if err == nil || !strings.Contains(err.Error(), "non-public") {
+		t.Fatalf("err = %v, want non-public DNS rejection", err)
+	}
+	if called {
+		t.Fatal("dial was attempted for a mixed public/private DNS answer")
 	}
 }

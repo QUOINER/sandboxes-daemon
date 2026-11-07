@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -109,6 +111,8 @@ type Manager struct {
 	// remoteTLSConfig overrides the TLS root store for remote MCP dials;
 	// nil selects the system trust store. Intended for controlled tests.
 	remoteTLSConfig *tls.Config
+	remoteLookup    func(context.Context, string, string) ([]netip.Addr, error)
+	remoteDial      func(context.Context, string, string) (net.Conn, error)
 }
 
 func (m *Manager) SetApprovalProvider(provider ApprovalProvider) {
