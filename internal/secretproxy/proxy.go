@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	daemonnetwork "github.com/rheic/sandboxes-daemon/internal/network"
@@ -113,6 +114,42 @@ type proxy struct {
 	mu       sync.RWMutex
 	path     string
 	routes   map[string]*proxyRoute
+	// rejectedPeers counts connections closed because the peer process was
+	// not owned by the daemon user. Lifecycle-bound identity: the channel is
+	// authorized by the host-side sandbox binding plus a same-owner peer.
+	rejectedPeers atomic.Int64
+}
+
+// peerCheckingListener closes any accepted connection whose peer process is
+// verifiably owned by a different UID, before the HTTP server sees it.
+type peerCheckingListener struct {
+	net.Listener
+	rejected *atomic.Int64
+	peerUID  func(net.Conn) (uint64, bool)
+}
+
+func newPeerCheckingListener(inner net.Listener, rejected *atomic.Int64) net.Listener {
+	return peerCheckingListener{Listener: inner, rejected: rejected, peerUID: peerOwnerUID}
+}
+
+func (l peerCheckingListener) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		uid, ok := l.peerUID(conn)
+		if !ok {
+			// Peer unverifiable on this platform (e.g. Windows named-pipe
+			// transports with their own ACL model); accept.
+			return conn, nil
+		}
+		if uid == currentUID() {
+			return conn, nil
+		}
+		l.rejected.Add(1)
+		_ = conn.Close()
+	}
 }
 
 type proxyRoute struct {
@@ -175,6 +212,19 @@ func (m *Manager) Has(sandbox, service string) bool {
 	return m.proxies[sandbox+"/"+service] != nil
 }
 
+// RejectedPeerConnections reports how many channel connections were closed
+// because the peer process was verifiably owned by a different UID. It is the
+// audit counter for the lifecycle-bound channel identity check.
+func (m *Manager) RejectedPeerConnections(sandbox, service string) int64 {
+	m.mu.Lock()
+	p := m.proxies[sandbox+"/"+service]
+	m.mu.Unlock()
+	if p == nil {
+		return 0
+	}
+	return p.rejectedPeers.Load()
+}
+
 // StartUnix starts a per-sandbox proxy on a unix socket. Every request must
 // carry the per-VM token; the socket is private (0600) and owned by the run
 // directory, so the token is defense in depth rather than the only control.
@@ -228,7 +278,7 @@ func (m *Manager) StartUnixRoutes(ctx context.Context, sandbox string, routes ma
 	}
 	p := &proxy{path: socketPath, routes: preparedRoutes, url: "unix:" + socketPath}
 	srv := &http.Server{Handler: proxyHandler(p), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 64 << 10}
-	p.server, p.listener = srv, listener
+	p.server, p.listener = srv, newPeerCheckingListener(listener, &p.rejectedPeers)
 	m.mu.Lock()
 	if existing = m.proxies[key]; existing != nil {
 		m.mu.Unlock()
