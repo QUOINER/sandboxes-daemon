@@ -6,11 +6,13 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -58,6 +60,7 @@ type ApprovalRequest struct {
 	Action            string
 	ServerName        string
 	Command           string
+	URL               string
 	ArgumentCount     int
 	Directory         string
 	SandboxID         string
@@ -67,15 +70,21 @@ type ApprovalRequest struct {
 }
 type Server struct {
 	Name             string   `json:"name"`
-	Command          string   `json:"command"`
-	Arguments        []string `json:"arguments"`
-	Directory        string   `json:"directory"`
-	ExecutableSHA256 string   `json:"executable_sha256"`
+	Transport        string   `json:"transport,omitempty"`
+	Command          string   `json:"command,omitempty"`
+	Arguments        []string `json:"arguments,omitempty"`
+	Directory        string   `json:"directory,omitempty"`
+	ExecutableSHA256 string   `json:"executable_sha256,omitempty"`
+	URL              string   `json:"url,omitempty"`
+	// Headers are static, non-secret request headers. Secret material must
+	// come from the host vault and is never stored in the registry state.
+	Headers map[string]string `json:"headers,omitempty"`
 }
 type Summary struct {
-	Name   string
-	Loaded bool
-	Usable bool
+	Name      string
+	Transport string
+	Loaded    bool
+	Usable    bool
 }
 type challenge struct {
 	kind          string
@@ -94,6 +103,12 @@ type Manager struct {
 	sessions map[string]*managedSession
 	starting map[string]chan struct{}
 	closed   bool
+	// remoteHosts is the exact allowlist of host names for remote MCP
+	// servers; empty disables the transport (fail closed).
+	remoteHosts map[string]struct{}
+	// remoteTLSConfig overrides the TLS root store for remote MCP dials;
+	// nil selects the system trust store. Intended for controlled tests.
+	remoteTLSConfig *tls.Config
 }
 
 func (m *Manager) SetApprovalProvider(provider ApprovalProvider) {
@@ -131,14 +146,14 @@ func New(ctx context.Context, state State) (*Manager, error) {
 	if len(items) > maxServers {
 		return nil, errors.New("MCP registry exceeds the server limit")
 	}
-	for _, s := range items {
-		if validateStoredServer(s) != nil {
+	for i := range items {
+		if validateStoredServer(items[i]) != nil {
 			return nil, errors.New("MCP registry entry is invalid")
 		}
-		if _, duplicate := m.servers[s.Name]; duplicate {
+		if _, duplicate := m.servers[items[i].Name]; duplicate {
 			return nil, errors.New("MCP registry has duplicate server names")
 		}
-		m.servers[s.Name] = s
+		m.servers[items[i].Name] = items[i]
 	}
 	return m, nil
 }
@@ -151,6 +166,13 @@ func (m *Manager) Register(ctx context.Context, name, command string, args []str
 	if err != nil {
 		return "", err
 	}
+	return m.registerPrepared(ctx, server)
+}
+
+func (m *Manager) registerPrepared(ctx context.Context, server Server) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -160,12 +182,12 @@ func (m *Manager) Register(ctx context.Context, name, command string, args []str
 	if len(m.pending) >= maxPending || len(m.servers) >= maxServers {
 		return "", errors.New("MCP registry is at capacity")
 	}
-	if _, ok := m.servers[name]; ok {
+	if _, ok := m.servers[server.Name]; ok {
 		return "", errors.New("MCP server name already exists")
 	}
 	for pendingID := range m.pending {
 		candidate := m.pending[pendingID]
-		if candidate.kind == challengeRegistration && candidate.server.Name == name {
+		if candidate.kind == challengeRegistration && candidate.server.Name == server.Name {
 			return "", errors.New("MCP server name already has a pending registration")
 		}
 	}
@@ -198,10 +220,10 @@ func (m *Manager) ApproveRegistration(ctx context.Context, id string) (*Summary,
 	if approver == nil {
 		return nil, errors.New("trusted MCP host approval provider is unavailable")
 	}
-	if err := approver.Approve(ctx, ApprovalRequest{Action: "register", ServerName: p.server.Name, Command: p.server.Command, ArgumentCount: len(p.server.Arguments), Directory: p.server.Directory}); err != nil {
+	if err := approver.Approve(ctx, ApprovalRequest{Action: "register", ServerName: p.server.Name, Command: p.server.Command, URL: p.server.URL, ArgumentCount: len(p.server.Arguments), Directory: p.server.Directory}); err != nil {
 		return nil, errors.New("MCP registration was denied or trusted approval failed")
 	}
-	if err := verifyExecutable(p.server); err != nil {
+	if err := m.verifyServer(p.server); err != nil {
 		return nil, err
 	}
 	m.mu.Lock()
@@ -226,9 +248,10 @@ func (m *Manager) List() []Summary {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	result := make([]Summary, 0, len(m.servers))
-	for name, server := range m.servers {
+	for name := range m.servers {
+		server := m.servers[name]
 		_, loaded := m.sessions[name]
-		result = append(result, Summary{Name: name, Loaded: loaded, Usable: executableAvailable(server)})
+		result = append(result, Summary{Name: name, Transport: serverTransport(server), Loaded: loaded, Usable: m.serverUsableLocked(server)})
 	}
 	slicesSort(result)
 	return result
@@ -377,8 +400,9 @@ func (m *Manager) Close() error {
 }
 
 func sameServer(left, right Server) bool {
-	return left.Name == right.Name && left.Command == right.Command && left.Directory == right.Directory &&
-		left.ExecutableSHA256 == right.ExecutableSHA256 && slices.Equal(left.Arguments, right.Arguments)
+	return left.Name == right.Name && left.Transport == right.Transport && left.Command == right.Command && left.Directory == right.Directory &&
+		left.ExecutableSHA256 == right.ExecutableSHA256 && left.URL == right.URL &&
+		slices.Equal(left.Arguments, right.Arguments) && maps.Equal(left.Headers, right.Headers)
 }
 func (m *Manager) expireLocked() {
 	now := m.now()
@@ -390,8 +414,8 @@ func (m *Manager) expireLocked() {
 }
 func (m *Manager) persist(ctx context.Context) error {
 	items := make([]Server, 0, len(m.servers))
-	for _, s := range m.servers {
-		items = append(items, s)
+	for name := range m.servers {
+		items = append(items, m.servers[name])
 	}
 	slicesSortServers(items)
 	raw, err := json.Marshal(items)
@@ -493,7 +517,28 @@ func executableAvailable(s Server) bool {
 }
 
 func validateStoredServer(s Server) error {
-	if !namePattern.MatchString(s.Name) || !filepath.IsAbs(s.Command) || !filepath.IsAbs(s.Directory) || len(s.Arguments) > 64 {
+	if !namePattern.MatchString(s.Name) || len(s.Arguments) > 64 {
+		return errors.New("invalid MCP registry entry")
+	}
+	switch s.Transport {
+	case transportRemote:
+		return validateStoredRemoteServer(s)
+	case "":
+		return validateStoredStdioServer(s)
+	default:
+		return errors.New("invalid MCP registry entry")
+	}
+}
+
+func validateStoredRemoteServer(s Server) error {
+	if s.Command != "" || s.URL == "" || len(s.Headers) > 16 || s.ExecutableSHA256 != "" {
+		return errors.New("invalid remote MCP registry entry")
+	}
+	return nil
+}
+
+func validateStoredStdioServer(s Server) error {
+	if !filepath.IsAbs(s.Command) || !filepath.IsAbs(s.Directory) {
 		return errors.New("invalid MCP registry entry")
 	}
 	if len(s.ExecutableSHA256) != sha256.Size*2 {
@@ -553,7 +598,7 @@ func token() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 func (m *Manager) execute(ctx context.Context, s Server, tool string, raw json.RawMessage) (json.RawMessage, error) {
-	if err := verifyExecutable(s); err != nil {
+	if err := m.verifyServer(s); err != nil {
 		return nil, err
 	}
 	var args map[string]any
@@ -644,7 +689,7 @@ func (m *Manager) findSession(server Server) (*managedSession, <-chan struct{}, 
 }
 
 func (m *Manager) startAndPublish(ctx context.Context, server Server, starting chan struct{}) (*managedSession, error) {
-	session, startErr := startSession(ctx, server)
+	session, startErr := m.startSession(ctx, server)
 	m.mu.Lock()
 	delete(m.starting, server.Name)
 	current, registered := m.servers[server.Name]
@@ -672,9 +717,12 @@ func (m *Manager) startAndPublish(ctx context.Context, server Server, starting c
 	return nil, errors.New("MCP server registration changed during startup")
 }
 
-func startSession(ctx context.Context, server Server) (*managedSession, error) {
-	if err := verifyExecutable(server); err != nil {
+func (m *Manager) startSession(ctx context.Context, server Server) (*managedSession, error) {
+	if err := m.verifyServer(server); err != nil {
 		return nil, err
+	}
+	if server.Transport == transportRemote {
+		return m.startRemoteSession(ctx, server)
 	}
 	process, err := mcpprocess.Start(server.Command, server.Arguments, server.Directory, restrictedEnvironment())
 	if err != nil {
@@ -743,4 +791,30 @@ func slicesSortServers(items []Server) {
 			items[j], items[j-1] = items[j-1], items[j]
 		}
 	}
+}
+
+// verifyServer applies the transport-specific registration checks: executable
+// integrity for local stdio servers, host-allowlist policy for remote servers.
+func (m *Manager) verifyServer(s Server) error {
+	if s.Transport == transportRemote {
+		return m.verifyRemoteServer(s)
+	}
+	return verifyExecutable(s)
+}
+
+// serverTransport reports the user-facing transport name for a registration.
+func serverTransport(s Server) string {
+	if s.Transport == transportRemote {
+		return "remote"
+	}
+	return "stdio"
+}
+
+// serverUsableLocked reports whether a session can currently be established.
+func (m *Manager) serverUsableLocked(s Server) bool {
+	if s.Transport == transportRemote {
+		host, err := remoteServerHost(s.URL)
+		return err == nil && m.remoteHostAllowed(host)
+	}
+	return executableAvailable(s)
 }

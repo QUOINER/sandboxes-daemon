@@ -67,6 +67,16 @@ func (s *Service) RegisterMCPServer(ctx context.Context, name, command string, a
 	}
 	return manager.Register(ctx, name, command, args, directory)
 }
+
+// RegisterRemoteMCPServer queues a remote (streamable HTTP) MCP server. The
+// URL must satisfy the daemon's fail-closed host allowlist.
+func (s *Service) RegisterRemoteMCPServer(ctx context.Context, name, rawURL string, headers map[string]string) (string, error) {
+	manager, err := s.mcpRegistry(ctx)
+	if err != nil {
+		return "", err
+	}
+	return manager.RegisterRemote(ctx, name, rawURL, headers)
+}
 func (s *Service) ApproveMCPRegistration(ctx context.Context, id string) (*mcpmanager.Summary, error) {
 	manager, err := s.mcpRegistry(ctx)
 	if err != nil {
