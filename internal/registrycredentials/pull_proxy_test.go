@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rheic/sandboxes-gateway/registryauth"
 )
@@ -538,5 +539,37 @@ func TestPullProxyRejectsUnknownOrOversizedLengthBeforeWriting(t *testing.T) {
 				t.Fatalf("rejected response status=%d bytes=%d", writer.status, writer.written)
 			}
 		})
+	}
+}
+
+func TestConfiguredRegistryConnectAndRealmAllowlist(t *testing.T) {
+	authority, err := generateProxyAuthority()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority.AllowHosts("registry.private.test", "auth.private.test", "cdn.private.test")
+	proxy := &PullProxy{
+		authority:     "registry.private.test",
+		realms:        []registryauth.Realm{{Host: "auth.private.test", Path: "/token"}},
+		redirectHosts: map[string]struct{}{"cdn.private.test": {}},
+		tlsAuthority:  authority,
+		tunnelSlots:   make(chan struct{}, 8),
+	}
+	for _, host := range []string{"registry.private.test", "auth.private.test", "cdn.private.test"} {
+		if !proxy.allowedConnectHost(host) {
+			t.Fatalf("configured host %q was rejected", host)
+		}
+	}
+	if proxy.allowedConnectHost("attacker.example") {
+		t.Fatal("unconfigured host was allowed")
+	}
+	if realm, ok := proxy.authRealm("AUTH.private.test."); !ok || realm.Path != "/token" {
+		t.Fatalf("realm lookup = %+v, %v", realm, ok)
+	}
+	if _, err := authority.Leaf("registry.private.test", time.Now()); err != nil {
+		t.Fatalf("configured host leaf: %v", err)
+	}
+	if _, err := authority.Leaf("attacker.example", time.Now()); err == nil {
+		t.Fatal("authority signed an unconfigured host")
 	}
 }
