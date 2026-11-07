@@ -49,6 +49,7 @@ type options struct {
 	registryPrivateRealms []string
 	registryPrivateRedirs []string
 	registryPrivateCAPath string
+	ipv6Experimental      bool
 	showVersion           bool
 }
 
@@ -129,6 +130,7 @@ func parseOptions() options {
 	flag.StringVar(&opts.runDir, "run-dir", "", "gateway runtime directory")
 	flag.StringVar(&opts.proxyHelperPath, "proxy-helper", "", "static Linux guest proxy helper; empty disables service proxy")
 	flag.StringVar(&opts.dnsUpstream, "dns-upstream", "", "optional DNS upstream")
+	flag.BoolVar(&opts.ipv6Experimental, "ipv6-experimental", false, "enable the experimental IPv6 guest datapath (acceptance only)")
 	flag.StringVar(&opts.settingsPath, "settings", settings.DefaultPath(), "user settings file")
 	flag.BoolVar(&opts.showVersion, "version", false, "print version")
 	flag.Parse()
@@ -246,6 +248,15 @@ func buildNetwork(opts *options, gatewayLost chan<- string) (runtime.Network, *g
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("create gateway manager: %w", err)
+	}
+	if opts.ipv6Experimental {
+		configurator, ok := any(manager).(interface{ SetIPv6Enabled(bool) error })
+		if !ok {
+			return nil, nil, errors.New("configured gateway module does not support experimental IPv6")
+		}
+		if err := configurator.SetIPv6Enabled(true); err != nil {
+			return nil, nil, fmt.Errorf("enable experimental IPv6 gateway: %w", err)
+		}
 	}
 	return daemonnetwork.New(manager, runDir), manager, nil
 }
