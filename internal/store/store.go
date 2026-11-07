@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,14 @@ type OperationStore struct {
 var _ sandbox.Store = (*Store)(nil)
 var _ operation.Store = (*OperationStore)(nil)
 
+// schemaVersion is the latest SQLite schema understood by this daemon. It is
+// stored in PRAGMA user_version and must only increase.
+const schemaVersion = 1
+
+// ErrSchemaNewer reports a database written by a newer daemon. Opening it
+// would risk data loss, so the daemon refuses to start instead.
+var ErrSchemaNewer = errors.New("database schema is newer than this daemon")
+
 // Open opens and migrates the SQLite database.
 func Open(ctx context.Context, path string) (*Store, error) {
 	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
@@ -45,11 +54,54 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
 	s := &Store{db: db, ops: &OperationStore{db: db}}
+	if err := s.prepareSchema(ctx, path); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := s.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+// prepareSchema refuses newer databases and backs up older ones before any
+// migration runs, so a failed or rolled-back upgrade can restore state.
+func (s *Store) prepareSchema(ctx context.Context, path string) error {
+	var current int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&current); err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	switch {
+	case current > schemaVersion:
+		return fmt.Errorf("%w: database version %d, daemon supports %d; restore the backup created before the upgrade", ErrSchemaNewer, current, schemaVersion)
+	case current == schemaVersion:
+		return nil
+	}
+	if err := backupDatabase(ctx, s.db, path, current); err != nil {
+		return fmt.Errorf("backup database before migration: %w", err)
+	}
+	return nil
+}
+
+func backupDatabase(ctx context.Context, db *sql.DB, path string, version int) error {
+	if _, err := db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return err
+	}
+	base := fmt.Sprintf("%s.pre-v%d-%s", path, version, time.Now().UTC().Format("20060102T150405Z"))
+	backup := base + ".bak"
+	for i := 1; ; i++ {
+		if _, err := os.Stat(backup); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		backup = fmt.Sprintf("%s-%d.bak", base, i)
+	}
+	quoted := strings.ReplaceAll(backup, "'", "''")
+	//nolint:gosec // backup path is local, single-quoted and escaped above.
+	if _, err := db.ExecContext(ctx, `VACUUM INTO '`+quoted+`'`); err != nil {
+		return err
+	}
+	return os.Chmod(backup, 0o600)
 }
 
 // Close closes the database.
@@ -123,6 +175,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if err := s.ensureSandboxResourceColumns(ctx); err != nil {
 		return fmt.Errorf("migrate sandbox resources: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
+		return fmt.Errorf("record schema version: %w", err)
 	}
 	return nil
 }
