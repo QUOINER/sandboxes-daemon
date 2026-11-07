@@ -76,6 +76,9 @@ func TestLoadRejectsUnsafeAndUnknown(t *testing.T) {
 }
 
 func TestRegistryPrivateSettings(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("settings ACLs are covered by TestLoadDefaultsAndFile on Windows")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "settings.toml")
 	valid := `registry_private_host = "registry.example.test"
