@@ -156,9 +156,6 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 	if err := imageClient.EnsureImage(startupCtx, inputs.image); err != nil {
 		t.Fatalf("pre-pull pinned sandbox image before lifecycle budget: %v", err)
 	}
-	// The cold template pull is complete; bound the service lifecycle independently.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
 	networkManager, err := gateway.New(gateway.Config{
 		GVProxy: inputs.gvproxy, Supervisor: inputs.daemon, RunDir: filepath.Join(root, "run", "gateway"),
 	})
@@ -179,7 +176,7 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := store.Open(ctx, filepath.Join(root, "sandboxes.db"))
+	state, err := store.Open(startupCtx, filepath.Join(root, "sandboxes.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,10 +216,10 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		t.Fatal(err)
 	}
 	sandboxName := "p04-service-" + hex.EncodeToString(nonce[:])
-	if _, err := serviceSecrets.Load(ctx, "openai", servicesecrets.ScopeSandbox, sandboxName); !errors.Is(err, servicesecrets.ErrNotFound) {
+	if _, err := serviceSecrets.Load(startupCtx, "openai", servicesecrets.ScopeSandbox, sandboxName); !errors.Is(err, servicesecrets.ErrNotFound) {
 		t.Fatalf("unique sandbox keychain account already exists: %v", err)
 	}
-	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeSandbox, sandboxName, []byte(p04ServiceCredential)); err != nil {
+	if _, err := svc.SetServiceSecret(startupCtx, "openai", servicesecrets.ScopeSandbox, sandboxName, []byte(p04ServiceCredential)); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -231,7 +228,11 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		}
 	})
 
+	// The cold template pull and local setup are complete; bound only the
+	// create/start/exec/revoke/delete lifecycle.
 	started := time.Now()
+	ctx, cancel := context.WithDeadline(context.Background(), started.Add(5*time.Minute))
+	defer cancel()
 	operation, err := svc.Create(ctx, CreateRequest{
 		Name:  sandboxName,
 		Image: inputs.image,
@@ -241,12 +242,9 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		t.Fatalf("service Create with sandbox-scoped proxy credential: %v", err)
 	}
 	sandboxID := operation.SandboxID
-	if sandboxID == "" || !proxies.Has(sandboxName, "openai") {
-		t.Fatalf("service Create did not persist sandbox identity and start broker (id=%q)", sandboxID)
-	}
 	deleted := false
 	defer func() {
-		if deleted {
+		if deleted || sandboxID == "" {
 			return
 		}
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -255,6 +253,9 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 			t.Errorf("delete owned service acceptance sandbox: %v", err)
 		}
 	}()
+	if sandboxID == "" || !proxies.Has(sandboxName, "openai") {
+		t.Fatalf("service Create did not persist sandbox identity and start broker (id=%q)", sandboxID)
+	}
 
 	checkEnv := `/bin/sh -c 'test "$OPENAI_API_KEY" = rheic-proxy-placeholder && test "$OPENAI_BASE_URL" = http://127.0.0.1:3128/v1'`
 	if err := waitP04ServiceHelper(ctx, svc, sandboxID); err != nil {
