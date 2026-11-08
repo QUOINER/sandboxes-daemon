@@ -51,9 +51,34 @@ the database under the operating system's user config directory in `rheic/`.
 ## Sign and publish a policy
 
 The signer receives a JSON `PolicyPayload` matching the OpenAPI schema. The
-server accepts strictly increasing revisions and rejects expired, malformed,
-cross-organization or incorrectly signed bundles. Signing is local and does
-not contact the server:
+JSON representation is only the transport format; it is not signed directly.
+Both signer and server sign/verify the following version-1 canonical byte
+format, using Ed25519:
+
+1. Domain separator: the UTF-8 bytes `rheic-policy-payload\0v1\0`.
+2. `schemaVersion`: unsigned 32-bit big-endian integer.
+3. `orgId`: unsigned 32-bit big-endian UTF-8 byte length, then the exact UTF-8
+   bytes (no Unicode normalization).
+4. `revision`: unsigned 64-bit big-endian integer.
+5. `issuedAt`, then `expiresAt`: each is signed 64-bit big-endian Unix seconds
+   followed by unsigned 32-bit big-endian nanoseconds. RFC 3339 timestamps may
+   use an explicit offset; they are interpreted as instants and encoded in
+   UTC. Precision finer than one nanosecond is rejected. The signer emits UTC
+   timestamps ending in `Z`.
+6. `rules`: unsigned 32-bit big-endian rule count, followed in array order by
+   each rule's `resource`, `action`, and `ruleId`; each string uses the same
+   32-bit byte-length prefix and exact UTF-8 encoding as `orgId`.
+
+Rules must already be in strictly increasing bytewise UTF-8 `ruleId` order;
+duplicate IDs and unsorted arrays are rejected, not silently reordered. JSON
+with duplicate object members, invalid UTF-8, or unpaired Unicode surrogate
+escapes is rejected. The bundle's
+`signature` is standard padded Base64 of the 64-byte Ed25519 signature over the
+canonical bytes above. The server accepts strictly increasing revisions and
+rejects expired, malformed, cross-organization or incorrectly signed bundles.
+Legacy signatures over `json.Marshal(payload)` are not accepted. Reissue an
+existing policy with a higher revision using this format. Signing is local and
+does not contact the server:
 
 ```sh
 rheic-server sign-policy \

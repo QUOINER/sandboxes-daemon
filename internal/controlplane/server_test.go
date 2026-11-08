@@ -3,10 +3,12 @@
 package controlplane
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -64,6 +66,100 @@ func TestExpiredPolicyIsRejected(t *testing.T) {
 	response := requestJSON(t, server.Handler(), http.MethodPut, "/v1/orgs/example-org/policy", signedBundle(t, payload, privateKey), true)
 	if response.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expired policy status=%d, want %d", response.Code, http.StatusUnprocessableEntity)
+	}
+}
+
+func TestPolicySigningVectorAndUTCNormalization(t *testing.T) {
+	seed := make([]byte, ed25519.SeedSize)
+	for index := range seed {
+		seed[index] = byte(index)
+	}
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	payload := PolicyPayload{
+		SchemaVersion: 1,
+		OrgID:         "acme",
+		Revision:      7,
+		IssuedAt:      time.Date(2026, time.January, 2, 3, 4, 5, 123456789, time.FixedZone("UTC+02", 2*60*60)),
+		ExpiresAt:     time.Date(2026, time.January, 3, 4, 5, 6, 987654321, time.UTC),
+		Rules: []PolicyRule{
+			{Resource: "network:api.example.test:443", Action: "allow", RuleID: "r-1"},
+			{Resource: "filesystem:/work", Action: "deny", RuleID: "r-2"},
+		},
+	}
+	canonical, err := PolicySigningBytes(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature := ed25519.Sign(privateKey, canonical)
+	const wantCanonicalHex = "72686569632d706f6c6963792d7061796c6f616400763100000000010000000461636d6500000000000000070000000069571985075bcd1500000000695895723ade68b1000000020000001c6e6574776f726b3a6170692e6578616d706c652e746573743a34343300000005616c6c6f7700000003722d310000001066696c6573797374656d3a2f776f726b0000000464656e7900000003722d32"
+	const wantSignatureBase64 = "mypTm0Wj1KhKqZ9FvMa5wlmCKz0IPbnnmcS9AlIyCAM36n13c+aLkFh2y07Ib0/WdE4cF2ibYRPDpRnrz5j2Aw=="
+	if hex.EncodeToString(canonical) != wantCanonicalHex {
+		t.Fatalf("canonical bytes = %x", canonical)
+	}
+	if base64.StdEncoding.EncodeToString(signature) != wantSignatureBase64 {
+		t.Fatalf("signature = %s", base64.StdEncoding.EncodeToString(signature))
+	}
+	utcPayload := payload
+	utcPayload.IssuedAt = payload.IssuedAt.UTC()
+	canonicalUTC, err := PolicySigningBytes(utcPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(canonical, canonicalUTC) {
+		t.Fatal("equivalent timestamp offsets produced different signing bytes")
+	}
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	if !ed25519.Verify(publicKey, canonical, signature) || !verifySignature(payload, wantSignatureBase64, publicKey) {
+		t.Fatal("fixed Ed25519 policy signature did not interoperate with verifier")
+	}
+	if verifySignature(payload, wantSignatureBase64+"\n", publicKey) {
+		t.Fatal("noncanonical Base64 signature was accepted")
+	}
+}
+
+func TestPolicyRulesMustBeStrictlyOrderedByRuleID(t *testing.T) {
+	server, _, now := newTestServer(t)
+	payload := PolicyPayload{
+		SchemaVersion: 1,
+		OrgID:         "example-org",
+		Revision:      1,
+		IssuedAt:      now,
+		ExpiresAt:     now.Add(time.Hour),
+		Rules: []PolicyRule{
+			{Resource: "network:b.example.test:443", Action: "allow", RuleID: "r-2"},
+			{Resource: "network:a.example.test:443", Action: "deny", RuleID: "r-1"},
+		},
+	}
+	response := requestJSON(t, server.Handler(), http.MethodPut, "/v1/orgs/example-org/policy", SignedPolicyBundle{Payload: payload, Signature: "invalid"}, true)
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("unsorted policy status=%d, want %d", response.Code, http.StatusUnprocessableEntity)
+	}
+}
+
+func TestPolicyJSONRejectsDuplicateMembersAndExcessTimestampPrecision(t *testing.T) {
+	valid := `{"schemaVersion":1,"orgId":"example-org","revision":1,"issuedAt":"2026-11-08T00:00:00Z","expiresAt":"2026-11-08T01:00:00Z","rules":[]}`
+	for name, raw := range map[string]string{
+		"duplicate":          `{"schemaVersion":1,"schemaVersion":1,"orgId":"example-org","revision":1,"issuedAt":"2026-11-08T00:00:00Z","expiresAt":"2026-11-08T01:00:00Z","rules":[]}`,
+		"excess precision":   `{"schemaVersion":1,"orgId":"example-org","revision":1,"issuedAt":"2026-11-08T00:00:00.1234567890Z","expiresAt":"2026-11-08T01:00:00Z","rules":[]}`,
+		"duplicate nested":   `{"schemaVersion":1,"orgId":"example-org","revision":1,"issuedAt":"2026-11-08T00:00:00Z","expiresAt":"2026-11-08T01:00:00Z","rules":[{"resource":"x","resource":"y","action":"allow","ruleId":"r1"}]}`,
+		"unpaired surrogate": `{"schemaVersion":1,"orgId":"example-org","revision":1,"issuedAt":"2026-11-08T00:00:00Z","expiresAt":"2026-11-08T01:00:00Z","rules":[{"resource":"\ud800","action":"allow","ruleId":"r1"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodePolicyPayloadJSON([]byte(raw)); err == nil {
+				t.Fatal("invalid policy JSON was accepted")
+			}
+		})
+	}
+	if _, err := DecodePolicyPayloadJSON([]byte(valid)); err != nil {
+		t.Fatalf("valid policy JSON rejected: %v", err)
+	}
+	validSurrogatePair := `{"schemaVersion":1,"orgId":"example-org","revision":1,"issuedAt":"2026-11-08T00:00:00Z","expiresAt":"2026-11-08T01:00:00Z","rules":[{"resource":"\ud83d\ude00","action":"allow","ruleId":"r1"}]}`
+	if _, err := DecodePolicyPayloadJSON([]byte(validSurrogatePair)); err != nil {
+		t.Fatalf("valid surrogate pair rejected: %v", err)
+	}
+	invalidUTF8 := append([]byte(valid[:len(valid)-1]), 0xff, '}')
+	if _, err := DecodePolicyPayloadJSON(invalidUTF8); err == nil {
+		t.Fatal("invalid UTF-8 policy JSON was accepted")
 	}
 }
 
@@ -175,7 +271,7 @@ func newTestServer(t *testing.T) (*Server, ed25519.PrivateKey, time.Time) {
 
 func signedBundle(t *testing.T, payload PolicyPayload, key ed25519.PrivateKey) SignedPolicyBundle {
 	t.Helper()
-	encoded, err := json.Marshal(payload)
+	encoded, err := PolicySigningBytes(payload)
 	if err != nil {
 		t.Fatal(err)
 	}

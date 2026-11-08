@@ -223,11 +223,12 @@ func (s *Server) getPolicy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database_error")
 		return
 	}
-	var payload PolicyPayload
-	if err := json.Unmarshal(raw, &payload); err != nil || validatePayload(payload, org, s.clock()) != nil || !verifySignature(payload, signature, s.policyKey) {
+	payload, decodeErr := DecodePolicyPayloadJSON(raw)
+	if decodeErr != nil || validatePayload(payload, org, s.clock()) != nil || !verifySignature(payload, signature, s.policyKey) {
 		writeError(w, http.StatusServiceUnavailable, "stored_policy_invalid")
 		return
 	}
+	payload = normalizePolicyTimes(payload)
 	writeJSON(w, http.StatusOK, SignedPolicyBundle{Payload: payload, Signature: signature})
 }
 
@@ -240,8 +241,13 @@ func (s *Server) putPolicy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_org_id")
 		return
 	}
-	var bundle SignedPolicyBundle
-	if err := decodeJSON(w, r, maxBundleBytes, &bundle); err != nil {
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBundleBytes))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_bundle")
+		return
+	}
+	bundle, err := DecodeSignedPolicyBundleJSON(raw)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_bundle")
 		return
 	}
@@ -249,6 +255,7 @@ func (s *Server) putPolicy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "bundle_signature_or_policy_invalid")
 		return
 	}
+	bundle.Payload = normalizePolicyTimes(bundle.Payload)
 	payload, err := json.Marshal(bundle.Payload)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "encoding_failed")
@@ -329,13 +336,28 @@ func validatePayload(payload PolicyPayload, org string, now time.Time) error {
 	if err := validatePayloadMetadata(payload, org, now); err != nil {
 		return err
 	}
-	for _, rule := range payload.Rules {
+	return validatePolicyRules(payload.Rules)
+}
+
+// ValidatePolicyPayload applies the control-plane policy constraints to a
+// payload at the supplied time.
+func ValidatePolicyPayload(payload PolicyPayload, org string, now time.Time) error {
+	return validatePayload(payload, org, now)
+}
+
+func validatePolicyRules(rules []PolicyRule) error {
+	previousRuleID := ""
+	for index, rule := range rules {
 		if !idPattern.MatchString(rule.RuleID) || rule.Resource == "" || len(rule.Resource) > 512 {
 			return errors.New("invalid policy rule")
 		}
 		if _, ok := decisionNames[rule.Action]; !ok {
 			return errors.New("invalid policy action")
 		}
+		if index > 0 && rule.RuleID <= previousRuleID {
+			return errors.New("policy rules must be strictly ordered by ruleId")
+		}
+		previousRuleID = rule.RuleID
 	}
 	return nil
 }
@@ -355,11 +377,17 @@ func validatePayloadMetadata(payload PolicyPayload, org string, now time.Time) e
 
 func verifySignature(payload PolicyPayload, encoded string, key ed25519.PublicKey) bool {
 	signature, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil || len(signature) != ed25519.SignatureSize {
+	if err != nil || len(signature) != ed25519.SignatureSize || base64.StdEncoding.EncodeToString(signature) != encoded {
 		return false
 	}
-	canonical, err := json.Marshal(payload)
+	canonical, err := PolicySigningBytes(payload)
 	return err == nil && ed25519.Verify(key, canonical, signature)
+}
+
+func normalizePolicyTimes(payload PolicyPayload) PolicyPayload {
+	payload.IssuedAt = payload.IssuedAt.UTC()
+	payload.ExpiresAt = payload.ExpiresAt.UTC()
+	return payload
 }
 
 func decodeAuditBatch(raw []byte, now time.Time) ([]AuditEvent, error) {
@@ -396,20 +424,6 @@ func validAuditEvent(event AuditEvent, now time.Time) bool {
 }
 
 func validOrgID(org string) bool { return orgIDPattern.MatchString(org) }
-
-func decodeJSON(w http.ResponseWriter, r *http.Request, limit int64, dst any) error {
-	defer func() { _ = r.Body.Close() }()
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(dst); err != nil {
-		return err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return errors.New("trailing JSON data")
-	}
-	return nil
-}
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")

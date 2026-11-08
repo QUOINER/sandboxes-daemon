@@ -71,12 +71,15 @@ func TestGenerateAndSignPolicyOffline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	canonical, err := json.Marshal(bundle.Payload)
+	canonical, err := controlplane.PolicySigningBytes(bundle.Payload)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ed25519.Verify(ed25519.PublicKey(publicKey), canonical, signature) {
 		t.Fatal("offline signature did not verify with the generated public key")
+	}
+	if bundle.Payload.IssuedAt.Location() != time.UTC || bundle.Payload.ExpiresAt.Location() != time.UTC {
+		t.Fatal("sign-policy did not normalize payload timestamps to UTC")
 	}
 	if err := generatePolicyKey([]string{"--prefix", prefix}); err == nil {
 		t.Fatal("keygen overwrote an existing private key")

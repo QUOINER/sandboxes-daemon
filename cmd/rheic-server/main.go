@@ -214,28 +214,13 @@ func signPolicy(args []string) error {
 	if len(privateKey) != ed25519.PrivateKeySize {
 		return errors.New("policy private key has invalid size")
 	}
-	input, err := os.Open(*inputPath)
+	payload, err := readPolicyPayload(*inputPath)
 	if err != nil {
-		return fmt.Errorf("open policy payload: %w", err)
+		return err
 	}
-	defer func() {
-		if err := input.Close(); err != nil {
-			slog.Error("close policy payload", "error", err)
-		}
-	}()
-	decoder := json.NewDecoder(io.LimitReader(input, 1<<20))
-	decoder.DisallowUnknownFields()
-	var payload controlplane.PolicyPayload
-	if err := decoder.Decode(&payload); err != nil {
-		return fmt.Errorf("decode policy payload: %w", err)
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return errors.New("policy payload contains trailing JSON")
-	}
-	canonical, err := json.Marshal(payload)
+	canonical, err := controlplane.PolicySigningBytes(payload)
 	if err != nil {
-		return fmt.Errorf("encode policy payload: %w", err)
+		return fmt.Errorf("canonicalize policy payload: %w", err)
 	}
 	bundle := controlplane.SignedPolicyBundle{Payload: payload, Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(ed25519.PrivateKey(privateKey), canonical))}
 	encoded, err := json.MarshalIndent(bundle, "", "  ")
@@ -248,6 +233,36 @@ func signPolicy(args []string) error {
 		return err
 	}
 	return writeNewFile(*outputPath, encoded, 0o600)
+}
+
+func readPolicyPayload(path string) (controlplane.PolicyPayload, error) {
+	//nolint:gosec // --input is an operator-supplied local policy file, not a request-controlled path.
+	input, err := os.Open(path)
+	if err != nil {
+		return controlplane.PolicyPayload{}, fmt.Errorf("open policy payload: %w", err)
+	}
+	defer func() {
+		if err := input.Close(); err != nil {
+			slog.Error("close policy payload", "error", err)
+		}
+	}()
+	raw, err := io.ReadAll(io.LimitReader(input, (1<<20)+1))
+	if err != nil {
+		return controlplane.PolicyPayload{}, fmt.Errorf("read policy payload: %w", err)
+	}
+	if len(raw) > 1<<20 {
+		return controlplane.PolicyPayload{}, errors.New("policy payload exceeds 1 MiB")
+	}
+	payload, err := controlplane.DecodePolicyPayloadJSON(raw)
+	if err != nil {
+		return controlplane.PolicyPayload{}, fmt.Errorf("decode policy payload: %w", err)
+	}
+	if err := controlplane.ValidatePolicyPayload(payload, payload.OrgID, time.Now()); err != nil {
+		return controlplane.PolicyPayload{}, fmt.Errorf("validate policy payload: %w", err)
+	}
+	payload.IssuedAt = payload.IssuedAt.UTC()
+	payload.ExpiresAt = payload.ExpiresAt.UTC()
+	return payload, nil
 }
 
 func writeNewFile(path string, content []byte, mode os.FileMode) error {
