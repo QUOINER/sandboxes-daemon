@@ -724,19 +724,20 @@ func TestCreatePassesWorkspacesAndStoresThem(t *testing.T) {
 	svc := New(st, backend)
 	work := filepath.Join(t.TempDir(), "work")
 	docs := filepath.Join(t.TempDir(), "docs")
+	hostPort := availableHostTCPPort(t)
 	op, err := svc.Create(ctx, CreateRequest{Name: "multi", Agent: "shell", Detached: true, Workspaces: []sandbox.Workspace{
 		{Path: work}, {Path: docs, ReadOnly: true},
-	}, Ports: []sandbox.Port{{Host: 8080, Guest: 3000}}})
+	}, Ports: []sandbox.Port{{Host: hostPort, Guest: 3000}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(backend.lastConfig.Workspaces) != 2 || !backend.lastConfig.Workspaces[1].ReadOnly ||
-		backend.lastConfig.Workspace != work || len(backend.lastConfig.Ports) != 1 || backend.lastConfig.Ports[0].Host != 8080 {
+		backend.lastConfig.Workspace != work || len(backend.lastConfig.Ports) != 1 || backend.lastConfig.Ports[0].Host != hostPort {
 		t.Fatalf("runtime config=%+v", backend.lastConfig)
 	}
 	sb, err := svc.Get(ctx, op.SandboxID)
 	if err != nil || len(sb.Workspaces) != 2 || sb.Workspace != work || !sb.Workspaces[1].ReadOnly ||
-		len(sb.Ports) != 1 || sb.Ports[0].Guest != 3000 || sb.Meta == nil || sb.Meta.Agent != "shell" || !sb.Meta.Detached {
+		len(sb.Ports) != 1 || sb.Ports[0].Host != hostPort || sb.Ports[0].Guest != 3000 || sb.Meta == nil || sb.Meta.Agent != "shell" || !sb.Meta.Detached {
 		t.Fatalf("sandbox=%+v err=%v", sb, err)
 	}
 }
@@ -847,7 +848,8 @@ func TestStartPassesPublishedPortsToRuntime(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	backend := &fakeRuntime{}
 	svc := New(st, backend)
-	op, err := svc.Create(ctx, CreateRequest{Name: "ported", Ports: []sandbox.Port{{Host: 8080, Guest: 3000}}})
+	hostPort := availableHostTCPPort(t)
+	op, err := svc.Create(ctx, CreateRequest{Name: "ported", Ports: []sandbox.Port{{Host: hostPort, Guest: 3000}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -857,9 +859,22 @@ func TestStartPassesPublishedPortsToRuntime(t *testing.T) {
 	if _, err := svc.Start(ctx, op.SandboxID); err != nil {
 		t.Fatal(err)
 	}
-	if len(backend.lastHandle.Ports) != 1 || backend.lastHandle.Ports[0].Host != 8080 || backend.lastHandle.Ports[0].Guest != 3000 {
+	if len(backend.lastHandle.Ports) != 1 || backend.lastHandle.Ports[0].Host != hostPort || backend.lastHandle.Ports[0].Guest != 3000 {
 		t.Fatalf("start handle=%+v", backend.lastHandle)
 	}
+}
+
+func availableHostTCPPort(t *testing.T) uint16 {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return uint16(port)
 }
 
 func TestCreatePassesAndStoresNetworkRules(t *testing.T) {
