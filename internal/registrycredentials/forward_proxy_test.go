@@ -227,6 +227,37 @@ func TestBlobRedirectPreservesEmptyQueryMarker(t *testing.T) {
 	}
 }
 
+func TestBlobRedirectCapsNotFoundResponseBody(t *testing.T) {
+	tests := []struct {
+		name           string
+		responseStatus int
+		bodyLength     int64
+		wantStatus     int
+	}{
+		{name: "within error limit", responseStatus: http.StatusNotFound, bodyLength: maxPullErrorResponseBytes, wantStatus: http.StatusNotFound},
+		{name: "over error limit", responseStatus: http.StatusNotFound, bodyLength: maxPullErrorResponseBytes + 1, wantStatus: http.StatusBadGateway},
+		{name: "successful blob exceeds error limit", responseStatus: http.StatusOK, bodyLength: maxPullErrorResponseBytes + 1, wantStatus: http.StatusOK},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := strings.Repeat("x", int(test.bodyLength))
+			response := &http.Response{
+				StatusCode: test.responseStatus, Header: make(http.Header),
+				Body: io.NopCloser(strings.NewReader(body)), ContentLength: test.bodyLength,
+			}
+			proxy := &PullProxy{maxBytes: maxPullResponseBytes}
+			recorder := httptest.NewRecorder()
+			proxy.writeBlobRedirect(recorder, http.MethodGet, response)
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, test.wantStatus)
+			}
+			if (test.wantStatus == http.StatusNotFound || test.wantStatus == http.StatusOK) && int64(recorder.Body.Len()) != test.bodyLength {
+				t.Fatalf("body length = %d, want %d", recorder.Body.Len(), test.bodyLength)
+			}
+		})
+	}
+}
+
 func TestBlobRedirectRejectsExpiredAndUntrustedSessions(t *testing.T) {
 	proxy := &PullProxy{blobRedirects: make(map[string]blobRedirectSession), redirectHosts: redirectHostSet([]string{dockerHubBlobAuthority})}
 	expired, err := url.Parse("https://production.cloudfront.docker.com/blob?sig=expired")

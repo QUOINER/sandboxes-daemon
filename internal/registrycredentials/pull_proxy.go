@@ -74,7 +74,7 @@ type PullProxyTransportFactory interface {
 }
 
 const maxPullResponseBytes = 16 << 30
-const maxPullErrorResponseBytes = 64 << 10
+const maxPullErrorResponseBytes = maxRegistryErrorBody
 
 // PullProxyConfig is trusted host configuration, never a guest request.
 type PullProxyConfig struct {
