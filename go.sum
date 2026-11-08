@@ -101,8 +101,8 @@ github.com/rheic/sandboxes-api v0.0.21 h1:r4SYHr1fi5kGLCKMleJSNP+r9TwKF8QeO/EZF1
 github.com/rheic/sandboxes-api v0.0.21/go.mod h1:R3Hvfvl1WzUaK2f1GVJv7AdPKw5JgHFPqsiWaQYNl94=
 github.com/rheic/sandboxes-core v0.0.11 h1:TIox6cArRsdxpQORQdag4fFkRvn51+ZS774fetLjLQQ=
 github.com/rheic/sandboxes-core v0.0.11/go.mod h1:ue8m6n4U0yiuQfJ2DVSIOgalrai/LX+CsapbHLIOT+k=
-github.com/rheic/sandboxes-gateway v0.0.15 h1:PCsjgh7sYTesdQv9c4oxwp1XB53d3bTb6JpVRCh850A=
-github.com/rheic/sandboxes-gateway v0.0.15/go.mod h1:UiK34i7S82e9b6f3d6JoArIFksb3JhiHaOPnf8Rfi60=
+github.com/rheic/sandboxes-gateway v0.0.16 h1:E9ajlt5C8HypZuQQv5II1zC9FeuyqazQKCUFnTBDQMw=
+github.com/rheic/sandboxes-gateway v0.0.16/go.mod h1:UiK34i7S82e9b6f3d6JoArIFksb3JhiHaOPnf8Rfi60=
 github.com/rheic/sandboxes-runtime v0.0.26 h1:qwmJrSkQoMS0DDv60+yVS723K8aJUEphKhMzo9hUVp8=
 github.com/rheic/sandboxes-runtime v0.0.26/go.mod h1:hrxA+hCW3sfmNmbwugLRyeaODCkdGwB96po3/VQX+Vw=
 github.com/segmentio/asm v1.2.1 h1:DTNbBqs57ioxAD4PrArqftgypG4/qNpXoJx8TVXxPR0=
