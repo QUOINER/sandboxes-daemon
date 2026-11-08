@@ -141,7 +141,9 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	// A cold pinned sandbox-template pull is several hundred MiB; allow the
+	// controlled registry fetch to complete before testing VM lifecycle.
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 	if err := waitP04ServiceContainerd(ctx, inputs.ctr, containerdSocket, containerdDone); err != nil {
 		t.Fatalf("wait for owned containerd: %v (log %s)", err, filepath.Join(root, "containerd.log"))
