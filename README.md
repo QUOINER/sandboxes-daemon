@@ -126,3 +126,20 @@ entries are not overwritten. Docker account login uses the Docker public
 device-flow client ID embedded in Docker CLI and the installed Docker
 Sandboxes `sbx` binary. No Rheic OAuth registration is needed. Browser launch
 is supported on macOS; other platforms return unsupported.
+
+## Policy sync client (internal preview)
+
+`internal/policysync` contains a daemon-internal client for the self-hosted
+control plane. It fetches `GET /v1/orgs/{org}/policy` over TLS with a bearer
+credential and a pinned Ed25519 public key, re-verifies the canonical bundle
+signature locally (server-side verification is not trusted), rejects expired
+bundles and revision rollbacks, and stores only verified bundles in the
+`org_policy_bundles` SQLite table. The schema migration is forward-only and
+creates a pre-upgrade backup; network, TLS, signature, expiry and revision
+failures fail closed and leave the previous bundle intact.
+
+The client is not wired into the CLI, local API or SDK yet; that product wiring
+is a separate slice. Multi-tenancy, applying synced policy to sandboxes,
+offline last-known-good behavior and audit SIEM export remain out of scope for
+this preview. The table stores policy metadata and signatures only, never
+sandbox secrets.
