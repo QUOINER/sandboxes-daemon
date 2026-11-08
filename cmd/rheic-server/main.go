@@ -45,12 +45,12 @@ func run() error {
 }
 
 type serverOptions struct {
-	listen     string
-	dbPath     string
-	tokenPath  string
-	publicKey  string
-	certPath   string
-	privateKey string
+	listen          string
+	dbPath          string
+	credentialsPath string
+	publicKey       string
+	certPath        string
+	privateKey      string
 }
 
 func runServer(args []string) error {
@@ -61,17 +61,17 @@ func runServer(args []string) error {
 	}
 	listen := flags.String("listen", "127.0.0.1:8443", "HTTPS listen address")
 	dbPath := flags.String("db", defaultDBPath, "SQLite database path")
-	tokenPath := flags.String("admin-token-file", "", "file with a random 32-byte-or-longer admin bearer token (mode 0600)")
+	credentialsPath := flags.String("credentials-file", "", "protected role-scoped bearer credentials file (mode 0600)")
 	publicKeyPath := flags.String("policy-public-key", "", "base64 Ed25519 policy-signing public key file")
 	certPath := flags.String("tls-cert", "", "TLS certificate PEM")
 	keyPath := flags.String("tls-key", "", "TLS private key PEM")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *tokenPath == "" || *publicKeyPath == "" || *certPath == "" || *keyPath == "" {
-		return errors.New("--admin-token-file, --policy-public-key, --tls-cert, and --tls-key are required")
+	if flags.NArg() != 0 || *credentialsPath == "" || *publicKeyPath == "" || *certPath == "" || *keyPath == "" {
+		return errors.New("--credentials-file, --policy-public-key, --tls-cert, and --tls-key are required")
 	}
-	return serve(serverOptions{listen: *listen, dbPath: *dbPath, tokenPath: *tokenPath, publicKey: *publicKeyPath, certPath: *certPath, privateKey: *keyPath})
+	return serve(serverOptions{listen: *listen, dbPath: *dbPath, credentialsPath: *credentialsPath, publicKey: *publicKeyPath, certPath: *certPath, privateKey: *keyPath})
 }
 
 func defaultDatabasePath() (string, error) {
@@ -87,13 +87,13 @@ func databasePathInConfigDir(configDir string) string {
 }
 
 func serve(options serverOptions) error {
-	token, err := readPrivateFile(options.tokenPath)
+	credentialsRaw, err := readProtectedFile(options.credentialsPath, controlplane.MaxCredentialFileBytes)
 	if err != nil {
-		return fmt.Errorf("read admin token: %w", err)
+		return fmt.Errorf("read credentials file: %w", err)
 	}
-	token = []byte(strings.TrimSpace(string(token)))
-	if len(token) < 32 {
-		return errors.New("admin token must contain at least 32 bytes")
+	credentials, err := controlplane.ParseCredentials(credentialsRaw)
+	if err != nil {
+		return fmt.Errorf("parse credentials file: %w", err)
 	}
 	encodedKey, err := os.ReadFile(options.publicKey)
 	if err != nil {
@@ -110,7 +110,7 @@ func serve(options serverOptions) error {
 	if err := prepareDatabasePath(options.dbPath); err != nil {
 		return err
 	}
-	service, err := controlplane.New(controlplane.Config{DBPath: options.dbPath, AdminToken: token, PolicyKey: ed25519.PublicKey(publicKey)})
+	service, err := controlplane.New(controlplane.Config{DBPath: options.dbPath, Credentials: credentials, PolicyKey: ed25519.PublicKey(publicKey)})
 	if err != nil {
 		return err
 	}
@@ -284,6 +284,10 @@ func writeNewFile(path string, content []byte, mode os.FileMode) error {
 }
 
 func readPrivateFile(path string) ([]byte, error) {
+	return readProtectedFile(path, 4096)
+}
+
+func readProtectedFile(path string, limit int) ([]byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
@@ -306,12 +310,12 @@ func readPrivateFile(path string) ([]byte, error) {
 			slog.Error("close private input file", "error", err)
 		}
 	}()
-	content, err := io.ReadAll(io.LimitReader(file, 4097))
+	content, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(content) > 4096 {
-		return nil, errors.New("private file exceeds 4096-byte limit")
+	if len(content) > limit {
+		return nil, fmt.Errorf("protected file exceeds %d-byte limit", limit)
 	}
 	return content, nil
 }
