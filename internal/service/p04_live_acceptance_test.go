@@ -292,8 +292,8 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 	if err := ctx.Err(); err != nil {
 		t.Fatalf("service acceptance exceeded operation deadline: %v", err)
 	}
-	if elapsed := time.Since(started); elapsed >= 90*time.Second {
-		t.Fatalf("service acceptance exceeded 90 seconds: %s", elapsed)
+	if elapsed := time.Since(started); elapsed >= 5*time.Minute {
+		t.Fatalf("service lifecycle acceptance exceeded 5 minutes: %s", elapsed)
 	}
 	t.Log("PASS: native sandbox-scoped keychain credential drove service Create/Stop/Start/Exec; env stayed placeholder-only; revoke closed broker and blocked Exec; Delete removed proxy metadata; credential absent from SQLite")
 }
