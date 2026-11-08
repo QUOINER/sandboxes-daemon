@@ -2,6 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 || $# -gt 2 || ! "$1" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+if [[ $# -lt 1 || $# -gt 2 || ! "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   printf 'usage: %s VERSION [CHANGELOG]\n' "${0##*/}" >&2
   exit 2
 fi
