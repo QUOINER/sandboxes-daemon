@@ -49,6 +49,13 @@ func (p *PullProxy) serveForwardRequest(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "invalid TLS host", http.StatusMisdirectedRequest)
 		return
 	}
+	// The broker terminates the guest-visible token exchange on the registry
+	// authority. The real realm stays host-side and is selected from the
+	// upstream Bearer challenge.
+	if strings.EqualFold(host, p.authority) && r.URL.Path == brokerTokenPath {
+		p.servePrivateTokenRequest(w, r)
+		return
+	}
 	// A registry may serve its token endpoint on the registry host itself, so
 	// an exact realm path wins over the registry route on the same host.
 	if realm, ok := p.realmForPath(host, r.URL.Path); ok {
@@ -112,6 +119,38 @@ func (p *PullProxy) serveTokenRequest(w http.ResponseWriter, r *http.Request, re
 	scope := "repository:" + repository + ":" + strings.Join(sortedActions(actions), ",")
 	_, err = p.store.ExchangeScopedToken(ctx, transport, p.registry, p.credentialScope, p.sandboxName, p.service, scope, realm, p.realms)
 	if err != nil {
+		http.Error(w, "registry authentication failed", http.StatusUnauthorized)
+		return
+	}
+	writeSentinelToken(w, p, repository, actions)
+}
+
+// servePrivateTokenRequest terminates the guest-visible token exchange on the
+// registry authority. The guest never contacts the real realm; the broker
+// exchanges the host credential against the realm discovered from the upstream
+// challenge and returns only a short-lived sentinel.
+func (p *PullProxy) servePrivateTokenRequest(w http.ResponseWriter, r *http.Request) {
+	repository, actions, status := requestedTokenScope(r, p.service, brokerTokenPath)
+	if status != http.StatusOK {
+		message := "registry token request is invalid"
+		if status == http.StatusForbidden {
+			message = "registry token request is unsupported"
+		}
+		http.Error(w, message, status)
+		return
+	}
+	realm, ok := p.cachedRealm(repository)
+	if !ok {
+		http.Error(w, "registry authentication realm is not discovered", http.StatusUnauthorized)
+		return
+	}
+	transport, err := p.tokenTransportFor(r.Context(), realm)
+	if err != nil {
+		http.Error(w, "registry authentication unavailable", http.StatusBadGateway)
+		return
+	}
+	scope := "repository:" + repository + ":" + strings.Join(sortedActions(actions), ",")
+	if _, err := p.store.ExchangeScopedToken(r.Context(), transport, p.registry, p.credentialScope, p.sandboxName, p.service, scope, realm, p.realms); err != nil {
 		http.Error(w, "registry authentication failed", http.StatusUnauthorized)
 		return
 	}
@@ -307,13 +346,123 @@ func (p *PullProxy) serveRegistryForward(w http.ResponseWriter, r *http.Request,
 	}
 	token := strings.TrimSpace(r.Header.Get("Authorization"))
 	if token == "" {
+		if !p.privateRegistry {
+			p.writeRegistryChallenge(w, operation)
+			return
+		}
+		realm, requiresAuth, err := p.resolveOperationRealm(r.Context(), r, endpoint, operation)
+		if err != nil {
+			http.Error(w, "registry authorization discovery failed", http.StatusBadGateway)
+			return
+		}
+		if !requiresAuth {
+			p.forwardRegistryOperation(w, r, endpoint, operation, "")
+			return
+		}
+		_ = realm
 		p.writeRegistryChallenge(w, operation)
 		return
 	}
 	if !p.authorizeGuestOperation(w, r, operation, token) {
 		return
 	}
-	p.forwardRegistryOperation(w, r, endpoint, operation)
+	upstreamToken, err := p.exchangeOperationToken(r.Context(), operation)
+	if err != nil {
+		http.Error(w, "registry authorization failed", http.StatusBadGateway)
+		return
+	}
+	defer clear([]byte(upstreamToken))
+	p.forwardRegistryOperation(w, r, endpoint, operation, upstreamToken)
+}
+
+// resolveOperationRealm discovers the realm advertised by the trusted upstream
+// for this operation, caches it per repository, and reports whether the
+// operation requires authentication at all. A streaming request cannot be
+// replayed for discovery, so it must already have a cached realm.
+func (p *PullProxy) resolveOperationRealm(ctx context.Context, incoming *http.Request, endpoint *url.URL, operation registryOperation) (registryauth.Realm, bool, error) {
+	if realm, ok := p.cachedRealm(operation.repository); ok {
+		return realm, true, nil
+	}
+	if (incoming.Method != http.MethodGet && incoming.Method != http.MethodHead) || incoming.ContentLength != 0 || len(incoming.TransferEncoding) != 0 {
+		return registryauth.Realm{}, false, errors.New("registry realm discovery requires a read request")
+	}
+	realm, requiresAuth, err := p.probeRegistryRealm(ctx, incoming, endpoint)
+	if err != nil {
+		return registryauth.Realm{}, false, err
+	}
+	if requiresAuth {
+		p.rememberRealm(operation.repository, realm)
+	}
+	return realm, requiresAuth, nil
+}
+
+func (p *PullProxy) probeRegistryRealm(ctx context.Context, incoming *http.Request, endpoint *url.URL) (registryauth.Realm, bool, error) {
+	transport, err := p.registryTransportFor(ctx)
+	if err != nil {
+		return registryauth.Realm{}, false, err
+	}
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	probe, err := http.NewRequestWithContext(ctx, incoming.Method, endpoint.String(), http.NoBody) //nolint:gosec // endpoint is pinned to the configured registry authority.
+	if err != nil {
+		return registryauth.Realm{}, false, err
+	}
+	for _, key := range forwardedPullHeaders {
+		for _, value := range incoming.Header.Values(key) {
+			probe.Header.Add(key, value)
+		}
+	}
+	probe.Header.Set("Accept-Encoding", "identity")
+	response, err := client.Do(probe) // #nosec G704 -- pinned registry transport and authority.
+	if err != nil {
+		return registryauth.Realm{}, false, err
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusUnauthorized {
+		if response.StatusCode >= 200 && response.StatusCode < 500 {
+			return registryauth.Realm{}, false, nil
+		}
+		return registryauth.Realm{}, false, errors.New("registry realm probe failed")
+	}
+	challenges := response.Header.Values("WWW-Authenticate")
+	if len(challenges) != 1 {
+		return registryauth.Realm{}, false, errors.New("registry returned an invalid challenge")
+	}
+	challenge, err := registryauth.ParseBearerChallenge(challenges[0], p.realms)
+	if err != nil || challenge.Service != p.service || challenge.Realm.Host == "" {
+		return registryauth.Realm{}, false, errors.New("registry returned an untrusted challenge")
+	}
+	return registryauth.Realm{Host: challenge.Realm.Host, Path: challenge.Realm.EscapedPath()}, true, nil
+}
+
+func (p *PullProxy) rememberRealm(repository string, realm registryauth.Realm) {
+	p.challengeMu.Lock()
+	defer p.challengeMu.Unlock()
+	now := time.Now()
+	if len(p.challenges) >= maxCachedRealms {
+		for key, grant := range p.challenges {
+			if !grant.expiresAt.After(now) {
+				delete(p.challenges, key)
+			}
+		}
+	}
+	if len(p.challenges) >= maxCachedRealms {
+		return
+	}
+	p.challenges[repository] = realmGrant{realm: realm, expiresAt: now.Add(5 * time.Minute)}
+}
+
+func (p *PullProxy) cachedRealm(repository string) (registryauth.Realm, bool) {
+	p.challengeMu.Lock()
+	defer p.challengeMu.Unlock()
+	grant, ok := p.challenges[repository]
+	if !ok {
+		return registryauth.Realm{}, false
+	}
+	if !grant.expiresAt.After(time.Now()) {
+		delete(p.challenges, repository)
+		return registryauth.Realm{}, false
+	}
+	return grant.realm, true
 }
 
 func registryEndpointFromRequest(r *http.Request, host string) (*url.URL, error) {
@@ -352,7 +501,7 @@ func (p *PullProxy) authorizeGuestOperation(w http.ResponseWriter, r *http.Reque
 	return false
 }
 
-func (p *PullProxy) forwardRegistryOperation(w http.ResponseWriter, r *http.Request, endpoint *url.URL, operation registryOperation) {
+func (p *PullProxy) forwardRegistryOperation(w http.ResponseWriter, r *http.Request, endpoint *url.URL, operation registryOperation, upstreamToken string) {
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
 	if !p.limiter.acquire(ctx) {
@@ -363,12 +512,6 @@ func (p *PullProxy) forwardRegistryOperation(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	defer p.limiter.release()
-	upstreamToken, err := p.exchangeOperationToken(ctx, operation)
-	if err != nil {
-		http.Error(w, "registry authorization failed", http.StatusBadGateway)
-		return
-	}
-	defer clear([]byte(upstreamToken))
 	transport, err := p.registryTransportFor(ctx)
 	if err != nil {
 		http.Error(w, "registry transport unavailable", http.StatusBadGateway)
@@ -383,7 +526,9 @@ func (p *PullProxy) forwardRegistryOperation(w http.ResponseWriter, r *http.Requ
 	out.Header.Del("Proxy-Authorization")
 	out.Header.Del("Proxy-Connection")
 	out.Header.Del("Authorization")
-	out.Header.Set("Authorization", "Bearer "+upstreamToken)
+	if upstreamToken != "" {
+		out.Header.Set("Authorization", "Bearer "+upstreamToken)
+	}
 	out.Header.Set("Accept-Encoding", "identity")
 	if operation.kind == registryUploadInitKind {
 		out.Body = http.NoBody
@@ -398,7 +543,7 @@ func (p *PullProxy) forwardRegistryOperation(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	defer func() { _ = response.Body.Close() }()
-	p.finishRegistryResponse(w, r.Method, endpoint, operation, response)
+	p.finishRegistryResponse(ctx, w, r, r.Method, endpoint, operation, response)
 }
 
 func (p *PullProxy) writeRegistryChallenge(w http.ResponseWriter, operation registryOperation) {
@@ -410,15 +555,40 @@ func (p *PullProxy) writeRegistryChallenge(w http.ResponseWriter, operation regi
 	if operation.action == registryActionPush {
 		scope = "repository:" + operation.repository + ":pull,push"
 	}
-	realm := p.realms[0]
-	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm=%q,service=%q,scope=%q`, "https://"+realm.Host+realm.Path, p.service, scope))
+	var realmURL string
+	switch {
+	case p.privateRegistry:
+		// Configured private registries terminate the guest token exchange on
+		// the registry authority; the real realm stays host-side.
+		realmURL = "https://" + p.authority + brokerTokenPath
+	case len(p.realms) != 0:
+		// Docker Hub keeps its established auth authority challenge.
+		realmURL = "https://" + p.realms[0].Host + p.realms[0].Path
+	default:
+		http.Error(w, "registry authorization is required", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm=%q,service=%q,scope=%q`, realmURL, p.service, scope))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
 	_, _ = io.WriteString(w, `{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}`)
 }
 
 func (p *PullProxy) exchangeOperationToken(ctx context.Context, operation registryOperation) (string, error) {
-	transport, err := p.tokenTransportFor(ctx, p.realms[0])
+	var realm registryauth.Realm
+	if !p.privateRegistry {
+		if len(p.realms) == 0 {
+			return "", errors.New("registry authentication realm is not configured")
+		}
+		realm = p.realms[0]
+	} else {
+		var ok bool
+		realm, ok = p.cachedRealm(operation.repository)
+		if !ok {
+			return "", errors.New("registry authentication realm is not discovered")
+		}
+	}
+	transport, err := p.tokenTransportFor(ctx, realm)
 	if err != nil {
 		return "", err
 	}
@@ -428,10 +598,7 @@ func (p *PullProxy) exchangeOperationToken(ctx context.Context, operation regist
 		// Keep this action grant explicit and never request delete.
 		scope = "repository:" + operation.repository + ":pull,push"
 	}
-	if len(p.realms) == 0 {
-		return "", errors.New("registry authentication realm is not configured")
-	}
-	return p.store.ExchangeScopedToken(ctx, transport, p.registry, p.credentialScope, p.sandboxName, p.service, scope, p.realms[0], p.realms)
+	return p.store.ExchangeScopedToken(ctx, transport, p.registry, p.credentialScope, p.sandboxName, p.service, scope, realm, p.realms)
 }
 
 func parseRegistryOperation(method string, endpoint *url.URL, expectedHost string) (registryOperation, error) {
@@ -650,9 +817,9 @@ func isLowerHexCharacter(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f'
 }
 
-func (p *PullProxy) finishRegistryResponse(w http.ResponseWriter, method string, endpoint *url.URL, operation registryOperation, response *http.Response) {
+func (p *PullProxy) finishRegistryResponse(ctx context.Context, w http.ResponseWriter, incoming *http.Request, method string, endpoint *url.URL, operation registryOperation, response *http.Response) {
 	if isPullRedirectStatus(response.StatusCode) {
-		p.finishRegistryRedirect(w, method, endpoint, response)
+		p.finishRegistryRedirect(ctx, w, incoming, method, endpoint, response)
 		return
 	}
 	validatedLocation, ok := p.recordUploadLocation(w, method, endpoint, operation, response)
@@ -665,7 +832,7 @@ func (p *PullProxy) finishRegistryResponse(w http.ResponseWriter, method string,
 	p.writeForwardRegistryResponse(w, method, response, validatedLocation)
 }
 
-func (p *PullProxy) finishRegistryRedirect(w http.ResponseWriter, method string, endpoint *url.URL, response *http.Response) {
+func (p *PullProxy) finishRegistryRedirect(ctx context.Context, w http.ResponseWriter, incoming *http.Request, method string, endpoint *url.URL, response *http.Response) {
 	if len(response.Header.Values("Location")) != 1 {
 		_ = response.Body.Close()
 		http.Error(w, "registry redirect is invalid", http.StatusBadGateway)
@@ -676,7 +843,19 @@ func (p *PullProxy) finishRegistryRedirect(w http.ResponseWriter, method string,
 		http.Error(w, "registry write redirect is unsupported", http.StatusBadGateway)
 		return
 	}
-	redirect, err := p.validatePullRedirect(endpoint, response.Header.Get("Location"))
+	location := response.Header.Get("Location")
+	if !p.privateRegistry {
+		p.finishGuestRedirect(w, endpoint, response, location)
+		return
+	}
+	// Configured private registries follow allowlisted redirects host-side so
+	// the guest only ever reaches the registry authority.
+	_ = response.Body.Close()
+	p.followPrivateRedirect(ctx, w, incoming, method, endpoint, location)
+}
+
+func (p *PullProxy) finishGuestRedirect(w http.ResponseWriter, endpoint *url.URL, response *http.Response, location string) {
+	redirect, err := p.validatePullRedirect(endpoint, location)
 	if err != nil {
 		_ = response.Body.Close()
 		http.Error(w, "registry redirect is untrusted", http.StatusBadGateway)
@@ -692,6 +871,58 @@ func (p *PullProxy) finishRegistryRedirect(w http.ResponseWriter, method string,
 	_ = response.Body.Close()
 	copyForwardHeaders(w.Header(), response.Header, true)
 	w.WriteHeader(response.StatusCode)
+}
+
+func (p *PullProxy) followPrivateRedirect(ctx context.Context, w http.ResponseWriter, incoming *http.Request, method string, endpoint *url.URL, location string) {
+	next := endpoint
+	for redirects := 0; redirects <= 5; redirects++ {
+		redirect, err := p.validatePullRedirect(next, location)
+		if err != nil {
+			http.Error(w, "registry redirect is untrusted", http.StatusBadGateway)
+			return
+		}
+		if strings.EqualFold(redirect.Host, p.authority) {
+			http.Error(w, "registry redirect loop", http.StatusBadGateway)
+			return
+		}
+		followed, err := p.fetchPrivateRedirect(ctx, incoming, method, redirect)
+		if err != nil {
+			http.Error(w, "registry redirect fetch failed", http.StatusBadGateway)
+			return
+		}
+		if !isPullRedirectStatus(followed.StatusCode) {
+			p.writeForwardRegistryResponse(w, method, followed, false)
+			return
+		}
+		locations := followed.Header.Values("Location")
+		_ = followed.Body.Close()
+		if len(locations) != 1 {
+			http.Error(w, "registry redirect is invalid", http.StatusBadGateway)
+			return
+		}
+		next = redirect
+		location = locations[0]
+	}
+	http.Error(w, "too many registry redirects", http.StatusBadGateway)
+}
+
+func (p *PullProxy) fetchPrivateRedirect(ctx context.Context, incoming *http.Request, method string, redirect *url.URL) (*http.Response, error) {
+	transport, err := p.transportFactory.Redirect(ctx, redirect.Host)
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, method, redirect.String(), http.NoBody) //nolint:gosec // redirect authority is allowlisted and its transport pins the address.
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range forwardedPullHeaders {
+		for _, value := range incoming.Header.Values(key) {
+			request.Header.Add(key, value)
+		}
+	}
+	request.Header.Set("Accept-Encoding", "identity")
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return client.Do(request) // #nosec G704 -- allowlisted redirect authority and pinned transport.
 }
 
 func (p *PullProxy) recordUploadLocation(w http.ResponseWriter, method string, endpoint *url.URL, operation registryOperation, response *http.Response) (bool, bool) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -317,7 +318,7 @@ func TestConfiguredPrivateBlobRedirectTraversesForwardTLSPath(t *testing.T) {
 	})
 	proxy := &PullProxy{
 		authority: "registry.private.test", redirectHosts: redirectHostSet([]string{"CDN.private.test."}),
-		maxBytes: 64, limiter: NewPullLimiter(),
+		privateRegistry: true, maxBytes: 64, limiter: NewPullLimiter(),
 		transportFactory: pullRedirectFactory{redirect: redirectTransport, authority: "cdn.private.test"},
 		blobRedirects:    make(map[string]blobRedirectSession),
 	}
@@ -328,12 +329,12 @@ func TestConfiguredPrivateBlobRedirectTraversesForwardTLSPath(t *testing.T) {
 	redirectBody := &closeTrackingBody{Reader: strings.NewReader("")}
 	registryResponse := &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: http.Header{"Location": []string{location}}, Body: redirectBody}
 	registryWriter := httptest.NewRecorder()
-	proxy.finishRegistryRedirect(registryWriter, http.MethodGet, endpoint, registryResponse)
+	proxy.finishRegistryRedirect(t.Context(), registryWriter, httptest.NewRequest(http.MethodGet, endpoint.String(), http.NoBody), http.MethodGet, endpoint, registryResponse)
 	if !redirectBody.closed {
 		t.Fatal("registry redirect response body was not closed")
 	}
-	if registryWriter.Code != http.StatusTemporaryRedirect || registryWriter.Header().Get("Location") != location {
-		t.Fatalf("configured registry redirect status=%d location=%q", registryWriter.Code, registryWriter.Header().Get("Location"))
+	if registryWriter.Code != http.StatusOK || registryWriter.Body.String() != "blob" || registryWriter.Header().Get("Location") != "" {
+		t.Fatalf("configured registry redirect status=%d body=%q location=%q", registryWriter.Code, registryWriter.Body.String(), registryWriter.Header().Get("Location"))
 	}
 
 	request := httptest.NewRequest(http.MethodGet, location, http.NoBody)
@@ -341,19 +342,19 @@ func TestConfiguredPrivateBlobRedirectTraversesForwardTLSPath(t *testing.T) {
 	request.Header.Set("Authorization", "Bearer guest-token")
 	blobWriter := httptest.NewRecorder()
 	proxy.serveForwardRequest(blobWriter, request)
-	if blobWriter.Code != http.StatusOK || blobWriter.Body.String() != "blob" {
-		t.Fatalf("configured TLS redirect status=%d body=%q", blobWriter.Code, blobWriter.Body.String())
+	if blobWriter.Code != http.StatusForbidden {
+		t.Fatalf("unrecorded TLS redirect status=%d body=%q", blobWriter.Code, blobWriter.Body.String())
 	}
 }
 
 func TestForwardTLSPathRejectsUnconfiguredPrivateRedirect(t *testing.T) {
-	proxy := &PullProxy{authority: "registry.private.test", redirectHosts: redirectHostSet(nil)}
+	proxy := &PullProxy{authority: "registry.private.test", redirectHosts: redirectHostSet(nil), privateRegistry: true}
 	endpoint, err := url.Parse("https://registry.private.test/v2/team/image/blobs/sha256:abcd")
 	if err != nil {
 		t.Fatal(err)
 	}
 	registryWriter := httptest.NewRecorder()
-	proxy.finishRegistryRedirect(registryWriter, http.MethodGet, endpoint, &http.Response{
+	proxy.finishRegistryRedirect(t.Context(), registryWriter, httptest.NewRequest(http.MethodGet, endpoint.String(), http.NoBody), http.MethodGet, endpoint, &http.Response{
 		StatusCode: http.StatusTemporaryRedirect,
 		Header:     http.Header{"Location": []string{"https://cdn.private.test/blob?sig=synthetic"}},
 		Body:       http.NoBody,
@@ -477,7 +478,7 @@ func TestAuthenticatedForwardProxyDispatchesExactRealmAndPath(t *testing.T) {
 	}
 	proxy, err := NewPullProxy(store, PullProxyConfig{
 		Registry: "registry.private.test", SandboxName: sandbox, CredentialScope: ScopeSandbox,
-		Service: service, Realms: realms, TransportFactory: factory, Limiter: NewPullLimiter(), MaxBytes: 1024,
+		Service: service, Realms: realms, TransportFactory: factory, PrivateRegistry: true, Limiter: NewPullLimiter(), MaxBytes: 1024,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -527,5 +528,199 @@ func TestAuthenticatedForwardProxyDispatchesExactRealmAndPath(t *testing.T) {
 	}
 	if len(factory.selected) != len(realms) {
 		t.Fatalf("selected %d token transports for %d realm requests", len(factory.selected), len(realms))
+	}
+}
+
+type challengeRealmFactory struct {
+	registry   http.RoundTripper
+	tokens     map[registryauth.Realm]http.RoundTripper
+	selected   []registryauth.Realm
+	registries int
+}
+
+func (f *challengeRealmFactory) Registry(context.Context, string) (http.RoundTripper, error) {
+	f.registries++
+	return f.registry, nil
+}
+
+func (f *challengeRealmFactory) Token(_ context.Context, realm registryauth.Realm) (http.RoundTripper, error) {
+	f.selected = append(f.selected, realm)
+	transport, ok := f.tokens[realm]
+	if !ok {
+		return nil, errors.New("unexpected private token realm")
+	}
+	return transport, nil
+}
+
+func (f *challengeRealmFactory) Redirect(context.Context, string) (http.RoundTripper, error) {
+	return nil, errors.New("unexpected redirect transport")
+}
+
+func TestPrivateForwardUsesUpstreamChallengeRealmAndLocalTokenEndpoint(t *testing.T) {
+	const service = "fixture"
+	const sandbox = "private-realm-sandbox"
+	realms := []registryauth.Realm{
+		{Host: "realm1.private.test", Path: "/token"},
+		{Host: "realm2.private.test", Path: "/token"},
+	}
+	var registryCalls int
+	registryTransport := pullRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		registryCalls++
+		switch request.Header.Get("Authorization") {
+		case "":
+			header := make(http.Header)
+			header.Set("WWW-Authenticate", `Bearer realm="https://realm2.private.test/token",service="fixture",scope="repository:team/image:pull"`)
+			return contractResponse(http.StatusUnauthorized, "", header), nil
+		case "Bearer upstream-token":
+			return contractResponse(http.StatusOK, "manifest", nil), nil
+		default:
+			t.Fatalf("registry received unexpected authorization %q", request.Header.Get("Authorization"))
+			return nil, errors.New("unreachable")
+		}
+	})
+	tokenTransport := pullRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Host != "realm2.private.test" || request.URL.Path != "/token" {
+			t.Fatalf("token exchange reached unexpected realm %s", request.URL.Redacted())
+		}
+		if request.URL.Query().Get("service") != service || request.URL.Query().Get("scope") != "repository:team/image:pull" {
+			t.Fatalf("token exchange query = %q", request.URL.RawQuery)
+		}
+		if username, password, ok := request.BasicAuth(); !ok || username != "synthetic-user" || password != "synthetic-password" {
+			t.Fatalf("token exchange did not use the host credential: %q", username)
+		}
+		return contractResponse(http.StatusOK, `{"token":"upstream-token"}`, nil), nil
+	})
+	factory := &challengeRealmFactory{
+		registry: registryTransport,
+		tokens: map[registryauth.Realm]http.RoundTripper{
+			realms[0]: pullRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+				t.Fatal("first configured realm must not be contacted")
+				return nil, errors.New("unreachable")
+			}),
+			realms[1]: tokenTransport,
+		},
+	}
+	store, err := NewStore(&fakeVault{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Save(t.Context(), Credential{
+		Registry: "registry.private.test", Username: "synthetic-user", Password: []byte("synthetic-password"),
+		Scope: ScopeSandbox, SandboxName: sandbox,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := NewPullProxy(store, PullProxyConfig{
+		Registry: "registry.private.test", SandboxName: sandbox, CredentialScope: ScopeSandbox,
+		Service: service, Realms: realms, TransportFactory: factory, PrivateRegistry: true, Limiter: NewPullLimiter(), MaxBytes: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestURL := "https://registry.private.test/v2/team/image/manifests/latest"
+	forward := func(authorization string) *httptest.ResponseRecorder {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodGet, manifestURL, http.NoBody)
+		request.TLS = &tls.ConnectionState{ServerName: "registry.private.test"}
+		request.Host = "registry.private.test"
+		if authorization != "" {
+			request.Header.Set("Authorization", authorization)
+		}
+		recorder := httptest.NewRecorder()
+		proxy.ServeHTTP(recorder, request)
+		return recorder
+	}
+
+	challenge := forward("")
+	if challenge.Code != http.StatusUnauthorized {
+		t.Fatalf("first request status=%d body=%q", challenge.Code, challenge.Body.String())
+	}
+	wantRealm := "https://registry.private.test" + brokerTokenPath
+	if got := challenge.Header().Get("WWW-Authenticate"); !strings.Contains(got, `realm="`+wantRealm+`"`) {
+		t.Fatalf("guest challenge = %q, want synthetic realm %q", got, wantRealm)
+	}
+	if strings.Contains(challenge.Header().Get("WWW-Authenticate"), "realm2.private.test") {
+		t.Fatal("guest challenge exposed the real token realm")
+	}
+
+	query := url.Values{"service": []string{service}, "scope": []string{"repository:team/image:pull"}}
+	tokenRequest := httptest.NewRequest(http.MethodGet, "https://registry.private.test"+brokerTokenPath+"?"+query.Encode(), http.NoBody)
+	tokenRequest.TLS = &tls.ConnectionState{ServerName: "registry.private.test"}
+	tokenRequest.Host = "registry.private.test"
+	tokenResponse := httptest.NewRecorder()
+	proxy.ServeHTTP(tokenResponse, tokenRequest)
+	if tokenResponse.Code != http.StatusOK {
+		t.Fatalf("private token endpoint status=%d body=%q", tokenResponse.Code, tokenResponse.Body.String())
+	}
+	if strings.Contains(tokenResponse.Body.String(), "upstream-token") {
+		t.Fatal("upstream registry token was exposed to the guest")
+	}
+	var issued struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(tokenResponse.Body.Bytes(), &issued); err != nil {
+		t.Fatalf("decode sentinel token: %v", err)
+	}
+	if !strings.HasPrefix(issued.Token, "rheic-") {
+		t.Fatalf("guest token %q is not a broker sentinel", issued.Token)
+	}
+
+	forwarded := forward("Bearer " + issued.Token)
+	if forwarded.Code != http.StatusOK || forwarded.Body.String() != "manifest" {
+		t.Fatalf("authenticated forward status=%d body=%q", forwarded.Code, forwarded.Body.String())
+	}
+	if len(factory.selected) != 2 || factory.selected[0] != realms[1] || factory.selected[1] != realms[1] {
+		t.Fatalf("token transports = %v, want only %v", factory.selected, realms[1])
+	}
+	if registryCalls != 2 {
+		t.Fatalf("registry calls = %d, want probe and forward", registryCalls)
+	}
+}
+
+func TestPrivateForwardRejectsChallengeRealmOutsideAllowlist(t *testing.T) {
+	const service = "fixture"
+	const sandbox = "private-realm-evil-sandbox"
+	realms := []registryauth.Realm{{Host: "realm2.private.test", Path: "/token"}}
+	registryTransport := pullRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+		header := make(http.Header)
+		header.Set("WWW-Authenticate", `Bearer realm="https://evil.private.test/token",service="fixture",scope="repository:team/image:pull"`)
+		return contractResponse(http.StatusUnauthorized, "", header), nil
+	})
+	factory := &challengeRealmFactory{
+		registry: registryTransport,
+		tokens: map[registryauth.Realm]http.RoundTripper{
+			realms[0]: pullRoundTripperFunc(func(*http.Request) (*http.Response, error) {
+				t.Fatal("allowlisted realm must not be contacted for an untrusted challenge")
+				return nil, errors.New("unreachable")
+			}),
+		},
+	}
+	store, err := NewStore(&fakeVault{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Save(t.Context(), Credential{
+		Registry: "registry.private.test", Username: "synthetic-user", Password: []byte("synthetic-password"),
+		Scope: ScopeSandbox, SandboxName: sandbox,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := NewPullProxy(store, PullProxyConfig{
+		Registry: "registry.private.test", SandboxName: sandbox, CredentialScope: ScopeSandbox,
+		Service: service, Realms: realms, TransportFactory: factory, PrivateRegistry: true, Limiter: NewPullLimiter(), MaxBytes: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://registry.private.test/v2/team/image/manifests/latest", http.NoBody)
+	request.TLS = &tls.ConnectionState{ServerName: "registry.private.test"}
+	request.Host = "registry.private.test"
+	recorder := httptest.NewRecorder()
+	proxy.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("untrusted challenge status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	if len(factory.selected) != 0 {
+		t.Fatalf("untrusted challenge selected a token transport: %v", factory.selected)
 	}
 }

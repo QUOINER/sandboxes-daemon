@@ -258,7 +258,7 @@ func TestUploadResponseRejectsUntrustedLocationBeforeForwarding(t *testing.T) {
 	} {
 		recorder := httptest.NewRecorder()
 		response := contractResponse(http.StatusAccepted, "", http.Header{"Location": []string{location}})
-		proxy.finishRegistryResponse(recorder, http.MethodPost, endpoint, operation, response)
+		proxy.finishRegistryResponse(t.Context(), recorder, nil, http.MethodPost, endpoint, operation, response)
 		if recorder.Code != http.StatusBadGateway || recorder.Header().Get("Location") != "" {
 			t.Errorf("untrusted upload location %q was forwarded: status=%d location=%q", location, recorder.Code, recorder.Header().Get("Location"))
 		}
