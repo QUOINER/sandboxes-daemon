@@ -1511,20 +1511,20 @@ func sameRule(a, b sandbox.NetworkRule) bool {
 
 func TestNormalizeDomainRules(t *testing.T) {
 	rule := sandbox.NetworkRule{Protocol: "tcp", Domain: "*.Example.COM.", Port: 443}
-	normalized, err := normalizeRules([]sandbox.NetworkRule{rule})
+	normalized, err := normalizeRules([]sandbox.NetworkRule{rule}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(normalized) != 1 || normalized[0].Domain != "*.example.com" || !strings.HasPrefix(normalized[0].RuleID, "rul_") {
 		t.Fatalf("normalized=%+v", normalized)
 	}
-	if _, err := normalizeRules([]sandbox.NetworkRule{{Protocol: "tcp", Domain: "example.com", CIDR: "192.0.2.0/24"}}); err == nil {
+	if _, err := normalizeRules([]sandbox.NetworkRule{{Protocol: "tcp", Domain: "example.com", CIDR: "192.0.2.0/24"}}, false); err == nil {
 		t.Fatal("domain+cidr accepted")
 	}
-	if _, err := normalizeRules([]sandbox.NetworkRule{{Protocol: "tcp", Domain: "*"}}); err == nil {
+	if _, err := normalizeRules([]sandbox.NetworkRule{{Protocol: "tcp", Domain: "*"}}, false); err == nil {
 		t.Fatal("bare wildcard accepted")
 	}
-	if _, err := normalizeRules([]sandbox.NetworkRule{{Protocol: "tcp", Domain: "192.0.2.10", Port: 443}}); err == nil {
+	if _, err := normalizeRules([]sandbox.NetworkRule{{Protocol: "tcp", Domain: "192.0.2.10", Port: 443}}, false); err == nil {
 		t.Fatal("IP literal accepted as a domain rule")
 	}
 }

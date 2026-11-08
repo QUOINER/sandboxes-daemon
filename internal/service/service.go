@@ -52,20 +52,23 @@ const (
 
 // Service coordinates durable sandbox state and operations.
 type Service struct {
-	store                    *store.Store
-	journal                  *operation.Journal
-	backend                  runtime.Backend
-	registryCredentials      *registrycredentials.Store
-	registryPullLimiter      *registrycredentials.PullLimiter
-	serviceSecrets           *servicesecrets.Store
-	secretProxies            *secretproxy.Manager
-	proxyHelperPath          string
-	proxyTempDir             string
-	oauthProviders           map[string]OAuthProvider
-	oauthVaultStore          oauthsession.Vault
-	oauthRefresh             *oauthsession.RefreshCoordinator
-	dockerHubAuth            http.RoundTripper
-	DefaultImage             string
+	store               *store.Store
+	journal             *operation.Journal
+	backend             runtime.Backend
+	registryCredentials *registrycredentials.Store
+	registryPullLimiter *registrycredentials.PullLimiter
+	serviceSecrets      *servicesecrets.Store
+	secretProxies       *secretproxy.Manager
+	proxyHelperPath     string
+	proxyTempDir        string
+	oauthProviders      map[string]OAuthProvider
+	oauthVaultStore     oauthsession.Vault
+	oauthRefresh        *oauthsession.RefreshCoordinator
+	dockerHubAuth       http.RoundTripper
+	DefaultImage        string
+	// IPv6Enabled accepts IPv6 CIDR rules only when every datapath layer has
+	// the experimental capability enabled. It defaults to false.
+	IPv6Enabled              bool
 	DefaultCPUs              uint32
 	DefaultMemoryMiB         uint32
 	DefaultPolicyProfile     string
@@ -1481,7 +1484,7 @@ func sandboxDetached(sb sandbox.Sandbox) bool {
 	return sb.Meta != nil && sb.Meta.Detached
 }
 
-func normalizeCreateNetwork(req CreateRequest) ([]sandbox.Port, []sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+func normalizeCreateNetwork(req CreateRequest, ipv6Enabled bool) ([]sandbox.Port, []sandbox.NetworkRule, []sandbox.NetworkRule, error) {
 	ports, err := normalizePorts(req.Ports)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1489,7 +1492,7 @@ func normalizeCreateNetwork(req CreateRequest) ([]sandbox.Port, []sandbox.Networ
 	if err := checkHostPorts(ports); err != nil {
 		return nil, nil, nil, err
 	}
-	allow, deny, err := normalizeCreateRules(req)
+	allow, deny, err := normalizeCreateRules(req, ipv6Enabled)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -1542,19 +1545,19 @@ func hostPortProbeError(port sandbox.Port, err error) error {
 	return fmt.Errorf("%w: host port %s:%d/%s is unavailable: %w", core.ErrConflict, port.HostIP, port.Host, port.Protocol, err)
 }
 
-func normalizeCreateRules(req CreateRequest) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
-	allow, err := normalizeRules(req.Allow)
+func normalizeCreateRules(req CreateRequest, ipv6Enabled bool) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+	allow, err := normalizeRules(req.Allow, ipv6Enabled)
 	if err != nil {
 		return nil, nil, err
 	}
-	deny, err := normalizeRules(req.Deny)
+	deny, err := normalizeRules(req.Deny, ipv6Enabled)
 	if err != nil {
 		return nil, nil, err
 	}
 	return allow, deny, nil
 }
 
-func normalizeRules(rules []sandbox.NetworkRule) ([]sandbox.NetworkRule, error) {
+func normalizeRules(rules []sandbox.NetworkRule, ipv6Enabled bool) ([]sandbox.NetworkRule, error) {
 	if len(rules) > 64 {
 		return nil, fmt.Errorf("%w: too many network rules", core.ErrConflict)
 	}
@@ -1576,7 +1579,7 @@ func normalizeRules(rules []sandbox.NetworkRule) ([]sandbox.NetworkRule, error) 
 				return nil, fmt.Errorf("%w: %w", core.ErrConflict, err)
 			}
 		default:
-			if err := validateRuleCIDR(rule.CIDR); err != nil {
+			if err := validateRuleCIDR(rule.CIDR, ipv6Enabled); err != nil {
 				return nil, err
 			}
 		}
@@ -1591,12 +1594,12 @@ func normalizeRules(rules []sandbox.NetworkRule) ([]sandbox.NetworkRule, error) 
 	return out, nil
 }
 
-func validateRuleCIDR(cidr string) error {
+func validateRuleCIDR(cidr string, ipv6Enabled bool) error {
 	ip, _, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return fmt.Errorf("%w: network rule CIDR is invalid", core.ErrConflict)
 	}
-	if ip.To4() == nil {
+	if ip.To4() == nil && !ipv6Enabled {
 		return fmt.Errorf("%w: IPv6 network rules require an IPv6-capable runtime", core.ErrConflict)
 	}
 	return nil
@@ -1865,7 +1868,7 @@ const (
 )
 
 func (s *Service) normalizeCreatePolicy(ctx context.Context, req CreateRequest) (string, []sandbox.Port, []sandbox.NetworkRule, []sandbox.NetworkRule, error) {
-	ports, allow, deny, err := normalizeCreateNetwork(req)
+	ports, allow, deny, err := normalizeCreateNetwork(req, s.IPv6Enabled)
 	if err != nil {
 		return "", nil, nil, nil, err
 	}
@@ -1873,11 +1876,11 @@ func (s *Service) normalizeCreatePolicy(ctx context.Context, req CreateRequest) 
 	if err != nil {
 		return "", nil, nil, nil, err
 	}
-	allow, err = normalizeRules(mergePolicyRules(rules, allow))
+	allow, err = normalizeRules(mergePolicyRules(rules, allow), s.IPv6Enabled)
 	if err != nil {
 		return "", nil, nil, nil, err
 	}
-	deny, err = normalizeRules(deny)
+	deny, err = normalizeRules(deny, s.IPv6Enabled)
 	if err != nil {
 		return "", nil, nil, nil, err
 	}
@@ -1896,11 +1899,11 @@ func (s *Service) effectiveRules(ctx context.Context, allow, deny []sandbox.Netw
 	if err != nil {
 		return nil, nil, err
 	}
-	effectiveAllow, err := normalizeRules(mergePolicyRules(globalAllow, allow))
+	effectiveAllow, err := normalizeRules(mergePolicyRules(globalAllow, allow), s.IPv6Enabled)
 	if err != nil {
 		return nil, nil, err
 	}
-	effectiveDeny, err := normalizeRules(mergePolicyRules(globalDeny, deny))
+	effectiveDeny, err := normalizeRules(mergePolicyRules(globalDeny, deny), s.IPv6Enabled)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1937,7 +1940,7 @@ func (s *Service) loadGlobalRules(ctx context.Context, key string) ([]sandbox.Ne
 	if err := json.Unmarshal([]byte(encoded), &rules); err != nil {
 		return nil, fmt.Errorf("%w: global policy %s is corrupt", core.ErrConflict, key)
 	}
-	return normalizeRules(rules)
+	return normalizeRules(rules, s.IPv6Enabled)
 }
 
 // MutateGlobalPolicy changes one global rule. Deny wins at connection time.
@@ -1948,7 +1951,7 @@ func (s *Service) MutateGlobalPolicy(ctx context.Context, action string, rule sa
 	if err != nil {
 		return nil, nil, err
 	}
-	normalized, err := normalizeRules([]sandbox.NetworkRule{rule})
+	normalized, err := normalizeRules([]sandbox.NetworkRule{rule}, s.IPv6Enabled)
 	if err != nil || len(normalized) != 1 {
 		return nil, nil, fmt.Errorf("%w: invalid policy rule", core.ErrConflict)
 	}
@@ -2739,7 +2742,7 @@ func (s *Service) MutatePolicy(ctx context.Context, id, action string, rule sand
 		return sandbox.Sandbox{}, err
 	}
 	defer release()
-	normalized, err := normalizeRules([]sandbox.NetworkRule{rule})
+	normalized, err := normalizeRules([]sandbox.NetworkRule{rule}, s.IPv6Enabled)
 	if err != nil || len(normalized) != 1 {
 		return sandbox.Sandbox{}, fmt.Errorf("%w: invalid policy rule", core.ErrConflict)
 	}
@@ -2791,11 +2794,11 @@ func (s *Service) updatePolicyLocked(ctx context.Context, id string, allow, deny
 	if sb.State == sandbox.Deleting || sb.State == sandbox.Deleted {
 		return sandbox.Sandbox{}, fmt.Errorf("%w: sandbox is being deleted", core.ErrConflict)
 	}
-	normalizedAllow, err := normalizeRules(allow)
+	normalizedAllow, err := normalizeRules(allow, s.IPv6Enabled)
 	if err != nil {
 		return sandbox.Sandbox{}, err
 	}
-	normalizedDeny, err := normalizeRules(deny)
+	normalizedDeny, err := normalizeRules(deny, s.IPv6Enabled)
 	if err != nil {
 		return sandbox.Sandbox{}, err
 	}
