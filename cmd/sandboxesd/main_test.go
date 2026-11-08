@@ -41,3 +41,43 @@ func (configurator *testIPv6Configurator) SetIPv6Enabled(enabled bool) error {
 	configurator.enabled = enabled
 	return nil
 }
+
+func TestConfigureExperimentalQUICDisabledDoesNotRequireConfigurator(t *testing.T) {
+	if err := configureExperimentalQUIC(false, nil); err != nil {
+		t.Fatalf("configureExperimentalQUIC(false, nil) error = %v, want nil", err)
+	}
+}
+
+func TestConfigureExperimentalQUICEnabled(t *testing.T) {
+	configurator := &testQUICConfigurator{}
+	if err := configureExperimentalQUIC(true, configurator); err != nil {
+		t.Fatalf("configureExperimentalQUIC(true, configurator) error = %v, want nil", err)
+	}
+	if configurator.calls != 1 {
+		t.Fatalf("SetQUICEnabled calls = %d, want 1", configurator.calls)
+	}
+	if !configurator.enabled {
+		t.Fatal("SetQUICEnabled argument = false, want true")
+	}
+}
+
+func TestConfigureExperimentalQUICUnsupportedFailsClosed(t *testing.T) {
+	err := configureExperimentalQUIC(true, struct{}{})
+	if err == nil {
+		t.Fatal("configureExperimentalQUIC(true, unsupported) error = nil, want error")
+	}
+	if got, want := err.Error(), "configured gateway module does not support experimental QUIC"; got != want {
+		t.Fatalf("configureExperimentalQUIC error = %q, want %q", got, want)
+	}
+}
+
+type testQUICConfigurator struct {
+	calls   int
+	enabled bool
+}
+
+func (configurator *testQUICConfigurator) SetQUICEnabled(enabled bool) error {
+	configurator.calls++
+	configurator.enabled = enabled
+	return nil
+}

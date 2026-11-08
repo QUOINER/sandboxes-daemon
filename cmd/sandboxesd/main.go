@@ -50,6 +50,7 @@ type options struct {
 	registryPrivateRedirs []string
 	registryPrivateCAPath string
 	ipv6Experimental      bool
+	quicExperimental      bool
 	showVersion           bool
 }
 
@@ -131,6 +132,7 @@ func parseOptions() options {
 	flag.StringVar(&opts.proxyHelperPath, "proxy-helper", "", "static Linux guest proxy helper; empty disables service proxy")
 	flag.StringVar(&opts.dnsUpstream, "dns-upstream", "", "optional DNS upstream")
 	flag.BoolVar(&opts.ipv6Experimental, "ipv6-experimental", false, "enable the experimental IPv6 guest datapath (acceptance only)")
+	flag.BoolVar(&opts.quicExperimental, "quic-experimental", false, "enable experimental UDP domain policy backed by QUIC classification (acceptance only)")
 	flag.StringVar(&opts.settingsPath, "settings", settings.DefaultPath(), "user settings file")
 	flag.BoolVar(&opts.showVersion, "version", false, "print version")
 	flag.Parse()
@@ -252,11 +254,18 @@ func buildNetwork(opts *options, gatewayLost chan<- string) (runtime.Network, *g
 	if err := configureExperimentalIPv6(opts.ipv6Experimental, manager); err != nil {
 		return nil, nil, err
 	}
+	if err := configureExperimentalQUIC(opts.quicExperimental, manager); err != nil {
+		return nil, nil, err
+	}
 	return daemonnetwork.New(manager, runDir), manager, nil
 }
 
 type experimentalIPv6Configurator interface {
 	SetIPv6Enabled(bool) error
+}
+
+type experimentalQUICConfigurator interface {
+	SetQUICEnabled(bool) error
 }
 
 func configureExperimentalIPv6(enabled bool, target any) error {
@@ -269,6 +278,20 @@ func configureExperimentalIPv6(enabled bool, target any) error {
 	}
 	if err := configurator.SetIPv6Enabled(true); err != nil {
 		return fmt.Errorf("enable experimental IPv6 gateway: %w", err)
+	}
+	return nil
+}
+
+func configureExperimentalQUIC(enabled bool, target any) error {
+	if !enabled {
+		return nil
+	}
+	configurator, ok := target.(experimentalQUICConfigurator)
+	if !ok {
+		return errors.New("configured gateway module does not support experimental QUIC")
+	}
+	if err := configurator.SetQUICEnabled(true); err != nil {
+		return fmt.Errorf("enable experimental QUIC gateway: %w", err)
 	}
 	return nil
 }
