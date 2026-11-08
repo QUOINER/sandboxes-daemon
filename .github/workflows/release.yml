@@ -27,6 +27,8 @@ jobs:
           ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Trust the container checkout for git commands
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Fetch protected main for ancestry validation
         run: git fetch --no-tags origin main:refs/remotes/origin/main
       - name: Verify pinned Go toolchain
@@ -53,6 +55,10 @@ jobs:
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
               -ldflags="-s -w -X github.com/rheic/sandboxes-daemon/internal/version.Version=$VERSION" -o "$out" ./cmd/sandboxesd
             (cd dist && sha256sum "${out#dist/}") > "$out.sha256"
+            server="dist/rheic-server-${os}-${arch}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
+              -ldflags="-s -w" -o "$server" ./cmd/rheic-server
+            (cd dist && sha256sum "${server#dist/}") > "$server.sha256"
           done
           actual=$(dist/sandboxesd-linux-amd64 --version)
           [[ "$actual" == "$VERSION" ]]
@@ -64,10 +70,10 @@ jobs:
         run: (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
-          subject-path: dist/sandboxesd-darwin-arm64,dist/sandboxesd-darwin-amd64,dist/sandboxesd-linux-arm64,dist/sandboxesd-linux-amd64
+          subject-path: dist/sandboxesd-darwin-arm64,dist/sandboxesd-darwin-amd64,dist/sandboxesd-linux-arm64,dist/sandboxesd-linux-amd64,dist/rheic-server-darwin-arm64,dist/rheic-server-darwin-amd64,dist/rheic-server-linux-arm64,dist/rheic-server-linux-amd64
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: dist/sandboxesd-darwin-arm64,dist/sandboxesd-darwin-amd64,dist/sandboxesd-linux-arm64,dist/sandboxesd-linux-amd64
+          subject-path: dist/sandboxesd-darwin-arm64,dist/sandboxesd-darwin-amd64,dist/sandboxesd-linux-arm64,dist/sandboxesd-linux-amd64,dist/rheic-server-darwin-arm64,dist/rheic-server-darwin-amd64,dist/rheic-server-linux-arm64,dist/rheic-server-linux-amd64
           sbom-path: dist/sandboxesd.cdx.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
