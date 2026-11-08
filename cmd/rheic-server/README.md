@@ -1,4 +1,4 @@
-# Self-hosted control-plane MVP
+# Self-hosted control-plane preview
 
 `rheic-server` serves signed organization policy and accepts structured audit
 events over HTTPS. It is a single-operator preview; daemon synchronization,
