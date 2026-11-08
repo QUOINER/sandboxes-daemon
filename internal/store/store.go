@@ -35,7 +35,7 @@ var _ operation.Store = (*OperationStore)(nil)
 
 // schemaVersion is the latest SQLite schema understood by this daemon. It is
 // stored in PRAGMA user_version and must only increase.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // ErrSchemaNewer reports a database written by a newer daemon. Opening it
 // would risk data loss, so the daemon refuses to start instead.
@@ -166,6 +166,15 @@ func (s *Store) migrate(ctx context.Context) error {
 			sandbox_name TEXT NOT NULL DEFAULT '',
 			username TEXT NOT NULL,
 			PRIMARY KEY (registry, scope, sandbox_name)
+		)`,
+		`CREATE TABLE IF NOT EXISTS org_policy_bundles (
+			org_id TEXT PRIMARY KEY,
+			revision INTEGER NOT NULL,
+			payload BLOB NOT NULL,
+			signature TEXT NOT NULL,
+			issued_at INTEGER NOT NULL,
+			expires_at INTEGER NOT NULL,
+			synced_at INTEGER NOT NULL
 		)`,
 	}
 	for _, stmt := range statements {

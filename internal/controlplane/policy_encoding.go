@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -346,4 +347,14 @@ func hasNanosecondPrecision(value string) bool {
 		end++
 	}
 	return end-start <= 9
+}
+
+// ValidOrgID reports whether org is a valid organization identifier for policy
+// routes and bundles.
+func ValidOrgID(org string) bool { return validOrgID(org) }
+
+// VerifyPolicySignature reports whether signature is the canonical Ed25519
+// signature over payload using the supplied pinned public key.
+func VerifyPolicySignature(payload PolicyPayload, signature string, key ed25519.PublicKey) bool {
+	return verifySignature(payload, signature, key)
 }
