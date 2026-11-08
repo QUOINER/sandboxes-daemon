@@ -11,8 +11,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rheic/sandboxes-daemon/internal/controlplane"
+	"github.com/rheic/sandboxes-daemon/internal/policysync"
 )
 
 // Values are the supported user overrides. Zero means "not set".
@@ -37,6 +39,14 @@ type Values struct {
 	RegistryPrivateRedirects []string
 	// RegistryPrivateCA is an optional host-side PEM bundle for a private CA.
 	RegistryPrivateCA string
+	// PolicySync configures the opt-in background pull of a signed organization
+	// policy bundle. All four required values must be set together; the interval
+	// is optional and defaults to policysync.DefaultInterval.
+	PolicySyncURL           string
+	PolicySyncOrg           string
+	PolicySyncPublicKeyFile string
+	PolicySyncTokenFile     string
+	PolicySyncInterval      time.Duration
 }
 
 // DefaultPath returns ~/.config/rheic/settings.toml, honoring XDG_CONFIG_HOME.
@@ -75,13 +85,13 @@ func Load(path string) (Values, error) {
 	if err := parse(file, &values); err != nil {
 		return values, err
 	}
-	if err := validateValues(values); err != nil {
+	if err := validateValues(&values); err != nil {
 		return values, err
 	}
 	return values, nil
 }
 
-func validateValues(values Values) error {
+func validateValues(values *Values) error {
 	if values.DNSUpstream != "" {
 		host, port, err := net.SplitHostPort(values.DNSUpstream)
 		if err != nil || host == "" || port == "" {
@@ -105,10 +115,48 @@ func validateValues(values Values) error {
 	if err := validateOrgPolicy(values); err != nil {
 		return err
 	}
+	if err := validatePolicySync(values); err != nil {
+		return err
+	}
 	return validateRegistryPrivate(values)
 }
 
-func validateOrgPolicy(values Values) error {
+func validatePolicySync(values *Values) error {
+	configured := 0
+	for _, value := range []string{
+		values.PolicySyncURL,
+		values.PolicySyncOrg,
+		values.PolicySyncPublicKeyFile,
+		values.PolicySyncTokenFile,
+	} {
+		if value != "" {
+			configured++
+		}
+	}
+	if configured == 0 {
+		if values.PolicySyncInterval != 0 {
+			return errors.New("settings policy_sync.interval requires policy_sync.url, policy_sync.org, policy_sync.public_key_file and policy_sync.token_file")
+		}
+		return nil
+	}
+	if configured != 4 {
+		return errors.New("settings policy_sync requires url, org, public_key_file and token_file together")
+	}
+	if err := policysync.ValidateBaseURL(values.PolicySyncURL); err != nil {
+		return fmt.Errorf("settings policy_sync.url: %w", err)
+	}
+	if !controlplane.ValidOrgID(values.PolicySyncOrg) {
+		return errors.New("settings policy_sync.org is not a valid organization ID")
+	}
+	if values.PolicySyncInterval != 0 {
+		if err := policysync.ValidateInterval(values.PolicySyncInterval); err != nil {
+			return fmt.Errorf("settings policy_sync.interval: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateOrgPolicy(values *Values) error {
 	if values.OrgPolicyOrg != "" && !controlplane.ValidOrgID(values.OrgPolicyOrg) {
 		return errors.New("settings org_policy.org is not a valid organization ID")
 	}
@@ -118,7 +166,7 @@ func validateOrgPolicy(values Values) error {
 	return nil
 }
 
-func validateRegistryPrivate(values Values) error {
+func validateRegistryPrivate(values *Values) error {
 	if values.RegistryPrivateHost == "" {
 		if values.RegistryPrivateService != "" || len(values.RegistryPrivateRealms) != 0 || len(values.RegistryPrivateRedirects) != 0 {
 			return errors.New("settings registry_private_* require registry_private_host")
@@ -164,7 +212,7 @@ func parseRegistryRealms(value string) ([]string, error) {
 	return out, nil
 }
 
-//nolint:gocyclo,cyclop,gocognit // flat settings key dispatch; helpers own the per-key validation.
+//nolint:gocyclo,cyclop,gocognit,funlen // flat settings key dispatch; helpers own the per-key validation.
 func parse(r io.Reader, values *Values) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 4096), 64*1024)
@@ -209,6 +257,23 @@ func parse(r io.Reader, values *Values) error {
 			values.OrgPolicyEnforce = enforce
 		case "org_policy.org":
 			values.OrgPolicyOrg = strings.TrimSpace(value)
+		case "policy_sync.url":
+			values.PolicySyncURL = strings.TrimSpace(value)
+		case "policy_sync.org":
+			values.PolicySyncOrg = strings.TrimSpace(value)
+		case "policy_sync.public_key_file":
+			values.PolicySyncPublicKeyFile = strings.TrimSpace(value)
+		case "policy_sync.token_file":
+			values.PolicySyncTokenFile = strings.TrimSpace(value)
+		case "policy_sync.interval":
+			interval, parseErr := time.ParseDuration(value)
+			if parseErr != nil {
+				return fmt.Errorf("settings line %d: policy_sync.interval must be a duration such as 5m", lineNumber)
+			}
+			if err := policysync.ValidateInterval(interval); err != nil {
+				return fmt.Errorf("settings line %d: %w", lineNumber, err)
+			}
+			values.PolicySyncInterval = interval
 		case "registry_private_host", "registry_private_service", "registry_private_realms", "registry_private_redirects", "registry_private_ca":
 			if err := parseRegistryPrivateSetting(values, key, value); err != nil {
 				return fmt.Errorf("settings line %d: %w", lineNumber, err)

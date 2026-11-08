@@ -6,8 +6,9 @@
 // back the locally stored revision. Network, TLS, signature and revision
 // failures fail closed: the previous stored bundle is left untouched.
 //
-// This package is deliberately not wired into the daemon CLI, local API or SDK
-// yet. The stored bundle can be enforced for sandbox network deny rules by
+// The daemon wires the client into an opt-in background loop: one attempt at
+// startup, then a jittered periodic attempt, cancellable with the daemon
+// context. The stored bundle can be enforced for sandbox network deny rules by
 // internal/orgpolicy when org_policy.enforce is on. Multi-tenancy, offline
 // last-known-good behavior and non-network resources remain out of scope.
 package policysync
@@ -30,6 +31,13 @@ import (
 )
 
 const (
+	// DefaultInterval is used when policy_sync.interval is not configured.
+	DefaultInterval = 5 * time.Minute
+	// MinInterval is the shortest accepted background sync period.
+	MinInterval = 30 * time.Second
+	// MaxInterval is the longest accepted background sync period.
+	MaxInterval = 24 * time.Hour
+
 	maxBundleBytes = 1 << 20
 	syncTimeout    = 15 * time.Second
 	minTokenBytes  = 32
@@ -131,6 +139,22 @@ func parseBaseURL(raw string) (string, error) {
 	return parsed.String(), nil
 }
 
+// ValidateBaseURL checks the base URL accepted by New without building a
+// client. Settings validation uses the same rules so configuration cannot pass
+// startup validation and then fail when the background runner is created.
+func ValidateBaseURL(raw string) error {
+	_, err := parseBaseURL(raw)
+	return err
+}
+
+// ValidateInterval checks the background sync interval bounds.
+func ValidateInterval(interval time.Duration) error {
+	if interval < MinInterval || interval > MaxInterval {
+		return fmt.Errorf("policy sync interval must be between %s and %s", MinInterval, MaxInterval)
+	}
+	return nil
+}
+
 func newSyncHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
@@ -142,6 +166,9 @@ func newSyncHTTPClient() *http.Client {
 		},
 	}
 }
+
+// OrgID returns the organization this client is pinned to.
+func (c *Client) OrgID() string { return c.orgID }
 
 // Sync fetches the latest bundle, verifies it locally and persists it when it
 // is strictly newer. Equal revisions are an idempotent no-op; older revisions

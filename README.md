@@ -52,8 +52,9 @@ sandboxesd --state "$HOME/.sandboxes" \
 `--settings` defaults to `~/.config/rheic/settings.toml`. Supported overrides
 are `dns_upstream`, `default_policy_profile`, `default_cpus`,
 `default_memory_mib`, `docker_volume_size`, `mcp_remote_allowed_hosts`,
-`org_policy.enforce` and `org_policy.org`. The MCP value is a comma-separated
-exact DNS host allowlist, for example
+`org_policy.enforce`, `org_policy.org` and the optional `policy_sync.*` block
+documented under [Policy sync](#policy-sync-opt-in-background-sync). The MCP
+value is a comma-separated exact DNS host allowlist, for example
 `mcp_remote_allowed_hosts = "mcp.example.com,api.example.com"`; wildcards and
 IP literals are rejected, and an empty value disables remote MCP. The file is
 strict, mode-checked and never contains secrets. Settings need a daemon restart
@@ -128,21 +129,119 @@ device-flow client ID embedded in Docker CLI and the installed Docker
 Sandboxes `sbx` binary. No Rheic OAuth registration is needed. Browser launch
 is supported on macOS; other platforms return unsupported.
 
-## Policy sync client (internal preview)
+## Policy sync (opt-in background sync)
 
-`internal/policysync` contains a daemon-internal client for the self-hosted
-control plane. It fetches `GET /v1/orgs/{org}/policy` over TLS with a bearer
-credential and a pinned Ed25519 public key, re-verifies the canonical bundle
-signature locally (server-side verification is not trusted), rejects expired
-bundles and revision rollbacks, and stores only verified bundles in the
+`internal/policysync` pulls signed organization policy bundles from the
+self-hosted control plane. It fetches `GET /v1/orgs/{org}/policy` over TLS with
+a bearer credential and a pinned Ed25519 public key, re-verifies the canonical
+bundle signature locally (server-side verification is not trusted), rejects
+expired bundles and revision rollbacks, and stores only verified bundles in the
 `org_policy_bundles` SQLite table. The schema migration is forward-only and
 creates a pre-upgrade backup; network, TLS, signature, expiry and revision
 failures fail closed and leave the previous bundle intact.
 
-The client is not wired into the CLI, local API or SDK yet; that product wiring
-is a separate slice. Multi-tenancy, offline last-known-good behavior and audit
-SIEM export remain out of scope. The table stores policy metadata and
-signatures only, never sandbox secrets.
+The daemon runs the client only when the settings block is present. It is off by
+default, and the four required values are all-or-none: a partial configuration
+is a startup error.
+
+```toml
+policy_sync.url = "https://control.example.test:8443"
+policy_sync.org = "acme"
+policy_sync.public_key_file = "/home/operator/.config/rheic/policy.public"
+policy_sync.token_file = "/home/operator/.config/rheic/policy.token"
+policy_sync.interval = "5m" # optional, 30s..24h, default 5m
+```
+
+- `policy_sync.url` must be an absolute HTTPS URL with no path, query, fragment
+  or userinfo. Redirects are refused and the normal system trust store is used;
+  there is no insecure or custom-CA flag.
+- `policy_sync.org` must be a valid organization ID and must match the bundle's
+  `orgId`.
+- `policy_sync.public_key_file` contains the base64 Ed25519 public key. It must
+  be a bounded (4 KiB) regular file and not a symlink.
+- `policy_sync.token_file` contains the bearer token. It must be a bounded
+  (4 KiB) regular file, mode `0600`, and not a symlink. The token is never
+  accepted as a command-line flag (process list exposure), is read only at
+  startup, and is never logged or included in errors.
+- `policy_sync.interval` is optional. Values outside 30 seconds to 24 hours are
+  rejected. The loop adds up to 20% random jitter so replicas do not poll in
+  lockstep.
+
+On startup the daemon performs one attempt and then repeats it on the configured
+interval. Attempts are sequential (single-flight), and daemon shutdown cancels
+an in-flight request promptly. A failed attempt logs a redacted error and leaves
+the previously stored bundle untouched; it never crashes the daemon. If
+`org_policy.enforce` is on and there is no usable bundle, sandbox operations
+still fail closed through `internal/orgpolicy`; there is no permissive fallback.
+
+### End-to-end recipe
+
+This uses synthetic keys and a controlled local control plane. Keep the private
+key offline.
+
+```sh
+# 1. Generate the policy-signing key pair (policy-key.private is 0600).
+rheic-server keygen --prefix ./policy-key
+
+# 2. Create an unsigned payload. revision must increase on every rollout and
+#    expiresAt should be comfortably in the future.
+cat > ./policy-payload.json <<'EOF'
+{
+  "schemaVersion": 1,
+  "orgId": "acme",
+  "revision": 1,
+  "issuedAt": "2026-11-08T00:00:00Z",
+  "expiresAt": "2026-12-08T00:00:00Z",
+  "rules": [
+    {"resource": "network:blocked.example.test:443", "action": "deny", "ruleId": "deny-1"}
+  ]
+}
+EOF
+
+# 3. Sign locally with the canonical policy encoding.
+rheic-server sign-policy \
+  --input ./policy-payload.json \
+  --private-key ./policy-key.private \
+  --output ./signed-policy.json
+
+# 4. Publish with an admin credential from the server's credentials file.
+export RHEIC_ADMIN_TOKEN="$(jq -r '.credentials[] | select(.role == "admin") | .token' ./credentials.json)"
+curl --fail --cacert ./tls/ca.crt \
+  -H "Authorization: Bearer $RHEIC_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data-binary @./signed-policy.json \
+  -X PUT https://control.example.test:8443/v1/orgs/acme/policy
+
+# 5. Install the daemon-side settings and protected files.
+install -d -m 700 "$HOME/.config/rheic"
+cat > "$HOME/.config/rheic/settings.toml" <<EOF
+policy_sync.url = "https://control.example.test:8443"
+policy_sync.org = "acme"
+policy_sync.public_key_file = "$HOME/.config/rheic/policy.public"
+policy_sync.token_file = "$HOME/.config/rheic/policy.token"
+policy_sync.interval = "5m"
+EOF
+chmod 600 "$HOME/.config/rheic/settings.toml"
+install -m 644 ./policy-key.public "$HOME/.config/rheic/policy.public"
+
+# Use a reader or admin token. Write it without putting it on a command line.
+(umask 077; jq -r '.credentials[] | select(.role == "reader") | .token' ./credentials.json \
+  > "$HOME/.config/rheic/policy.token")
+
+# 6. Start the daemon. With org_policy.enforce also set, the synced deny rules
+#    apply to new sandbox operations.
+sandboxesd --state "$HOME/.sandboxes" \
+  --socket "$HOME/.sandboxes/sandboxesd.sock"
+
+# 7. Observe the attempt and the stored revision.
+#    Log line: level=INFO msg="policy bundle synced" org=acme revision=1 ...
+sqlite3 "$HOME/.sandboxes/sandboxes.db" \
+  'SELECT org_id, revision, datetime(expires_at/1000000000, "unixepoch") FROM org_policy_bundles;'
+```
+
+The daemon does not expose policy-sync state through the CLI, local API or SDK
+yet. A subsequent slice can add an operation/status surface, offline
+last-known-good reporting and secret-vault token storage instead of a file.
 
 ## Organization policy enforcement (ADR-0003 slice)
 
