@@ -82,6 +82,8 @@ type Server struct {
 	// Headers are static, non-secret request headers. Secret material must
 	// come from the host vault and is never stored in the registry state.
 	Headers map[string]string `json:"headers,omitempty"`
+	// SecretHeaders contains only vault placeholder templates, never values.
+	SecretHeaders map[string]string `json:"secret_headers,omitempty"`
 }
 type Summary struct {
 	Name      string
@@ -419,7 +421,7 @@ func (m *Manager) Close() error {
 func sameServer(left, right Server) bool {
 	return left.Name == right.Name && left.Transport == right.Transport && left.Command == right.Command && left.Directory == right.Directory &&
 		left.ExecutableSHA256 == right.ExecutableSHA256 && left.URL == right.URL &&
-		slices.Equal(left.Arguments, right.Arguments) && maps.Equal(left.Headers, right.Headers)
+		slices.Equal(left.Arguments, right.Arguments) && maps.Equal(left.Headers, right.Headers) && maps.Equal(left.SecretHeaders, right.SecretHeaders)
 }
 func (m *Manager) expireLocked() {
 	now := m.now()
@@ -548,8 +550,17 @@ func validateStoredServer(s Server) error {
 }
 
 func validateStoredRemoteServer(s Server) error {
-	if s.Command != "" || s.URL == "" || len(s.Headers) > 16 || s.ExecutableSHA256 != "" {
+	if s.Command != "" || s.URL == "" || len(s.Headers)+len(s.SecretHeaders) > 16 || s.ExecutableSHA256 != "" {
 		return errors.New("invalid remote MCP registry entry")
+	}
+	for key, value := range s.SecretHeaders {
+		if strings.TrimSpace(key) == "" || strings.ContainsAny(key, "\r\n:\x00") || strings.ContainsAny(value, "\r\n\x00") {
+			return errors.New("invalid remote MCP registry entry")
+		}
+		refs, err := parseMCPHeaderReferences(value)
+		if err != nil || len(refs) == 0 {
+			return errors.New("invalid remote MCP registry entry")
+		}
 	}
 	return nil
 }

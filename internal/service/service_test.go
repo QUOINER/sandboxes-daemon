@@ -102,14 +102,14 @@ func TestRemoteMCPUsesExplicitHostAllowlist(t *testing.T) {
 	svc := New(st, nil)
 	defer func() { _ = svc.Close() }()
 	svc.SetMCPRemoteAllowlist([]string{"mcp.example.test"})
-	if _, err := svc.RegisterRemoteMCPServer(ctx, "allowed", "https://mcp.example.test/mcp", nil); err != nil {
+	if _, err := svc.RegisterRemoteMCPServer(ctx, "allowed", "https://mcp.example.test/mcp", nil, nil); err != nil {
 		t.Fatalf("allowed remote host rejected: %v", err)
 	}
-	if _, err := svc.RegisterRemoteMCPServer(ctx, "blocked", "https://other.example.test/mcp", nil); err == nil {
+	if _, err := svc.RegisterRemoteMCPServer(ctx, "blocked", "https://other.example.test/mcp", nil, nil); err == nil {
 		t.Fatal("host outside the administrator allowlist was accepted")
 	}
 	svc.SetMCPRemoteAllowlist(nil)
-	if _, err := svc.RegisterRemoteMCPServer(ctx, "revoked", "https://mcp.example.test/mcp", nil); err == nil {
+	if _, err := svc.RegisterRemoteMCPServer(ctx, "revoked", "https://mcp.example.test/mcp", nil, nil); err == nil {
 		t.Fatal("empty/revoked host policy still allowed registration")
 	}
 }

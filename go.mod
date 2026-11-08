@@ -5,7 +5,7 @@ go 1.27
 require (
 	github.com/Microsoft/go-winio v0.6.4
 	github.com/modelcontextprotocol/go-sdk v1.8.0
-	github.com/rheic/sandboxes-api v0.0.22
+	github.com/rheic/sandboxes-api v0.0.23
 	github.com/rheic/sandboxes-core v0.0.11
 	github.com/rheic/sandboxes-gateway v0.0.17
 	github.com/rheic/sandboxes-runtime v0.0.29

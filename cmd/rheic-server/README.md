@@ -2,6 +2,7 @@
 
 ![Rheic blue shark logo](../../docs/assets/rheic-shark.png)
 
+
 `rheic-server` serves signed organization policy and accepts structured audit
 events over HTTPS. It is a single-operator preview; applying synced policy to
 sandbox operations, audit search/SIEM export, PostgreSQL HA and deployment

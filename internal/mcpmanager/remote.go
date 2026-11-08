@@ -118,11 +118,11 @@ func dialRemoteIP(ctx context.Context, dialer *net.Dialer, override func(context
 // RegisterRemote queues a remote (streamable HTTP) MCP server for trusted
 // host approval. The URL must satisfy the fail-closed remote policy before a
 // challenge is created.
-func (m *Manager) RegisterRemote(ctx context.Context, name, rawURL string, headers map[string]string) (string, error) {
+func (m *Manager) RegisterRemote(ctx context.Context, name, rawURL string, headers, secretHeaders map[string]string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	server, err := prepareRemoteServer(name, rawURL, headers, m.remoteHostAllowed)
+	server, err := prepareRemoteServer(name, rawURL, headers, secretHeaders, m.remoteHostAllowed)
 	if err != nil {
 		return "", err
 	}
@@ -131,7 +131,7 @@ func (m *Manager) RegisterRemote(ctx context.Context, name, rawURL string, heade
 
 // prepareRemoteServer validates a remote MCP server registration against the
 // host allowlist. Anything but an exact, allowlisted https host fails closed.
-func prepareRemoteServer(name, rawURL string, headers map[string]string, allowed func(string) bool) (Server, error) {
+func prepareRemoteServer(name, rawURL string, headers, secretHeaders map[string]string, allowed func(string) bool) (Server, error) {
 	if !namePattern.MatchString(name) {
 		return Server{}, errors.New("invalid MCP server name")
 	}
@@ -139,11 +139,11 @@ func prepareRemoteServer(name, rawURL string, headers map[string]string, allowed
 	if err != nil {
 		return Server{}, err
 	}
-	copied, err := copiedRemoteHeaders(headers)
+	copied, copiedSecrets, err := copiedRemoteHeaders(headers, secretHeaders)
 	if err != nil {
 		return Server{}, err
 	}
-	return Server{Name: name, Transport: transportRemote, URL: cleanURL, Headers: copied}, nil
+	return Server{Name: name, Transport: transportRemote, URL: cleanURL, Headers: copied, SecretHeaders: copiedSecrets}, nil
 }
 
 // validateRemoteURL enforces the remote transport policy and returns the
@@ -187,37 +187,70 @@ func validateRemoteURL(rawURL string, allowed func(string) bool) (host, cleanURL
 
 // copiedRemoteHeaders validates static headers and non-secret ${name}
 // references. Secret material itself must never enter registration state.
-func copiedRemoteHeaders(headers map[string]string) (map[string]string, error) {
+func copiedRemoteHeaders(headers, secretHeaders map[string]string) (map[string]string, map[string]string, error) {
 	copied := make(map[string]string, len(headers))
-	headerNames := make(map[string]struct{}, len(headers))
+	copiedSecrets := make(map[string]string, len(secretHeaders))
+	headerNames := make(map[string]struct{}, len(headers)+len(secretHeaders))
 	for key, value := range headers {
-		trimmed := strings.TrimSpace(key)
-		if trimmed == "" || strings.ContainsAny(trimmed, "\r\n:\x00") {
-			return nil, errors.New("invalid remote MCP header name")
-		}
-		canonicalName := strings.ToLower(trimmed)
-		if _, exists := headerNames[canonicalName]; exists {
-			return nil, errors.New("remote MCP header names must be unique, ignoring case")
-		}
-		headerNames[canonicalName] = struct{}{}
-		if strings.ContainsAny(value, "\r\n\x00") {
-			return nil, errors.New("invalid remote MCP header value")
-		}
-		refs, err := parseMCPHeaderReferences(value)
+		trimmed, refs, err := validateMCPHeader(key, value, headerNames)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if strings.EqualFold(trimmed, "authorization") || strings.EqualFold(trimmed, "proxy-authorization") {
-			if len(refs) == 0 {
-				return nil, errors.New("authorization MCP headers must use a host-vault ${placeholder}")
-			}
+		if sensitiveMCPHeaderName(trimmed) {
+			return nil, nil, errors.New("credential-bearing MCP headers must use secret_headers with a host-vault ${placeholder}")
+		}
+		if len(refs) > 0 {
+			return nil, nil, errors.New("MCP header placeholders must use secret_headers")
 		}
 		copied[trimmed] = value
 	}
 	if len(copied) > 16 {
-		return nil, errors.New("remote MCP server allows at most 16 headers")
+		return nil, nil, errors.New("remote MCP server allows at most 16 headers")
 	}
-	return copied, nil
+	for key, value := range secretHeaders {
+		trimmed, refs, err := validateMCPHeader(key, value, headerNames)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(refs) == 0 {
+			return nil, nil, errors.New("secret MCP header templates must contain valid host-vault ${placeholder} references")
+		}
+		copiedSecrets[trimmed] = value
+	}
+	if len(headerNames) > 16 {
+		return nil, nil, errors.New("remote MCP server allows at most 16 headers")
+	}
+	return copied, copiedSecrets, nil
+}
+
+func validateMCPHeader(key, value string, names map[string]struct{}) (string, []string, error) {
+	trimmed := strings.TrimSpace(key)
+	if trimmed == "" || strings.ContainsAny(trimmed, "\r\n:\x00") {
+		return "", nil, errors.New("invalid remote MCP header name")
+	}
+	canonicalName := strings.ToLower(trimmed)
+	if _, exists := names[canonicalName]; exists {
+		return "", nil, errors.New("remote MCP header names must be unique, ignoring case")
+	}
+	names[canonicalName] = struct{}{}
+	if strings.ContainsAny(value, "\r\n\x00") {
+		return "", nil, errors.New("invalid remote MCP header value")
+	}
+	refs, err := parseMCPHeaderReferences(value)
+	if err != nil {
+		return "", nil, err
+	}
+	return trimmed, refs, nil
+}
+
+func sensitiveMCPHeaderName(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, marker := range []string{"auth", "cookie", "token", "secret", "credential", "password", "-key", "_key", "apikey"} {
+		if strings.Contains(name, marker) {
+			return true
+		}
+	}
+	return strings.HasSuffix(name, "key")
 }
 
 func parseMCPHeaderReferences(value string) ([]string, error) {
@@ -287,11 +320,12 @@ func remoteServerHost(rawURL string) (string, error) {
 
 // headerTransport injects the registered static, non-secret headers.
 type headerTransport struct {
-	base    http.RoundTripper
-	headers map[string]string
-	server  string
-	host    string
-	resolve RemoteSecretResolver
+	base          http.RoundTripper
+	headers       map[string]string
+	secretHeaders map[string]string
+	server        string
+	host          string
+	resolve       RemoteSecretResolver
 }
 
 func (t headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -300,25 +334,53 @@ func (t headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	cloned := req.Clone(req.Context())
 	for key, value := range t.headers {
-		refs, err := parseMCPHeaderReferences(value)
-		if err != nil {
-			return nil, errors.New("remote MCP header configuration is invalid")
+		if err := t.applyHeader(req.Context(), cloned, key, value, false); err != nil {
+			return nil, err
 		}
-		for _, name := range refs {
-			if t.resolve == nil {
-				return nil, errors.New("remote MCP host-vault secret is unavailable")
-			}
-			secret, err := t.resolve(req.Context(), t.server, name)
-			if err != nil || len(secret) == 0 || strings.ContainsAny(string(secret), "\r\n\x00") {
-				clear(secret)
-				return nil, errors.New("remote MCP host-vault secret is unavailable")
-			}
-			value = strings.Replace(value, "${"+name+"}", string(secret), 1)
-			clear(secret)
+	}
+	for key, value := range t.secretHeaders {
+		if err := t.applyHeader(req.Context(), cloned, key, value, true); err != nil {
+			return nil, err
 		}
-		cloned.Header.Set(key, value)
 	}
 	return t.base.RoundTrip(cloned)
+}
+
+func (t headerTransport) applyHeader(ctx context.Context, req *http.Request, key, value string, requireReference bool) error {
+	refs, err := parseMCPHeaderReferences(value)
+	if err != nil || requireReference && len(refs) == 0 {
+		return errors.New("remote MCP header configuration is invalid")
+	}
+	if len(refs) == 0 {
+		req.Header.Set(key, value)
+		return nil
+	}
+	var resolved strings.Builder
+	resolved.Grow(len(value))
+	cursor := 0
+	for _, name := range refs {
+		placeholder := "${" + name + "}"
+		relativeStart := strings.Index(value[cursor:], placeholder)
+		if relativeStart < 0 {
+			return errors.New("remote MCP header configuration is invalid")
+		}
+		start := cursor + relativeStart
+		resolved.WriteString(value[cursor:start])
+		if t.resolve == nil {
+			return errors.New("remote MCP host-vault secret is unavailable")
+		}
+		secret, err := t.resolve(ctx, t.server, name)
+		if err != nil || len(secret) == 0 || strings.ContainsAny(string(secret), "\r\n\x00") {
+			clear(secret)
+			return errors.New("remote MCP host-vault secret is unavailable")
+		}
+		resolved.Write(secret)
+		clear(secret)
+		cursor = start + len(placeholder)
+	}
+	resolved.WriteString(value[cursor:])
+	req.Header.Set(key, resolved.String())
+	return nil
 }
 
 // startRemoteSession connects to a streamable HTTP MCP endpoint with a
@@ -353,8 +415,8 @@ func (m *Manager) startRemoteSession(ctx context.Context, server Server) (*manag
 		TLSClientConfig: tlsConfig,
 	}
 	var roundTripper http.RoundTripper = transport
-	if len(server.Headers) > 0 {
-		roundTripper = headerTransport{base: transport, headers: server.Headers, server: server.Name, host: serverHost, resolve: secretResolver}
+	if len(server.Headers)+len(server.SecretHeaders) > 0 {
+		roundTripper = headerTransport{base: transport, headers: server.Headers, secretHeaders: server.SecretHeaders, server: server.Name, host: serverHost, resolve: secretResolver}
 	}
 	client := &http.Client{Transport: roundTripper, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	stream := &mcp.StreamableClientTransport{

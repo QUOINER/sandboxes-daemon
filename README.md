@@ -2,6 +2,7 @@
 
 ![Rheic blue shark logo](docs/assets/rheic-shark.png)
 
+
 ## Import path migration
 
 The canonical Go module path is now `github.com/rheic/sandboxes-daemon` (previously `github.com/quoiner/sandboxes-daemon`). Update imports and `go.mod` requirements when moving to a release that includes this change. The old module path is not kept as a compatibility alias.
@@ -61,6 +62,12 @@ value is a comma-separated exact DNS host allowlist, for example
 IP literals are rejected, and an empty value disables remote MCP. The file is
 strict, mode-checked and never contains secrets. Settings need a daemon restart
 to take effect; new sandboxes use the policy profile and resource defaults.
+
+Remote MCP registration stores static non-secret headers separately from
+host-vault placeholder templates. For credential-bearing header names the
+daemon rejects literal values; only `${placeholder}` references are persisted
+and resolved at request time. Remote hosts still require exact allowlist
+entries, and redirects are refused.
 
 Service proxy references require the matching static guest helper artifact.
 Build it with `make build-proxy-helper` and pass
