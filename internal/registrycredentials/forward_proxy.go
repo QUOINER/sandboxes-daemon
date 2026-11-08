@@ -110,7 +110,7 @@ func (p *PullProxy) serveTokenRequest(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 	scope := "repository:" + repository + ":" + strings.Join(sortedActions(actions), ",")
-	_, err = p.store.ExchangeScopedToken(ctx, transport, p.registry, p.credentialScope, p.sandboxName, p.service, scope, p.realms)
+	_, err = p.store.ExchangeScopedToken(ctx, transport, p.registry, p.credentialScope, p.sandboxName, p.service, scope, realm, p.realms)
 	if err != nil {
 		http.Error(w, "registry authentication failed", http.StatusUnauthorized)
 		return
@@ -428,7 +428,10 @@ func (p *PullProxy) exchangeOperationToken(ctx context.Context, operation regist
 		// Keep this action grant explicit and never request delete.
 		scope = "repository:" + operation.repository + ":pull,push"
 	}
-	return p.store.ExchangeScopedToken(ctx, transport, p.registry, p.credentialScope, p.sandboxName, p.service, scope, p.realms)
+	if len(p.realms) == 0 {
+		return "", errors.New("registry authentication realm is not configured")
+	}
+	return p.store.ExchangeScopedToken(ctx, transport, p.registry, p.credentialScope, p.sandboxName, p.service, scope, p.realms[0], p.realms)
 }
 
 func parseRegistryOperation(method string, endpoint *url.URL, expectedHost string) (registryOperation, error) {

@@ -49,9 +49,10 @@ func (s *Store) ExchangePullToken(ctx context.Context, transport http.RoundTripp
 }
 
 // ExchangeScopedToken obtains a bearer for a previously parsed, least-privilege
-// repository scope. The caller must validate the scope and bind it to the
-// authenticated sandbox before invoking this method.
-func (s *Store) ExchangeScopedToken(ctx context.Context, transport http.RoundTripper, registry string, scope Scope, sandboxName, service, repositoryScope string, realms []registryauth.Realm) (string, error) {
+// repository scope. The caller must select the exact configured realm from the
+// authenticated request's host/path and bind it to the sandbox before invoking
+// this method.
+func (s *Store) ExchangeScopedToken(ctx context.Context, transport http.RoundTripper, registry string, scope Scope, sandboxName, service, repositoryScope string, realm registryauth.Realm, realms []registryauth.Realm) (string, error) {
 	if transport == nil || service == "" || len(realms) == 0 || !validRepositoryScope(repositoryScope) {
 		return "", errors.New("invalid registry token scope")
 	}
@@ -67,13 +68,11 @@ func (s *Store) ExchangeScopedToken(ctx context.Context, transport http.RoundTri
 	} else if _, _, err := validateScope(scope, sandboxName); err != nil {
 		return "", err
 	}
-	credential, err := s.Load(ctx, registry, scope, sandboxName)
-	if err != nil {
-		return "", err
-	}
-	defer clear(credential.Password)
-	realmURL := (&url.URL{Scheme: registryHTTPScheme, Host: realms[0].Host, Path: realms[0].Path}).String()
+	realmURL := (&url.URL{Scheme: registryHTTPScheme, Host: realm.Host, Path: realm.Path}).String()
 	header := fmt.Sprintf(`Bearer realm=%q,service=%q,scope=%q`, realmURL, service, repositoryScope)
+	if _, err := registryauth.ParseBearerChallenge(header, realms); err != nil {
+		return "", errors.New("registry token realm is not configured")
+	}
 	return s.exchangeToken(ctx, transport, registry, scope, sandboxName, header, realms, service, repositoryScope)
 }
 
