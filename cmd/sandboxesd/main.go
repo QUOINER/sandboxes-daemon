@@ -249,16 +249,28 @@ func buildNetwork(opts *options, gatewayLost chan<- string) (runtime.Network, *g
 	if err != nil {
 		return nil, nil, fmt.Errorf("create gateway manager: %w", err)
 	}
-	if opts.ipv6Experimental {
-		configurator, ok := any(manager).(interface{ SetIPv6Enabled(bool) error })
-		if !ok {
-			return nil, nil, errors.New("configured gateway module does not support experimental IPv6")
-		}
-		if err := configurator.SetIPv6Enabled(true); err != nil {
-			return nil, nil, fmt.Errorf("enable experimental IPv6 gateway: %w", err)
-		}
+	if err := configureExperimentalIPv6(opts.ipv6Experimental, manager); err != nil {
+		return nil, nil, err
 	}
 	return daemonnetwork.New(manager, runDir), manager, nil
+}
+
+type experimentalIPv6Configurator interface {
+	SetIPv6Enabled(bool) error
+}
+
+func configureExperimentalIPv6(enabled bool, target any) error {
+	if !enabled {
+		return nil
+	}
+	configurator, ok := target.(experimentalIPv6Configurator)
+	if !ok {
+		return errors.New("configured gateway module does not support experimental IPv6")
+	}
+	if err := configurator.SetIPv6Enabled(true); err != nil {
+		return fmt.Errorf("enable experimental IPv6 gateway: %w", err)
+	}
+	return nil
 }
 
 func readPrivateRegistryCA(path string) ([]byte, error) {
