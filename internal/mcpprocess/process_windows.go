@@ -81,15 +81,15 @@ func startTree(cmd *exec.Cmd) (func() error, func() error, error) {
 	return kill, finish, nil
 }
 
-func primaryThread(pid uint32) (windows.Handle, error) {
+func primaryThread(pid uint32) (handle windows.Handle, err error) {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
 	if err != nil {
 		return 0, err
 	}
-	defer windows.CloseHandle(snapshot)
+	defer func() { err = errors.Join(err, windows.CloseHandle(snapshot)) }()
 	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
-	if err = windows.Thread32First(snapshot, &entry); err != nil {
-		return 0, err
+	if firstErr := windows.Thread32First(snapshot, &entry); firstErr != nil {
+		return 0, firstErr
 	}
 	var id uint32
 	for {

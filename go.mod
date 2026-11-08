@@ -5,18 +5,17 @@ go 1.27
 require (
 	github.com/Microsoft/go-winio v0.6.4
 	github.com/modelcontextprotocol/go-sdk v1.8.0
-	github.com/rheic/sandboxes-api v0.0.21
+	github.com/rheic/sandboxes-api v0.0.22
 	github.com/rheic/sandboxes-core v0.0.11
-	github.com/rheic/sandboxes-gateway v0.0.16
-	github.com/rheic/sandboxes-runtime v0.0.26
-	github.com/zalando/go-keyring v0.2.6
+	github.com/rheic/sandboxes-gateway v0.0.17
+	github.com/rheic/sandboxes-runtime v0.0.29
+	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/sys v0.49.0
 	google.golang.org/grpc v1.85.0
-	modernc.org/sqlite v1.61.0
+	modernc.org/sqlite v1.62.0
 )
 
 require (
-	al.essio.dev/pkg/shellescape v1.5.1 // indirect
 	github.com/Microsoft/hcsshim v0.15.0-rc.4 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/containerd/cgroups/v3 v3.1.3 // indirect
@@ -32,13 +31,13 @@ require (
 	github.com/containerd/plugin v1.1.0 // indirect
 	github.com/containerd/ttrpc v1.2.9 // indirect
 	github.com/containerd/typeurl/v2 v2.3.0 // indirect
-	github.com/danieljoos/wincred v1.2.2 // indirect
+	github.com/danieljoos/wincred v1.2.3 // indirect
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/godbus/dbus/v5 v5.1.0 // indirect
+	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.20.2 // indirect
@@ -71,7 +70,7 @@ require (
 	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260825221802-da73d73af1c5 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
-	modernc.org/libc v1.79.0 // indirect
+	modernc.org/libc v1.80.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )
