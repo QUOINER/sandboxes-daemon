@@ -29,7 +29,6 @@ import (
 const p04ServiceCredential = "rheic-p04-service-synthetic-credential"
 
 func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
-	started := time.Now()
 	if runtime.GOARCH != "arm64" {
 		t.Skip("P-04 service-level owned-VM acceptance currently requires macOS ARM64")
 	}
@@ -148,6 +147,8 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 	if err := waitP04ServiceContainerd(ctx, inputs.ctr, containerdSocket, containerdDone); err != nil {
 		t.Fatalf("wait for owned containerd: %v (log %s)", err, filepath.Join(root, "containerd.log"))
 	}
+	// Keep the 90-second lifecycle budget separate from a cold image pull.
+	started := time.Now()
 	networkManager, err := gateway.New(gateway.Config{
 		GVProxy: inputs.gvproxy, Supervisor: inputs.daemon, RunDir: filepath.Join(root, "run", "gateway"),
 	})
