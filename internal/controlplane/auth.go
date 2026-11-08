@@ -52,11 +52,15 @@ func (s *Server) authenticate(r *http.Request) (Principal, bool) {
 	if !ok {
 		return Principal{}, false
 	}
-	role, ok := s.credentials.Authenticate(token)
-	if !ok {
-		return Principal{}, false
+	if role, ok := s.credentials.Authenticate(token); ok {
+		return Principal{Role: role}, true
 	}
-	return Principal{Role: role}, true
+	if s.oidc != nil {
+		if principal, err := s.oidc.Authenticate(r.Context(), token); err == nil {
+			return principal, true
+		}
+	}
+	return Principal{}, false
 }
 
 func bearerToken(r *http.Request) (string, bool) {
