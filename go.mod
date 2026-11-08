@@ -5,10 +5,10 @@ go 1.27
 require (
 	github.com/Microsoft/go-winio v0.6.4
 	github.com/modelcontextprotocol/go-sdk v1.8.0
-	github.com/rheic/sandboxes-api v0.0.20
+	github.com/rheic/sandboxes-api v0.0.21
 	github.com/rheic/sandboxes-core v0.0.11
-	github.com/rheic/sandboxes-gateway v0.0.14
-	github.com/rheic/sandboxes-runtime v0.0.25
+	github.com/rheic/sandboxes-gateway v0.0.15
+	github.com/rheic/sandboxes-runtime v0.0.26
 	github.com/zalando/go-keyring v0.2.6
 	golang.org/x/sys v0.49.0
 	google.golang.org/grpc v1.85.0
