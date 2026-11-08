@@ -189,11 +189,17 @@ func validateRemoteURL(rawURL string, allowed func(string) bool) (host, cleanURL
 // references. Secret material itself must never enter registration state.
 func copiedRemoteHeaders(headers map[string]string) (map[string]string, error) {
 	copied := make(map[string]string, len(headers))
+	headerNames := make(map[string]struct{}, len(headers))
 	for key, value := range headers {
 		trimmed := strings.TrimSpace(key)
 		if trimmed == "" || strings.ContainsAny(trimmed, "\r\n:\x00") {
 			return nil, errors.New("invalid remote MCP header name")
 		}
+		canonicalName := strings.ToLower(trimmed)
+		if _, exists := headerNames[canonicalName]; exists {
+			return nil, errors.New("remote MCP header names must be unique, ignoring case")
+		}
+		headerNames[canonicalName] = struct{}{}
 		if strings.ContainsAny(value, "\r\n\x00") {
 			return nil, errors.New("invalid remote MCP header value")
 		}

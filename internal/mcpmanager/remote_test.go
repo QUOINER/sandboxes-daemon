@@ -53,6 +53,7 @@ func TestPrepareRemoteServerFailsClosed(t *testing.T) {
 		{name: "query", rawURL: "https://mcp.example.com/mcp?x=1", wantErr: "query"},
 		{name: "fragment", rawURL: "https://mcp.example.com/mcp#x", wantErr: "query"},
 		{name: "authorization header", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer x"}, wantErr: "host-vault"},
+		{name: "case-insensitive duplicate headers", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Team": "one", "x-team": "two"}, wantErr: "unique"},
 		{name: "malformed placeholder", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer ${}"}, wantErr: "placeholder"},
 		{name: "crlf header value", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Test": "a\r\nb"}, wantErr: "header value"},
 	}
