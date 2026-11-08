@@ -2,8 +2,9 @@
 
 `rheic-server` serves signed organization policy and accepts structured audit
 events over HTTPS. It is a single-operator preview; daemon synchronization,
-OIDC, policy application, audit search/export, PostgreSQL HA and deployment
-packaging are not implemented yet. Static bearer credentials are role scoped:
+OIDC, policy application, audit search/SIEM export, PostgreSQL HA and
+deployment packaging are not implemented yet. Bounded JSON audit export is
+available. Static bearer credentials are role scoped:
 `admin` may publish policy and ingest audit, `reader` may only read policy.
 
 The API contract is in `sandboxes-api/openapi/cloud/v1.yaml`.
@@ -127,6 +128,32 @@ curl --fail --cacert ./tls/ca.crt \
 Audit ingestion is newline-delimited JSON. It only accepts bounded metadata
 fields and rejects unknown fields, including payload/detail fields. Do not put
 secrets, user paths or request bodies into audit values.
+
+## Export audit events
+
+`GET /v1/orgs/{org}/audit` returns one bounded JSON object, not NDJSON:
+
+```json
+{"events":[{"id":42,"occurredAt":"2026-11-08T00:00:00Z","sandboxId":"sbx_1","operationId":"op_1","action":"network.connect","resource":"network","decision":"allow"}],"nextCursor":"42"}
+```
+
+- `limit` is optional; it defaults to 100 and must be between 1 and 500.
+- `after` is optional and is an exclusive event ID cursor. Omit it for the
+  first page. IDs are assigned monotonically, and events are always ordered by
+  ascending ID, so a cursor does not replay or skip already exported events
+  when new events arrive.
+- `nextCursor` is empty on the last page; otherwise pass it as `after` on the
+  next request.
+- Invalid `limit` or `after` values return `400` with `invalid_limit` or
+  `invalid_cursor`.
+- `admin` and `reader` may export. Each response is restricted to the org in
+  the path.
+
+```sh
+curl --fail --cacert ./tls/ca.crt \
+  -H "Authorization: Bearer $RHEIC_READER_TOKEN" \
+  'https://control.example.test:8443/v1/orgs/acme/audit?limit=100&after=0'
+```
 
 An admin bearer grants access to every org handled by this server; a reader
 bearer reads every org. Do not expose this preview endpoint to untrusted
