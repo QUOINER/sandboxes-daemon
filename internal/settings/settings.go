@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/rheic/sandboxes-daemon/internal/controlplane"
 )
 
 // Values are the supported user overrides. Zero means "not set".
@@ -21,6 +23,12 @@ type Values struct {
 	DefaultCPUs           uint32
 	DefaultMemoryMiB      uint32
 	DockerVolumeSize      string
+	// OrgPolicyEnforce applies the stored, locally verified organization policy
+	// bundle. It is off by default; enabling it without a usable bundle fails
+	// sandbox create/start closed.
+	OrgPolicyEnforce bool
+	// OrgPolicyOrg is the organization whose stored bundle is enforced.
+	OrgPolicyOrg string
 	// RegistryPrivate configures one explicitly allowlisted private registry
 	// reached through the guest registry proxy. Empty disables the feature.
 	RegistryPrivateHost      string
@@ -94,7 +102,20 @@ func validateValues(values Values) error {
 	if values.DefaultMemoryMiB > 32768 {
 		return errors.New("settings default_memory_mib must be at most 32768")
 	}
+	if err := validateOrgPolicy(values); err != nil {
+		return err
+	}
 	return validateRegistryPrivate(values)
+}
+
+func validateOrgPolicy(values Values) error {
+	if values.OrgPolicyOrg != "" && !controlplane.ValidOrgID(values.OrgPolicyOrg) {
+		return errors.New("settings org_policy.org is not a valid organization ID")
+	}
+	if values.OrgPolicyEnforce && values.OrgPolicyOrg == "" {
+		return errors.New("settings org_policy.enforce requires org_policy.org")
+	}
+	return nil
 }
 
 func validateRegistryPrivate(values Values) error {
@@ -143,7 +164,7 @@ func parseRegistryRealms(value string) ([]string, error) {
 	return out, nil
 }
 
-//nolint:gocyclo,cyclop // flat settings key dispatch; helpers own the per-key validation.
+//nolint:gocyclo,cyclop,gocognit // flat settings key dispatch; helpers own the per-key validation.
 func parse(r io.Reader, values *Values) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 4096), 64*1024)
@@ -180,6 +201,14 @@ func parse(r io.Reader, values *Values) error {
 			}
 		case "docker_volume_size":
 			values.DockerVolumeSize = value
+		case "org_policy.enforce":
+			enforce, parseErr := parseStrictBool(key, value)
+			if parseErr != nil {
+				return fmt.Errorf("settings line %d: %w", lineNumber, parseErr)
+			}
+			values.OrgPolicyEnforce = enforce
+		case "org_policy.org":
+			values.OrgPolicyOrg = strings.TrimSpace(value)
 		case "registry_private_host", "registry_private_service", "registry_private_realms", "registry_private_redirects", "registry_private_ca":
 			if err := parseRegistryPrivateSetting(values, key, value); err != nil {
 				return fmt.Errorf("settings line %d: %w", lineNumber, err)
@@ -302,4 +331,18 @@ func parseUint(key, value string, bits int) (uint64, error) {
 		return 0, fmt.Errorf("%s must be a non-negative integer", key)
 	}
 	return parsed, nil
+}
+
+// parseStrictBool accepts only the literal true or false. strconv.ParseBool
+// would also accept 1/0/t/f, which makes an absent-vs-disabled mistake easier
+// in a protected security setting.
+func parseStrictBool(key, value string) (bool, error) {
+	switch value {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be true or false", key)
+	}
 }

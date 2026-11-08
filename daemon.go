@@ -31,16 +31,23 @@ type Config struct {
 	DefaultImage string
 	// IPv6Enabled accepts IPv6 CIDR rules only when the gateway datapath was
 	// configured with the experimental IPv6 capability. It defaults to false.
-	IPv6Enabled    bool
+	IPv6Enabled bool
+	// QUICEnabled accepts UDP domain rules only when the gateway datapath was
+	// configured with the experimental QUIC capability. It defaults to false.
+	QUICEnabled    bool
 	Cleanup        func() error
 	OAuthProviders map[string]service.OAuthProvider
 	OAuthVault     oauthsession.Vault
 	// Settings are optional host-side overrides loaded before the daemon starts.
-	DNSUpstream           string
-	DefaultPolicyProfile  string
-	DefaultCPUs           uint32
-	DefaultMemoryMiB      uint32
-	DockerVolumeSize      string
+	DNSUpstream          string
+	DefaultPolicyProfile string
+	DefaultCPUs          uint32
+	DefaultMemoryMiB     uint32
+	DockerVolumeSize     string
+	// OrgPolicyEnforce applies the stored organization policy bundle. It is off
+	// by default and fails closed when no usable bundle exists.
+	OrgPolicyEnforce      bool
+	OrgPolicyOrg          string
 	MCPRemoteAllowedHosts []string
 	// RegistryPrivate configures one allowlisted private registry reached
 	// through the guest registry proxy (ADR-0006).
@@ -167,6 +174,9 @@ func applyConfig(svc *service.Service, cfg Config) {
 	}
 	svc.DefaultPolicyProfile = cfg.DefaultPolicyProfile
 	svc.IPv6Enabled = cfg.IPv6Enabled
+	svc.QUICEnabled = cfg.QUICEnabled
+	svc.OrgPolicyEnforce = cfg.OrgPolicyEnforce
+	svc.OrgPolicyOrg = cfg.OrgPolicyOrg
 	svc.SetMCPRemoteAllowlist(cfg.MCPRemoteAllowedHosts)
 	if cfg.DockerVolumeSize != "" {
 		svc.DockerVolumeSize = cfg.DockerVolumeSize

@@ -7,8 +7,9 @@
 // failures fail closed: the previous stored bundle is left untouched.
 //
 // This package is deliberately not wired into the daemon CLI, local API or SDK
-// yet. Multi-tenancy, applying synced policy to sandboxes and offline
-// last-known-good behavior remain out of scope for this preview.
+// yet. The stored bundle can be enforced for sandbox network deny rules by
+// internal/orgpolicy when org_policy.enforce is on. Multi-tenancy, offline
+// last-known-good behavior and non-network resources remain out of scope.
 package policysync
 
 import (
