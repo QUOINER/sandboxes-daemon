@@ -25,10 +25,13 @@ import (
 
 // Config is the daemon configuration.
 type Config struct {
-	SocketPath     string
-	StateDir       string
-	Backend        runtime.Backend
-	DefaultImage   string
+	SocketPath   string
+	StateDir     string
+	Backend      runtime.Backend
+	DefaultImage string
+	// IPv6Enabled accepts IPv6 CIDR rules only when the gateway datapath was
+	// configured with the experimental IPv6 capability. It defaults to false.
+	IPv6Enabled    bool
 	Cleanup        func() error
 	OAuthProviders map[string]service.OAuthProvider
 	OAuthVault     oauthsession.Vault
@@ -163,6 +166,7 @@ func applyConfig(svc *service.Service, cfg Config) {
 		svc.DefaultMemoryMiB = cfg.DefaultMemoryMiB
 	}
 	svc.DefaultPolicyProfile = cfg.DefaultPolicyProfile
+	svc.IPv6Enabled = cfg.IPv6Enabled
 	svc.SetMCPRemoteAllowlist(cfg.MCPRemoteAllowedHosts)
 	if cfg.DockerVolumeSize != "" {
 		svc.DockerVolumeSize = cfg.DockerVolumeSize

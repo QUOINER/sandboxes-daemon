@@ -89,6 +89,7 @@ func run() int {
 		StateDir:                 opts.stateDir,
 		Backend:                  backend,
 		DefaultImage:             opts.image,
+		IPv6Enabled:              ipv6RuleCapability(&opts),
 		Cleanup:                  cleanup,
 		OAuthProviders:           dockerOAuthProviders(),
 		DNSUpstream:              opts.dnsUpstream,
@@ -266,6 +267,13 @@ type experimentalIPv6Configurator interface {
 
 type experimentalQUICConfigurator interface {
 	SetQUICEnabled(bool) error
+}
+
+// ipv6RuleCapability is true only when the operator asked for the
+// experimental datapath and a patched gvproxy is configured. Without gvproxy
+// the gateway capability cannot be enabled, so v6 rules stay rejected.
+func ipv6RuleCapability(opts *options) bool {
+	return opts.ipv6Experimental && opts.gvproxyPath != ""
 }
 
 func configureExperimentalIPv6(enabled bool, target any) error {

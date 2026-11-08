@@ -2,6 +2,25 @@ package main
 
 import "testing"
 
+func TestIPv6RuleCapabilityRequiresFlagAndGateway(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		opts options
+		want bool
+	}{
+		{name: "defaults off", opts: options{}, want: false},
+		{name: "flag without gvproxy", opts: options{ipv6Experimental: true}, want: false},
+		{name: "gvproxy without flag", opts: options{gvproxyPath: "/bin/gvproxy"}, want: false},
+		{name: "flag and gvproxy", opts: options{ipv6Experimental: true, gvproxyPath: "/bin/gvproxy"}, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ipv6RuleCapability(&test.opts); got != test.want {
+				t.Fatalf("ipv6RuleCapability(%+v) = %v, want %v", test.opts, got, test.want)
+			}
+		})
+	}
+}
+
 func TestConfigureExperimentalIPv6DisabledDoesNotRequireConfigurator(t *testing.T) {
 	if err := configureExperimentalIPv6(false, nil); err != nil {
 		t.Fatalf("configureExperimentalIPv6(false, nil) error = %v, want nil", err)
