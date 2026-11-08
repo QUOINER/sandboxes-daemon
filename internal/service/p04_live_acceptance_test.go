@@ -359,9 +359,9 @@ func execP04Service(ctx context.Context, svc *Service, sandboxID, command string
 }
 
 func waitP04ServiceHelper(ctx context.Context, svc *Service, sandboxID string) error {
-	command := `/bin/sh -c 'i=0; while [ "$i" -lt 50 ]; do busybox nc -z -w 1 127.0.0.1 3128 2>/dev/null && exit 0; i=$((i + 1)); sleep 0.1; done; exit 1'`
+	command := `/bin/sh -c 'i=0; while [ "$i" -lt 50 ]; do grep -Eq "^ *[0-9]+: 0100007F:0C38 +00000000:0000 +0A " /proc/net/tcp && exit 0; i=$((i + 1)); sleep 0.1; done; exit 1'`
 	if _, err := execP04Service(ctx, svc, sandboxID, command, nil); err != nil {
-		diagnostics, diagnosticErr := execP04Service(ctx, svc, sandboxID, `/bin/sh -c 'echo processes; busybox ps; echo helper; ls -l /tmp/rheic-proxy-helper; echo tcp; cat /proc/net/tcp; echo tcp6; cat /proc/net/tcp6; echo fds; ls -l /proc/2/fd; echo nc; busybox nc --help 2>&1'`, nil)
+		diagnostics, diagnosticErr := execP04Service(ctx, svc, sandboxID, `/bin/sh -c 'echo helper; ls -l /tmp/rheic-proxy-helper; echo tcp; cat /proc/net/tcp; echo tcp6; cat /proc/net/tcp6; echo fds; ls -l /proc/2/fd'`, nil)
 		return fmt.Errorf("wait for guest proxy listener: %w; diagnostics=%q (diagnostic error: %v)", err, diagnostics, diagnosticErr)
 	}
 	return nil
