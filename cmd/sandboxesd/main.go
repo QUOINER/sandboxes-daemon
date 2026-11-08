@@ -51,6 +51,8 @@ type options struct {
 	registryPrivateCAPath string
 	ipv6Experimental      bool
 	quicExperimental      bool
+	orgPolicyEnforce      bool
+	orgPolicyOrg          string
 	showVersion           bool
 }
 
@@ -90,6 +92,9 @@ func run() int {
 		Backend:                  backend,
 		DefaultImage:             opts.image,
 		IPv6Enabled:              ipv6RuleCapability(&opts),
+		QUICEnabled:              quicRuleCapability(&opts),
+		OrgPolicyEnforce:         opts.orgPolicyEnforce,
+		OrgPolicyOrg:             opts.orgPolicyOrg,
 		Cleanup:                  cleanup,
 		OAuthProviders:           dockerOAuthProviders(),
 		DNSUpstream:              opts.dnsUpstream,
@@ -155,6 +160,8 @@ func parseOptions() options {
 	opts.registryPrivateRealms = values.RegistryPrivateRealms
 	opts.registryPrivateRedirs = values.RegistryPrivateRedirects
 	opts.registryPrivateCAPath = values.RegistryPrivateCA
+	opts.orgPolicyEnforce = values.OrgPolicyEnforce
+	opts.orgPolicyOrg = values.OrgPolicyOrg
 	return opts
 }
 
@@ -274,6 +281,13 @@ type experimentalQUICConfigurator interface {
 // the gateway capability cannot be enabled, so v6 rules stay rejected.
 func ipv6RuleCapability(opts *options) bool {
 	return opts.ipv6Experimental && opts.gvproxyPath != ""
+}
+
+// quicRuleCapability mirrors ipv6RuleCapability for UDP domain policy. The
+// gateway only accepts UDP domain rules when the patched datapath is present
+// and the operator enabled it explicitly.
+func quicRuleCapability(opts *options) bool {
+	return opts.quicExperimental && opts.gvproxyPath != ""
 }
 
 func configureExperimentalIPv6(enabled bool, target any) error {

@@ -978,6 +978,7 @@ type fakePolicyRuntime struct {
 	fakeRuntime
 	revision int
 	allow    []runtime.Rule
+	deny     []runtime.Rule
 	err      error
 	before   func()
 }
@@ -1023,7 +1024,7 @@ func TestConcurrentPolicyMutationsPreserveRevocation(t *testing.T) {
 	}
 }
 
-func (f *fakePolicyRuntime) UpdatePolicy(_ context.Context, _ runtime.Handle, allow, _ []runtime.Rule, revision int) error {
+func (f *fakePolicyRuntime) UpdatePolicy(_ context.Context, _ runtime.Handle, allow, deny []runtime.Rule, revision int) error {
 	if f.before != nil {
 		f.before()
 	}
@@ -1032,6 +1033,7 @@ func (f *fakePolicyRuntime) UpdatePolicy(_ context.Context, _ runtime.Handle, al
 	}
 	f.revision = revision
 	f.allow = allow
+	f.deny = deny
 	return nil
 }
 

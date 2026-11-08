@@ -34,6 +34,7 @@ import (
 
 	"github.com/rheic/sandboxes-daemon/internal/mcpmanager"
 	"github.com/rheic/sandboxes-daemon/internal/oauthsession"
+	"github.com/rheic/sandboxes-daemon/internal/orgpolicy"
 	"github.com/rheic/sandboxes-daemon/internal/registrycredentials"
 	"github.com/rheic/sandboxes-daemon/internal/secretproxy"
 	"github.com/rheic/sandboxes-daemon/internal/servicesecrets"
@@ -68,10 +69,18 @@ type Service struct {
 	DefaultImage        string
 	// IPv6Enabled accepts IPv6 CIDR rules only when every datapath layer has
 	// the experimental capability enabled. It defaults to false.
-	IPv6Enabled              bool
-	DefaultCPUs              uint32
-	DefaultMemoryMiB         uint32
-	DefaultPolicyProfile     string
+	IPv6Enabled          bool
+	DefaultCPUs          uint32
+	DefaultMemoryMiB     uint32
+	DefaultPolicyProfile string
+	// OrgPolicyEnforce applies the stored organization policy bundle to every
+	// sandbox. It defaults to false and never re-fetches policy in the hot path.
+	OrgPolicyEnforce bool
+	// OrgPolicyOrg is the organization whose stored bundle is enforced.
+	OrgPolicyOrg string
+	// QUICEnabled mirrors the gateway experimental UDP domain policy capability
+	// so the daemon can reject unenforceable effective policy before runtime.
+	QUICEnabled              bool
 	DockerVolumeDir          string
 	DockerVolumeSize         string
 	MkfsExt4                 string
@@ -779,10 +788,6 @@ func (s *Service) CheckPolicy(ctx context.Context, id, protocol, address, domain
 // or the stored global rules when the ID is empty.
 func (s *Service) checkPolicyRules(ctx context.Context, id string) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
 	if id == "" {
-		allow, deny, err := s.GlobalPolicy(ctx)
-		if err != nil {
-			return nil, nil, err
-		}
 		profile, err := s.GetPolicyProfile(ctx)
 		if err != nil {
 			return nil, nil, err
@@ -791,7 +796,7 @@ func (s *Service) checkPolicyRules(ctx context.Context, id string) ([]sandbox.Ne
 		if err != nil {
 			return nil, nil, err
 		}
-		return mergePolicyRules(profileRules, allow), deny, nil
+		return s.effectiveRules(ctx, profileRules, nil)
 	}
 	sb, err := s.store.Get(ctx, id)
 	if err != nil {
@@ -1095,6 +1100,9 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		return operation.Operation{}, err
 	}
 	defer release()
+	if err := s.requireOrgPolicy(ctx); err != nil {
+		return operation.Operation{}, err
+	}
 	image, cpus, memoryMiB, env, err := s.resolveCreateResources(req)
 	if err != nil {
 		return operation.Operation{}, err
@@ -1894,7 +1902,15 @@ func (s *Service) effectivePolicy(ctx context.Context, sb sandbox.Sandbox) ([]sa
 	return s.effectiveRules(ctx, policyAllow(sb.Policy), policyDeny(sb.Policy))
 }
 
+// effectiveRules combines global, organization and sandbox rules. Organization
+// deny rules are loaded from the local store (never the network) and are placed
+// first in the deny list so they retain their signed rule ID for audit and
+// always outrank local allow rules.
 func (s *Service) effectiveRules(ctx context.Context, allow, deny []sandbox.NetworkRule) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+	organization, err := s.loadOrgPolicy(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	globalAllow, globalDeny, err := s.GlobalPolicy(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -1907,7 +1923,99 @@ func (s *Service) effectiveRules(ctx context.Context, allow, deny []sandbox.Netw
 	if err != nil {
 		return nil, nil, err
 	}
+	effectiveDeny, err = s.mergeOrgDeny(organization, effectiveDeny)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(organization.Deny) > 0 {
+		if err := validateOrgPolicyEnforcement(effectiveAllow, effectiveDeny, s.QUICEnabled); err != nil {
+			return nil, nil, err
+		}
+	}
 	return effectiveAllow, effectiveDeny, nil
+}
+
+// loadOrgPolicy returns an empty snapshot when enforcement is off. Any failure
+// to obtain a stored, locally verified and unexpired bundle is a hard error.
+func (s *Service) loadOrgPolicy(ctx context.Context) (*orgpolicy.Snapshot, error) {
+	if !s.OrgPolicyEnforce {
+		return &orgpolicy.Snapshot{}, nil
+	}
+	snapshot, err := orgpolicy.Load(ctx, s.store, s.OrgPolicyOrg, s.now().UTC())
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", core.ErrConflict, err)
+	}
+	return &snapshot, nil
+}
+
+func (s *Service) requireOrgPolicy(ctx context.Context) error {
+	_, err := s.loadOrgPolicy(ctx)
+	return err
+}
+
+func (s *Service) globalPolicyForMutation(ctx context.Context) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
+	if err := s.requireOrgPolicy(ctx); err != nil {
+		return nil, nil, err
+	}
+	return s.GlobalPolicy(ctx)
+}
+
+// mergeOrgDeny preserves the signed organization rule IDs while validating the
+// mapped rules through the same normalizer used for local rules. Organization
+// denies come first and win over local allows at the gateway.
+func (s *Service) mergeOrgDeny(organization *orgpolicy.Snapshot, deny []sandbox.NetworkRule) ([]sandbox.NetworkRule, error) {
+	if organization == nil || len(organization.Deny) == 0 {
+		return deny, nil
+	}
+	ids := make(map[string]string, len(organization.Deny))
+	for _, rule := range organization.Deny {
+		ids[policyRuleKey(rule)] = rule.RuleID
+	}
+	normalized, err := normalizeRules(organization.Deny, s.IPv6Enabled)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w: %w", core.ErrConflict, orgpolicy.ErrBundleInvalid, err)
+	}
+	out := make([]sandbox.NetworkRule, 0, len(normalized)+len(deny))
+	seen := make(map[string]struct{}, len(normalized)+len(deny))
+	for _, rule := range normalized {
+		key := policyRuleKey(rule)
+		if id, ok := ids[key]; ok {
+			rule.RuleID = id
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, rule)
+	}
+	for _, rule := range deny {
+		key := policyRuleKey(rule)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, rule)
+	}
+	return out, nil
+}
+
+func validateOrgPolicyEnforcement(allow, deny []sandbox.NetworkRule, quicEnabled bool) error {
+	toRules := func(rules []sandbox.NetworkRule, action gatewaypolicy.Action) []gatewaypolicy.Rule {
+		out := make([]gatewaypolicy.Rule, 0, len(rules))
+		for i := range rules {
+			out = append(out, gatewaypolicy.Rule{ID: rules[i].RuleID, Action: action, Protocol: rules[i].Protocol, Domain: rules[i].Domain, CIDR: rules[i].CIDR, Port: rules[i].Port})
+		}
+		return out
+	}
+	capabilities := gatewaypolicy.Capabilities{QUIC: quicEnabled}
+	if err := gatewaypolicy.ValidateEnforcementWith(toRules(allow, gatewaypolicy.Allow), toRules(deny, gatewaypolicy.Deny), capabilities); err != nil {
+		return fmt.Errorf("%w: %w: %w", core.ErrConflict, orgpolicy.ErrPolicyConflict, err)
+	}
+	return nil
+}
+
+func policyRuleKey(rule sandbox.NetworkRule) string {
+	return rule.Protocol + "|" + rule.CIDR + "|" + rule.Domain + "|" + strconv.Itoa(int(rule.Port))
 }
 
 const (
@@ -1947,7 +2055,7 @@ func (s *Service) loadGlobalRules(ctx context.Context, key string) ([]sandbox.Ne
 func (s *Service) MutateGlobalPolicy(ctx context.Context, action string, rule sandbox.NetworkRule) ([]sandbox.NetworkRule, []sandbox.NetworkRule, error) {
 	s.globalPolicyMu.Lock()
 	defer s.globalPolicyMu.Unlock()
-	allow, deny, err := s.GlobalPolicy(ctx)
+	allow, deny, err := s.globalPolicyForMutation(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1994,6 +2102,9 @@ func (s *Service) MutateGlobalPolicy(ctx context.Context, action string, rule sa
 // RefreshPolicies re-applies the effective policy to every running sandbox
 // immediately and returns how many accepted the refresh.
 func (s *Service) RefreshPolicies(ctx context.Context) (int, error) {
+	if err := s.requireOrgPolicy(ctx); err != nil {
+		return 0, err
+	}
 	sandboxes, _, err := s.store.List(ctx, sandbox.ListOptions{PageSize: 1000})
 	if err != nil {
 		return 0, err
@@ -2018,6 +2129,9 @@ func (s *Service) RefreshPolicies(ctx context.Context) (int, error) {
 // profile. Running sandboxes keep their own rules; the cleared global policy
 // is applied to them live. Sandbox-scoped rules are not touched.
 func (s *Service) ResetGlobalPolicy(ctx context.Context) ([]sandbox.NetworkRule, []sandbox.NetworkRule, string, error) {
+	if err := s.requireOrgPolicy(ctx); err != nil {
+		return nil, nil, "", err
+	}
 	s.globalPolicyMu.Lock()
 	if err := s.store.DeleteSetting(ctx, globalAllowSetting); err != nil {
 		s.globalPolicyMu.Unlock()
@@ -2095,6 +2209,9 @@ func (s *Service) GetPolicyProfile(ctx context.Context) (string, error) {
 
 // SetPolicyProfile stores the global default profile for new sandboxes.
 func (s *Service) SetPolicyProfile(ctx context.Context, profile string) (string, error) {
+	if err := s.requireOrgPolicy(ctx); err != nil {
+		return "", err
+	}
 	profile, _, err := normalizePolicyProfile(profile)
 	if err != nil {
 		return "", err
@@ -2651,6 +2768,9 @@ func (s *Service) Start(ctx context.Context, id string) (operation.Operation, er
 	if sb.State == sandbox.Deleting || sb.State == sandbox.Deleted {
 		return operation.Operation{}, fmt.Errorf("%w: sandbox is being deleted", core.ErrConflict)
 	}
+	if err := s.requireOrgPolicy(ctx); err != nil {
+		return operation.Operation{}, err
+	}
 	if s.backend != nil {
 		if err := s.prepareSandboxForStart(ctx, sb); err != nil {
 			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
@@ -2786,6 +2906,7 @@ func (s *Service) UpdatePolicy(ctx context.Context, id string, allow, deny []san
 	return s.updatePolicyLocked(ctx, id, allow, deny)
 }
 
+//nolint:cyclop,gocyclo // atomic persistence and runtime rollback paths are intentionally explicit.
 func (s *Service) updatePolicyLocked(ctx context.Context, id string, allow, deny []sandbox.NetworkRule) (sandbox.Sandbox, error) {
 	sb, err := s.store.Get(ctx, id)
 	if err != nil {
@@ -2793,6 +2914,9 @@ func (s *Service) updatePolicyLocked(ctx context.Context, id string, allow, deny
 	}
 	if sb.State == sandbox.Deleting || sb.State == sandbox.Deleted {
 		return sandbox.Sandbox{}, fmt.Errorf("%w: sandbox is being deleted", core.ErrConflict)
+	}
+	if err := s.requireOrgPolicy(ctx); err != nil {
+		return sandbox.Sandbox{}, err
 	}
 	normalizedAllow, err := normalizeRules(allow, s.IPv6Enabled)
 	if err != nil {

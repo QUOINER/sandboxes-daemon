@@ -51,8 +51,9 @@ sandboxesd --state "$HOME/.sandboxes" \
 
 `--settings` defaults to `~/.config/rheic/settings.toml`. Supported overrides
 are `dns_upstream`, `default_policy_profile`, `default_cpus`,
-`default_memory_mib`, `docker_volume_size` and `mcp_remote_allowed_hosts`. The
-last is a comma-separated exact DNS host allowlist for remote MCP, for example
+`default_memory_mib`, `docker_volume_size`, `mcp_remote_allowed_hosts`,
+`org_policy.enforce` and `org_policy.org`. The MCP value is a comma-separated
+exact DNS host allowlist, for example
 `mcp_remote_allowed_hosts = "mcp.example.com,api.example.com"`; wildcards and
 IP literals are rejected, and an empty value disables remote MCP. The file is
 strict, mode-checked and never contains secrets. Settings need a daemon restart
@@ -139,7 +140,52 @@ creates a pre-upgrade backup; network, TLS, signature, expiry and revision
 failures fail closed and leave the previous bundle intact.
 
 The client is not wired into the CLI, local API or SDK yet; that product wiring
-is a separate slice. Multi-tenancy, applying synced policy to sandboxes,
-offline last-known-good behavior and audit SIEM export remain out of scope for
-this preview. The table stores policy metadata and signatures only, never
-sandbox secrets.
+is a separate slice. Multi-tenancy, offline last-known-good behavior and audit
+SIEM export remain out of scope. The table stores policy metadata and
+signatures only, never sandbox secrets.
+
+## Organization policy enforcement (ADR-0003 slice)
+
+`org_policy.enforce = true` plus `org_policy.org = "<org>"` applies the stored,
+locally verified bundle for that organization to sandbox network policy. The
+setting defaults to off. When it is on, every create, start, policy mutation,
+policy refresh and policy-check path first loads the bundle from SQLite (never
+from the network). A missing, expired, cross-organization, malformed or
+metadata-inconsistent bundle returns a typed `core.ErrConflict` error and the
+operation fails closed; there is no permissive fallback.
+
+What is enforced:
+
+- only `network` deny resources of the form
+  `network:<domain-or-cidr>:<port>`, where the port is mandatory and non-zero;
+- every mapped deny expands to both TCP and UDP on the same destination/port,
+  so the restriction cannot be bypassed by choosing another transport;
+- organization deny is prepended to the effective deny list and keeps its signed
+  rule ID for audit and gateway decisions; gateway deny precedence therefore
+  beats local allow rules;
+- if the gateway cannot enforce the resulting combination (for example a
+  domain deny overlapping a direct IP allow), create/start/mutation fails with
+  `orgpolicy.ErrPolicyConflict` instead of dropping the organization deny.
+
+Resource parsing decisions:
+
+- a bare IP literal is treated as a `/32` or `/128` CIDR; a destination with a
+  slash must parse as a CIDR; any other destination is a domain rule;
+- a malformed `network:` deny fails the whole operation (fail closed) because
+  ignoring it would silently weaken a signed restriction;
+- organization `allow` rules are advisory and ignored in this slice, and
+  malformed allow resources are ignored with them;
+- `filesystem`, `mcp` and `secret` deny resources are outside this slice and are
+  ignored; they are documented as not enforced;
+- an IPv6 organization rule requires the existing IPv6 capability and otherwise
+  fails closed through the same normalizer as local rules;
+- a domain deny requires `--quic-experimental` and a patched gvproxy with the
+  QUIC classifier. Without it the gateway rejects UDP domain policy, so the
+  operation fails closed rather than granting TCP-only enforcement.
+
+Not enforced by this slice: filesystem, MCP and secret resources; organization
+allow rules; offline last-known-good beyond the stored bundle's expiry;
+multi-tenancy; and apply-time signature re-verification (the signature is
+verified by the policy sync client before the bundle is stored, and the local
+SQLite store is trusted daemon state). The daemon does not contact the control
+plane in the create/start/policy hot path.
