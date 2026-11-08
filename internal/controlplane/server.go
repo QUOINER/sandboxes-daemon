@@ -3,8 +3,6 @@ package controlplane
 import (
 	"bytes"
 	"crypto/ed25519"
-	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -16,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -67,23 +64,23 @@ type AuditEvent struct {
 }
 
 type Config struct {
-	DBPath     string
-	AdminToken []byte
-	PolicyKey  ed25519.PublicKey
-	Clock      func() time.Time
+	DBPath      string
+	Credentials *CredentialSet
+	PolicyKey   ed25519.PublicKey
+	Clock       func() time.Time
 }
 
 type Server struct {
-	db         *sql.DB
-	token      []byte
-	policyKey  ed25519.PublicKey
-	clock      func() time.Time
-	httpServer *http.ServeMux
+	db          *sql.DB
+	credentials *CredentialSet
+	policyKey   ed25519.PublicKey
+	clock       func() time.Time
+	httpServer  *http.ServeMux
 }
 
 func New(config Config) (*Server, error) {
-	if config.DBPath == "" || len(config.AdminToken) < 32 || len(config.PolicyKey) != ed25519.PublicKeySize {
-		return nil, errors.New("database path, 32-byte admin token, and Ed25519 policy public key are required")
+	if config.DBPath == "" || config.Credentials == nil || len(config.PolicyKey) != ed25519.PublicKeySize {
+		return nil, errors.New("database path, role-scoped credentials, and Ed25519 policy public key are required")
 	}
 	db, err := sql.Open("sqlite", config.DBPath)
 	if err != nil {
@@ -102,7 +99,7 @@ func New(config Config) (*Server, error) {
 	if clock == nil {
 		clock = time.Now
 	}
-	s := &Server{db: db, token: append([]byte(nil), config.AdminToken...), policyKey: append(ed25519.PublicKey(nil), config.PolicyKey...), clock: clock, httpServer: http.NewServeMux()}
+	s := &Server{db: db, credentials: config.Credentials, policyKey: append(ed25519.PublicKey(nil), config.PolicyKey...), clock: clock, httpServer: http.NewServeMux()}
 	s.httpServer.HandleFunc("GET /healthz", s.health)
 	s.httpServer.HandleFunc("GET /v1/orgs/{org}/policy", s.getPolicy)
 	s.httpServer.HandleFunc("PUT /v1/orgs/{org}/policy", s.putPolicy)
@@ -204,12 +201,17 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) getPolicy(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(w, r) {
+	principal, ok := s.requireRole(w, r, RoleAdmin, RoleReader)
+	if !ok {
 		return
 	}
 	org := r.PathValue("org")
 	if !validOrgID(org) {
 		writeError(w, http.StatusBadRequest, "invalid_org_id")
+		return
+	}
+	if !principal.allowsOrg(org) {
+		writeError(w, http.StatusForbidden, "forbidden")
 		return
 	}
 	var raw []byte
@@ -233,12 +235,17 @@ func (s *Server) getPolicy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) putPolicy(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(w, r) {
+	principal, ok := s.requireRole(w, r, RoleAdmin)
+	if !ok {
 		return
 	}
 	org := r.PathValue("org")
 	if !validOrgID(org) {
 		writeError(w, http.StatusBadRequest, "invalid_org_id")
+		return
+	}
+	if !principal.allowsOrg(org) {
+		writeError(w, http.StatusForbidden, "forbidden")
 		return
 	}
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBundleBytes))
@@ -277,12 +284,17 @@ WHERE excluded.revision > policy_bundles.revision`, org, bundle.Payload.Revision
 }
 
 func (s *Server) ingestAudit(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(w, r) {
+	principal, ok := s.requireRole(w, r, RoleAdmin)
+	if !ok {
 		return
 	}
 	org := r.PathValue("org")
 	if !validOrgID(org) {
 		writeError(w, http.StatusBadRequest, "invalid_org_id")
+		return
+	}
+	if !principal.allowsOrg(org) {
+		writeError(w, http.StatusForbidden, "forbidden")
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAuditBytes))
@@ -318,18 +330,6 @@ func (s *Server) ingestAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
-}
-
-func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
-	header := r.Header.Get("Authorization")
-	value := strings.TrimPrefix(header, "Bearer ")
-	providedHash := sha256.Sum256([]byte(value))
-	configuredHash := sha256.Sum256(s.token)
-	if value == header || subtle.ConstantTimeCompare(providedHash[:], configuredHash[:]) != 1 {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return false
-	}
-	return true
 }
 
 func validatePayload(payload PolicyPayload, org string, now time.Time) error {

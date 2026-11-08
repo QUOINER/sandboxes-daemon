@@ -179,7 +179,7 @@ func TestMigrationBacksUpExistingDatabaseAndRejectsNewerSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := New(Config{DBPath: dbPath, AdminToken: testToken, PolicyKey: publicKey})
+	server, err := New(Config{DBPath: dbPath, Credentials: testCredentials(t), PolicyKey: publicKey})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +215,7 @@ func TestMigrationBacksUpExistingDatabaseAndRejectsNewerSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = db.Close()
-	if _, err := New(Config{DBPath: dbPath, AdminToken: testToken, PolicyKey: publicKey}); err == nil {
+	if _, err := New(Config{DBPath: dbPath, Credentials: testCredentials(t), PolicyKey: publicKey}); err == nil {
 		t.Fatal("newer schema was accepted")
 	}
 }
@@ -227,7 +227,7 @@ func TestAuditIngestIsBoundedStructuredAndAuthenticated(t *testing.T) {
 		`{"occurredAt":"` + now.Format(time.RFC3339Nano) + `","sandboxId":"sbx_123","operationId":"op_124","action":"network.connect","resource":"network","decision":"deny"}`,
 	}, "\n")
 	request := httptest.NewRequest(http.MethodPost, "/v1/orgs/example-org/audit", strings.NewReader(batch))
-	request.Header.Set("Authorization", "Bearer "+string(testToken))
+	request.Header.Set("Authorization", "Bearer "+string(testAdminToken))
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusAccepted {
@@ -238,7 +238,7 @@ func TestAuditIngestIsBoundedStructuredAndAuthenticated(t *testing.T) {
 		t.Fatalf("audit rows=%d err=%v", count, err)
 	}
 	request = httptest.NewRequest(http.MethodPost, "/v1/orgs/example-org/audit", strings.NewReader(`{"occurredAt":"`+now.Format(time.RFC3339Nano)+`","sandboxId":"sbx_1","operationId":"op_1","action":"x","resource":"network","decision":"allow","payload":"must reject"}`))
-	request.Header.Set("Authorization", "Bearer "+string(testToken))
+	request.Header.Set("Authorization", "Bearer "+string(testAdminToken))
 	response = httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest {
@@ -252,7 +252,22 @@ func TestAuditIngestIsBoundedStructuredAndAuthenticated(t *testing.T) {
 	}
 }
 
-var testToken = []byte("test-only-random-admin-token-000000000000000000000000000000000000")
+var (
+	testAdminToken  = []byte("test-only-synthetic-admin-token-000000000000000000000000000000")
+	testReaderToken = []byte("test-only-synthetic-reader-token-00000000000000000000000000000")
+)
+
+func testCredentials(t *testing.T) *CredentialSet {
+	t.Helper()
+	credentials, err := NewCredentialSet([]Credential{
+		{Name: "test-admin", Role: RoleAdmin, Token: string(testAdminToken)},
+		{Name: "test-reader", Role: RoleReader, Token: string(testReaderToken)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return credentials
+}
 
 func newTestServer(t *testing.T) (*Server, ed25519.PrivateKey, time.Time) {
 	t.Helper()
@@ -261,7 +276,7 @@ func newTestServer(t *testing.T) (*Server, ed25519.PrivateKey, time.Time) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, time.November, 8, 0, 0, 0, 0, time.UTC)
-	server, err := New(Config{DBPath: filepath.Join(t.TempDir(), "controlplane.db"), AdminToken: testToken, PolicyKey: publicKey, Clock: func() time.Time { return now }})
+	server, err := New(Config{DBPath: filepath.Join(t.TempDir(), "controlplane.db"), Credentials: testCredentials(t), PolicyKey: publicKey, Clock: func() time.Time { return now }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,6 +295,15 @@ func signedBundle(t *testing.T, payload PolicyPayload, key ed25519.PrivateKey) S
 
 func requestJSON(t *testing.T, handler http.Handler, method, path string, value any, authorized bool) *httptest.ResponseRecorder {
 	t.Helper()
+	token := []byte(nil)
+	if authorized {
+		token = testAdminToken
+	}
+	return requestWithToken(t, handler, method, path, value, token)
+}
+
+func requestWithToken(t *testing.T, handler http.Handler, method, path string, value any, token []byte) *httptest.ResponseRecorder {
+	t.Helper()
 	var body io.Reader = strings.NewReader("")
 	if value != nil {
 		encoded, err := json.Marshal(value)
@@ -289,8 +313,8 @@ func requestJSON(t *testing.T, handler http.Handler, method, path string, value 
 		body = strings.NewReader(string(encoded))
 	}
 	request := httptest.NewRequest(method, path, body)
-	if authorized {
-		request.Header.Set("Authorization", "Bearer "+string(testToken))
+	if token != nil {
+		request.Header.Set("Authorization", "Bearer "+string(token))
 	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)

@@ -152,3 +152,24 @@ func TestDefaultDatabasePathUsesApplicationConfigDirectory(t *testing.T) {
 		t.Fatalf("default database directory permissions = %#o, want private", info.Mode().Perm())
 	}
 }
+
+func TestCredentialsFileMustBeOwnerOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	content := []byte(`{"credentials":[{"name":"ops","role":"admin","token":"synthetic-token-000000000000000000000000000000000000"}]}`)
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readProtectedFile(path, controlplane.MaxCredentialFileBytes); err == nil {
+		t.Fatal("credentials file readable by group or others was accepted")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := readProtectedFile(path, controlplane.MaxCredentialFileBytes)
+	if err != nil {
+		t.Fatalf("owner-only credentials file rejected: %v", err)
+	}
+	if _, err := controlplane.ParseCredentials(raw); err != nil {
+		t.Fatalf("synthetic credentials file rejected: %v", err)
+	}
+}

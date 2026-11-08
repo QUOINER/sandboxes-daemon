@@ -2,8 +2,9 @@
 
 `rheic-server` serves signed organization policy and accepts structured audit
 events over HTTPS. It is a single-operator preview; daemon synchronization,
-OIDC, multi-operator roles, policy application, audit search/export, PostgreSQL
-HA and deployment packaging are not implemented yet.
+OIDC, policy application, audit search/export, PostgreSQL HA and deployment
+packaging are not implemented yet. Static bearer credentials are role scoped:
+`admin` may publish policy and ingest audit, `reader` may only read policy.
 
 The API contract is in `sandboxes-api/openapi/cloud/v1.yaml`.
 
@@ -17,13 +18,43 @@ rheic-server keygen --prefix ./policy-key
 ```
 
 `policy-key.private` has mode `0600`; `policy-key.public` is base64 encoded and
-can be copied to the server. Generate an admin token and protect its file:
+can be copied to the server.
+
+Create a protected credentials file with mode `0600` (a regular file owned by
+the server user, not a symlink). It is strict JSON with one entry per named
+bearer credential:
+
+```json
+{
+  "credentials": [
+    {"name": "ops-admin", "role": "admin", "token": "<random value, at least 32 bytes>"},
+    {"name": "audit-reader", "role": "reader", "token": "<different random value, at least 32 bytes>"}
+  ]
+}
+```
+
+Generate each token separately, for example with `openssl rand -base64 48`, and
+never reuse a token between entries or roles. The server refuses to start on an
+empty file, an unknown role, a token shorter than 32 bytes, duplicate names or
+tokens, unknown fields, invalid JSON, or a file readable by group or others.
+Comparison is constant time over SHA-256 digests. Token values are never logged.
+
+| Operation | admin | reader |
+| --- | --- | --- |
+| `GET /v1/orgs/{org}/policy` | yes | yes |
+| `PUT /v1/orgs/{org}/policy` | yes | no (403) |
+| `POST /v1/orgs/{org}/audit` | yes | no (403) |
+
+Export a token from the file into the environment for the examples below; do
+not put it on a command line or in shell history:
 
 ```sh
-umask 077
-openssl rand -base64 48 > ./admin-token
-chmod 600 ./admin-token
+export RHEIC_ADMIN_TOKEN="$(jq -r '.credentials[] | select(.role == "admin") | .token' ./credentials.json)"
 ```
+
+Static credentials are installation wide: they are not scoped to an org. Each
+org path is still isolated in storage, but a credential holder may use any org
+ID handled by this server. Per-org authorization is an OIDC/follow-up gate.
 
 Provide a certificate and an owner-only regular key file (mode `0600`) for the
 server's DNS name. Clients verify TLS normally; there is no insecure mode. The
@@ -37,7 +68,7 @@ network policy.
 rheic-server \
   --listen 127.0.0.1:8443 \
   --db ./state/rheic-server.db \
-  --admin-token-file ./admin-token \
+  --credentials-file ./credentials.json \
   --policy-public-key ./policy-key.public \
   --tls-cert ./tls/server.crt \
   --tls-key ./tls/server.key
@@ -87,7 +118,7 @@ rheic-server sign-policy \
   --output ./signed-policy.json
 
 curl --fail --cacert ./tls/ca.crt \
-  -H "Authorization: Bearer $(cat ./admin-token)" \
+  -H "Authorization: Bearer $RHEIC_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
   --data-binary @./signed-policy.json \
   -X PUT https://control.example.test:8443/v1/orgs/acme/policy
@@ -97,6 +128,8 @@ Audit ingestion is newline-delimited JSON. It only accepts bounded metadata
 fields and rejects unknown fields, including payload/detail fields. Do not put
 secrets, user paths or request bodies into audit values.
 
-The admin bearer currently grants access to every org handled by this server.
-Do not expose this preview endpoint to untrusted clients. OIDC and per-org
-authorization are explicit follow-up gates, not implied by the HTTPS listener.
+An admin bearer grants access to every org handled by this server; a reader
+bearer reads every org. Do not expose this preview endpoint to untrusted
+clients. OIDC and per-org authorization are explicit follow-up gates, not
+implied by the HTTPS listener. The credential file is read once at startup;
+restart the server after rotating a token.
