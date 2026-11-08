@@ -123,3 +123,29 @@ func TestLoadTLSCertificateRequiresPrivateKeyPermissions(t *testing.T) {
 		t.Fatal("TLS private key with group/world permissions was accepted")
 	}
 }
+
+func TestDefaultDatabasePathUsesApplicationConfigDirectory(t *testing.T) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := defaultDatabasePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := databasePathInConfigDir(configDir)
+	if path != want {
+		t.Fatalf("default database path = %q, want %q", path, want)
+	}
+	temporaryPath := databasePathInConfigDir(t.TempDir())
+	if err := prepareDatabasePath(temporaryPath); err != nil {
+		t.Fatalf("prepare temporary default database path: %v", err)
+	}
+	info, err := os.Stat(filepath.Dir(temporaryPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("default database directory permissions = %#o, want private", info.Mode().Perm())
+	}
+}

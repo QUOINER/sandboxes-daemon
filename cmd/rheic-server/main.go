@@ -55,8 +55,12 @@ type serverOptions struct {
 
 func runServer(args []string) error {
 	flags := flag.NewFlagSet("rheic-server", flag.ContinueOnError)
+	defaultDBPath, err := defaultDatabasePath()
+	if err != nil {
+		return err
+	}
 	listen := flags.String("listen", "127.0.0.1:8443", "HTTPS listen address")
-	dbPath := flags.String("db", "rheic-server.db", "SQLite database path")
+	dbPath := flags.String("db", defaultDBPath, "SQLite database path")
 	tokenPath := flags.String("admin-token-file", "", "file with a random 32-byte-or-longer admin bearer token (mode 0600)")
 	publicKeyPath := flags.String("policy-public-key", "", "base64 Ed25519 policy-signing public key file")
 	certPath := flags.String("tls-cert", "", "TLS certificate PEM")
@@ -68,6 +72,18 @@ func runServer(args []string) error {
 		return errors.New("--admin-token-file, --policy-public-key, --tls-cert, and --tls-key are required")
 	}
 	return serve(serverOptions{listen: *listen, dbPath: *dbPath, tokenPath: *tokenPath, publicKey: *publicKeyPath, certPath: *certPath, privateKey: *keyPath})
+}
+
+func defaultDatabasePath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user config directory: %w", err)
+	}
+	return databasePathInConfigDir(configDir), nil
+}
+
+func databasePathInConfigDir(configDir string) string {
+	return filepath.Join(configDir, "rheic", "rheic-server.db")
 }
 
 func serve(options serverOptions) error {

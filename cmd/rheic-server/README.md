@@ -45,7 +45,8 @@ rheic-server \
 
 The database and its directory are restricted to the current user. The server
 uses SQLite WAL mode, rejects a newer schema, and creates a private snapshot
-before applying a migration to a non-empty database.
+before applying a migration to a non-empty database. Without `--db`, it stores
+the database under the operating system's user config directory in `rheic/`.
 
 ## Sign and publish a policy
 
