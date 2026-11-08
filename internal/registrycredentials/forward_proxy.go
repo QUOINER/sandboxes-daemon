@@ -959,7 +959,11 @@ func (p *PullProxy) writeBlobRedirect(w http.ResponseWriter, method string, resp
 		http.Error(w, "blob redirect response is unsupported", http.StatusBadGateway)
 		return
 	}
-	if response.ContentLength < 0 || response.ContentLength > p.maxBytes {
+	maxBytes := p.maxBytes
+	if response.StatusCode == http.StatusNotFound && maxBytes > maxRegistryErrorBody {
+		maxBytes = maxRegistryErrorBody
+	}
+	if response.ContentLength < 0 || response.ContentLength > maxBytes {
 		http.Error(w, "blob response exceeds supported limits", http.StatusBadGateway)
 		return
 	}
