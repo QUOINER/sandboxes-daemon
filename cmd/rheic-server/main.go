@@ -51,6 +51,9 @@ type serverOptions struct {
 	publicKey       string
 	certPath        string
 	privateKey      string
+	oidcIssuer      string
+	oidcAudience    string
+	oidcJWKSURL     string
 }
 
 func runServer(args []string) error {
@@ -65,13 +68,20 @@ func runServer(args []string) error {
 	publicKeyPath := flags.String("policy-public-key", "", "base64 Ed25519 policy-signing public key file")
 	certPath := flags.String("tls-cert", "", "TLS certificate PEM")
 	keyPath := flags.String("tls-key", "", "TLS private key PEM")
+	oidcIssuer := flags.String("oidc-issuer", "", "optional OIDC issuer URL; enables OIDC bearer validation with --oidc-audience and --oidc-jwks-url")
+	oidcAudience := flags.String("oidc-audience", "", "optional OIDC token audience")
+	oidcJWKSURL := flags.String("oidc-jwks-url", "", "optional HTTPS JWKS URL")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 || *credentialsPath == "" || *publicKeyPath == "" || *certPath == "" || *keyPath == "" {
 		return errors.New("--credentials-file, --policy-public-key, --tls-cert, and --tls-key are required")
 	}
-	return serve(serverOptions{listen: *listen, dbPath: *dbPath, credentialsPath: *credentialsPath, publicKey: *publicKeyPath, certPath: *certPath, privateKey: *keyPath})
+	return serve(serverOptions{
+		listen: *listen, dbPath: *dbPath, credentialsPath: *credentialsPath,
+		publicKey: *publicKeyPath, certPath: *certPath, privateKey: *keyPath,
+		oidcIssuer: *oidcIssuer, oidcAudience: *oidcAudience, oidcJWKSURL: *oidcJWKSURL,
+	})
 }
 
 func defaultDatabasePath() (string, error) {
@@ -110,7 +120,14 @@ func serve(options serverOptions) error {
 	if err := prepareDatabasePath(options.dbPath); err != nil {
 		return err
 	}
-	service, err := controlplane.New(controlplane.Config{DBPath: options.dbPath, Credentials: credentials, PolicyKey: ed25519.PublicKey(publicKey)})
+	var oidcConfig *controlplane.OIDCConfig
+	if oidcConfigured(options) {
+		oidcConfig, err = oidcConfigFromOptions(options)
+		if err != nil {
+			return err
+		}
+	}
+	service, err := controlplane.New(controlplane.Config{DBPath: options.dbPath, Credentials: credentials, PolicyKey: ed25519.PublicKey(publicKey), OIDC: oidcConfig})
 	if err != nil {
 		return err
 	}
@@ -142,6 +159,17 @@ func serve(options serverOptions) error {
 		return fmt.Errorf("serve HTTPS: %w", err)
 	}
 	return nil
+}
+
+func oidcConfigured(options serverOptions) bool {
+	return options.oidcIssuer != "" || options.oidcAudience != "" || options.oidcJWKSURL != ""
+}
+
+func oidcConfigFromOptions(options serverOptions) (*controlplane.OIDCConfig, error) {
+	if options.oidcIssuer == "" || options.oidcAudience == "" || options.oidcJWKSURL == "" {
+		return nil, errors.New("--oidc-issuer, --oidc-audience and --oidc-jwks-url must be provided together")
+	}
+	return &controlplane.OIDCConfig{Issuer: options.oidcIssuer, Audience: options.oidcAudience, JWKSURL: options.oidcJWKSURL}, nil
 }
 
 func loadTLSCertificate(certPath, keyPath string) (tls.Certificate, error) {

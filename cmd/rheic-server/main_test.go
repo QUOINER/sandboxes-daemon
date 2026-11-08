@@ -173,3 +173,21 @@ func TestCredentialsFileMustBeOwnerOnly(t *testing.T) {
 		t.Fatalf("synthetic credentials file rejected: %v", err)
 	}
 }
+
+func TestOIDCConfigRequiresAllOrNoneFlags(t *testing.T) {
+	if oidcConfigured(serverOptions{}) {
+		t.Fatal("empty OIDC options reported as configured")
+	}
+	if _, err := oidcConfigFromOptions(serverOptions{oidcIssuer: "https://idp.example.test"}); err == nil {
+		t.Fatal("partial OIDC options were accepted")
+	}
+	config, err := oidcConfigFromOptions(serverOptions{
+		oidcIssuer: "https://idp.example.test", oidcAudience: "rheic", oidcJWKSURL: "https://idp.example.test/jwks",
+	})
+	if err != nil {
+		t.Fatalf("complete OIDC options rejected: %v", err)
+	}
+	if config == nil || config.Issuer != "https://idp.example.test" || config.Audience != "rheic" {
+		t.Fatalf("OIDC config=%+v", config)
+	}
+}
