@@ -20,6 +20,7 @@ import (
 	daemon "github.com/rheic/sandboxes-daemon"
 	daemonnetwork "github.com/rheic/sandboxes-daemon/internal/network"
 	"github.com/rheic/sandboxes-daemon/internal/oauthsession"
+	"github.com/rheic/sandboxes-daemon/internal/policysync"
 	"github.com/rheic/sandboxes-daemon/internal/service"
 	"github.com/rheic/sandboxes-daemon/internal/settings"
 	"github.com/rheic/sandboxes-daemon/internal/version"
@@ -53,6 +54,11 @@ type options struct {
 	quicExperimental      bool
 	orgPolicyEnforce      bool
 	orgPolicyOrg          string
+	policySyncURL         string
+	policySyncOrg         string
+	policySyncPublicKey   string
+	policySyncTokenFile   string
+	policySyncInterval    time.Duration
 	showVersion           bool
 }
 
@@ -86,6 +92,11 @@ func run() int {
 		slog.Error("read private registry CA", "error", caErr)
 		return 1
 	}
+	policySync, syncErr := loadPolicySync(&opts)
+	if syncErr != nil {
+		slog.Error("load policy sync configuration", "error", syncErr)
+		return 1
+	}
 	err = daemon.Run(ctx, daemon.Config{
 		SocketPath:               opts.socketPath,
 		StateDir:                 opts.stateDir,
@@ -110,6 +121,7 @@ func run() int {
 		RegistryPrivateCA:        privateCA,
 		GatewayLost:              lost,
 		ProxyHelperPath:          opts.proxyHelperPath,
+		PolicySync:               policySync,
 	})
 	if err != nil {
 		slog.Error("daemon stopped", "error", err)
@@ -162,7 +174,39 @@ func parseOptions() options {
 	opts.registryPrivateCAPath = values.RegistryPrivateCA
 	opts.orgPolicyEnforce = values.OrgPolicyEnforce
 	opts.orgPolicyOrg = values.OrgPolicyOrg
+	opts.policySyncURL = values.PolicySyncURL
+	opts.policySyncOrg = values.PolicySyncOrg
+	opts.policySyncPublicKey = values.PolicySyncPublicKeyFile
+	opts.policySyncTokenFile = values.PolicySyncTokenFile
+	opts.policySyncInterval = values.PolicySyncInterval
 	return opts
+}
+
+// loadPolicySync reads the protected token and public-key files only when the
+// all-or-none settings block is present. The token is never accepted from a
+// command-line flag, so it cannot leak through the process list.
+func loadPolicySync(opts *options) (*daemon.PolicySyncConfig, error) {
+	if opts.policySyncURL == "" {
+		return nil, nil //nolint:nilnil // nil config means policy sync is disabled.
+	}
+	publicKey, err := policysync.LoadPublicKeyFile(opts.policySyncPublicKey)
+	if err != nil {
+		return nil, err
+	}
+	token, err := policysync.LoadTokenFile(opts.policySyncTokenFile)
+	if err != nil {
+		return nil, err
+	}
+	client, err := policysync.New(policysync.Config{
+		BaseURL:   opts.policySyncURL,
+		OrgID:     opts.policySyncOrg,
+		Token:     token,
+		PublicKey: publicKey,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &daemon.PolicySyncConfig{Client: client, Interval: opts.policySyncInterval}, nil
 }
 
 func dockerOAuthProviders() map[string]service.OAuthProvider {

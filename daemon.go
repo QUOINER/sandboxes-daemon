@@ -59,6 +59,10 @@ type Config struct {
 	// GatewayLost reports sandboxes whose gateway exited unexpectedly.
 	GatewayLost     <-chan string
 	ProxyHelperPath string
+	// PolicySync, when non-nil, enables the opt-in background policy sync. The
+	// runner performs one attempt at startup and then a jittered periodic
+	// attempt until the daemon context is canceled.
+	PolicySync *PolicySyncConfig
 }
 
 // configureService applies host configuration, wires credential storage and
@@ -142,9 +146,19 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	if changed > 0 {
 		slog.Info("reconciled interrupted state", "records", changed)
 	}
+	var policySync *policySyncRunner
+	if cfg.PolicySync != nil {
+		policySync, err = newPolicySyncRunner(*cfg.PolicySync, st)
+		if err != nil {
+			return fmt.Errorf("configure policy sync: %w", err)
+		}
+	}
 	lis, err := listenDaemon(ctx, cfg.SocketPath)
 	if err != nil {
 		return fmt.Errorf("listen local daemon endpoint: %w", err)
+	}
+	if policySync != nil {
+		defer startPolicySync(ctx, policySync)()
 	}
 
 	// The MCP contract caps JSON results at 4 MiB. Allow bounded protobuf

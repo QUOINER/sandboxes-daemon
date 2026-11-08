@@ -1,11 +1,12 @@
 # Self-hosted control-plane preview
 
 `rheic-server` serves signed organization policy and accepts structured audit
-events over HTTPS. It is a single-operator preview; daemon synchronization,
-OIDC, policy application, audit search/SIEM export, PostgreSQL HA and
-deployment packaging are not implemented yet. Bounded JSON audit export is
-available. Static bearer credentials are role scoped:
-`admin` may publish policy and ingest audit, `reader` may only read policy.
+events over HTTPS. It is a single-operator preview; applying synced policy to
+sandbox operations, audit search/SIEM export, PostgreSQL HA and deployment
+packaging are not implemented yet. The daemon can pull policy as an opt-in
+background sync (see the daemon README). Bounded JSON audit export is available.
+Static bearer credentials are role scoped: `admin` may publish policy and ingest
+audit, `reader` may only read policy.
 
 The API contract is in `sandboxes-api/openapi/cloud/v1.yaml`.
 
