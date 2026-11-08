@@ -79,6 +79,45 @@ uses SQLite WAL mode, rejects a newer schema, and creates a private snapshot
 before applying a migration to a non-empty database. Without `--db`, it stores
 the database under the operating system's user config directory in `rheic/`.
 
+## Optional OIDC bearer validation
+
+Set all three flags together to accept OIDC JWT bearer tokens in addition to
+static credentials:
+
+```sh
+rheic-server \
+  --credentials-file ./credentials.json \
+  --oidc-issuer https://idp.example.test \
+  --oidc-audience rheic-control-plane \
+  --oidc-jwks-url https://idp.example.test/.well-known/jwks.json \
+  ... # database, policy key and TLS flags as above
+```
+
+Only `RS256` and `EdDSA` signatures are accepted. Tokens using `none`, HMAC or
+any other algorithm are rejected before verification. The validator enforces:
+
+- exact `iss` match against `--oidc-issuer`;
+- the configured audience in `aud` (string or array);
+- required `exp` and optional `nbf`, with 60 seconds of clock leeway;
+- a non-empty `kid` that resolves to a usable key in the JWKS;
+- an `org` claim matching the org path, and a `role` claim of `admin` or
+  `reader`. A token scoped to one org gets `403` on another org, and a reader
+  token cannot publish or ingest.
+
+The JWKS is fetched over HTTPS, cached, refreshed every 5 minutes, and must be
+refreshed successfully before it is 15 minutes old. An unknown `kid` triggers
+at most one rate-limited refresh (not more than once every 30 seconds), so a
+stream of random key IDs cannot force unbounded fetches. If a refresh fails
+while the cache is stale, validation fails closed. JWKS and JWT payloads are
+size bounded, duplicate JSON members are rejected, RSA keys below 2048 bits
+and non-Ed25519 OKP keys are ignored.
+
+This is bearer-token validation, not a full OIDC client: there is no browser
+login, authorization-code flow, token issuance/refresh, discovery endpoint, or
+token introspection/revocation. Treat it as a documented gap rather than an
+implicit feature. Tokens, signatures and authorization headers are never
+logged.
+
 ## Sign and publish a policy
 
 The signer receives a JSON `PolicyPayload` matching the OpenAPI schema. The

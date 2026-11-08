@@ -67,6 +67,7 @@ type Config struct {
 	DBPath      string
 	Credentials *CredentialSet
 	PolicyKey   ed25519.PublicKey
+	OIDC        *OIDCConfig
 	Clock       func() time.Time
 }
 
@@ -74,6 +75,7 @@ type Server struct {
 	db          *sql.DB
 	credentials *CredentialSet
 	policyKey   ed25519.PublicKey
+	oidc        *OIDCValidator
 	clock       func() time.Time
 	httpServer  *http.ServeMux
 }
@@ -100,6 +102,14 @@ func New(config Config) (*Server, error) {
 		clock = time.Now
 	}
 	s := &Server{db: db, credentials: config.Credentials, policyKey: append(ed25519.PublicKey(nil), config.PolicyKey...), clock: clock, httpServer: http.NewServeMux()}
+	if config.OIDC != nil {
+		validator, oidcErr := NewOIDCValidator(*config.OIDC)
+		if oidcErr != nil {
+			_ = db.Close()
+			return nil, oidcErr
+		}
+		s.oidc = validator
+	}
 	s.httpServer.HandleFunc("GET /healthz", s.health)
 	s.httpServer.HandleFunc("GET /v1/orgs/{org}/policy", s.getPolicy)
 	s.httpServer.HandleFunc("PUT /v1/orgs/{org}/policy", s.putPolicy)
