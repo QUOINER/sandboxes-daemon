@@ -142,13 +142,23 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 
 	// A cold pinned sandbox-template pull is several hundred MiB; allow the
 	// controlled registry fetch to complete before testing VM lifecycle.
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
-	defer cancel()
-	if err := waitP04ServiceContainerd(ctx, inputs.ctr, containerdSocket, containerdDone); err != nil {
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer startupCancel()
+	if err := waitP04ServiceContainerd(startupCtx, inputs.ctr, containerdSocket, containerdDone); err != nil {
 		t.Fatalf("wait for owned containerd: %v (log %s)", err, filepath.Join(root, "containerd.log"))
 	}
-	// Keep the 90-second lifecycle budget separate from a cold image pull.
-	started := time.Now()
+	imageClient, err := ctr.New(ctr.Config{
+		Socket: containerdSocket, CTR: inputs.ctr, Snapshotter: "erofs", Platform: "linux/arm64",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := imageClient.EnsureImage(startupCtx, inputs.image); err != nil {
+		t.Fatalf("pre-pull pinned sandbox image before lifecycle budget: %v", err)
+	}
+	// The cold template pull is complete; bound the service lifecycle independently.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
 	networkManager, err := gateway.New(gateway.Config{
 		GVProxy: inputs.gvproxy, Supervisor: inputs.daemon, RunDir: filepath.Join(root, "run", "gateway"),
 	})
@@ -216,6 +226,7 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		}
 	})
 
+	started := time.Now()
 	operation, err := svc.Create(ctx, CreateRequest{
 		Name:  sandboxName,
 		Image: inputs.image,
