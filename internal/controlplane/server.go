@@ -104,6 +104,7 @@ func New(config Config) (*Server, error) {
 	s.httpServer.HandleFunc("GET /v1/orgs/{org}/policy", s.getPolicy)
 	s.httpServer.HandleFunc("PUT /v1/orgs/{org}/policy", s.putPolicy)
 	s.httpServer.HandleFunc("POST /v1/orgs/{org}/audit", s.ingestAudit)
+	s.httpServer.HandleFunc("GET /v1/orgs/{org}/audit", s.exportAudit)
 	return s, nil
 }
 
