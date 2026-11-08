@@ -1,8 +1,10 @@
 package registrycredentials
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,11 +13,35 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/rheic/sandboxes-gateway/registryauth"
 )
 
 type closeTrackingBody struct {
 	io.Reader
 	closed bool
+}
+
+type realmRoutingFactory struct {
+	transports map[registryauth.Realm]http.RoundTripper
+	selected   []registryauth.Realm
+}
+
+func (f *realmRoutingFactory) Registry(context.Context, string) (http.RoundTripper, error) {
+	return nil, errors.New("unexpected registry transport request")
+}
+
+func (f *realmRoutingFactory) Token(_ context.Context, realm registryauth.Realm) (http.RoundTripper, error) {
+	f.selected = append(f.selected, realm)
+	transport, ok := f.transports[realm]
+	if !ok {
+		return nil, errors.New("unexpected token realm")
+	}
+	return transport, nil
+}
+
+func (f *realmRoutingFactory) Redirect(context.Context, string) (http.RoundTripper, error) {
+	return nil, errors.New("unexpected redirect transport request")
 }
 
 func (b *closeTrackingBody) Close() error {
@@ -400,5 +426,106 @@ func TestTokenRequestAcceptsRepeatedScopes(t *testing.T) {
 	other := "service=fixture&scope=repository:one:pull&scope=repository:two:pull"
 	if _, _, ok, valid := parseTokenRequestScope(other, "fixture"); !valid || ok {
 		t.Fatal("multi-repository token request accepted")
+	}
+}
+
+func TestAuthenticatedForwardProxyDispatchesExactRealmAndPath(t *testing.T) {
+	const (
+		service = "registry.fixture"
+		sandbox = "realm-routing-sandbox"
+	)
+	realms := []registryauth.Realm{
+		{Host: "auth.private.test", Path: "/token"},
+		{Host: "auth-alt.private.test", Path: "/oauth/token"},
+	}
+	upstreamTokens := []string{"realm-one-upstream-token", "realm-two-upstream-token"}
+	transportCalls := make(map[registryauth.Realm]int, len(realms))
+	transports := make(map[registryauth.Realm]http.RoundTripper, len(realms))
+	transportForRealm := func(expected registryauth.Realm, upstreamToken string) http.RoundTripper {
+		return pullRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+			transportCalls[expected]++
+			if request.Method != http.MethodGet || request.URL.Host != expected.Host || request.URL.Path != expected.Path {
+				t.Errorf("realm %v received token exchange for %s %s; realm selection must bind host and path", expected, request.Method, request.URL)
+			}
+			if username, password, ok := request.BasicAuth(); !ok || username != "synthetic-user" || password != "synthetic-password" {
+				t.Errorf("realm %v received unexpected synthetic credentials: %q", expected, username)
+			}
+			if request.URL.Query().Get("service") != service || request.URL.Query().Get("scope") != "repository:team/image:pull" {
+				t.Errorf("realm %v received unexpected credential exchange query: %q", expected, request.URL.RawQuery)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"token":"` + upstreamToken + `"}`)),
+			}, nil
+		})
+	}
+	for index, realm := range realms {
+		transports[realm] = transportForRealm(realm, upstreamTokens[index])
+	}
+	factory := &realmRoutingFactory{transports: transports}
+	vault := &fakeVault{}
+	store, err := NewStore(vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Save(t.Context(), Credential{
+		Registry: "registry.private.test", Username: "synthetic-user", Password: []byte("synthetic-password"),
+		Scope: ScopeSandbox, SandboxName: sandbox,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	proxy, err := NewPullProxy(store, PullProxyConfig{
+		Registry: "registry.private.test", SandboxName: sandbox, CredentialScope: ScopeSandbox,
+		Service: service, Realms: realms, TransportFactory: factory, Limiter: NewPullLimiter(), MaxBytes: 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(realm registryauth.Realm, path string) *httptest.ResponseRecorder {
+		t.Helper()
+		query := url.Values{"service": []string{service}, "scope": []string{"repository:team/image:pull"}}
+		r := httptest.NewRequest(http.MethodGet, "https://"+realm.Host+path+"?"+query.Encode(), http.NoBody)
+		r.TLS = &tls.ConnectionState{ServerName: realm.Host}
+		r.Host = realm.Host
+		// The PullProxy is bound to this sandbox; its registry credential is
+		// loaded from the host vault and never supplied in this guest request.
+		response := httptest.NewRecorder()
+		proxy.ServeHTTP(response, r)
+		return response
+	}
+
+	mismatched := request(realms[1], realms[0].Path)
+	if mismatched.Code != http.StatusForbidden {
+		t.Fatalf("mismatched realm path returned %d: %s", mismatched.Code, mismatched.Body.String())
+	}
+	if len(factory.selected) != 0 || transportCalls[realms[0]] != 0 || transportCalls[realms[1]] != 0 {
+		t.Fatalf("mismatched realm path invoked token exchange: selected=%v calls=%v", factory.selected, transportCalls)
+	}
+
+	for index, realm := range realms {
+		otherRealm := realms[1-index]
+		otherRealmCalls := transportCalls[otherRealm]
+		response := request(realm, realm.Path)
+		if response.Code != http.StatusOK {
+			t.Fatalf("realm %v request returned %d: %s", realm, response.Code, response.Body.String())
+		}
+		for _, token := range upstreamTokens {
+			if strings.Contains(response.Body.String(), token) {
+				t.Fatal("upstream registry token was exposed to the guest")
+			}
+		}
+		if got := factory.selected[index]; got != realm {
+			t.Fatalf("request for realm %v selected token transport for %v", realm, got)
+		}
+		if transportCalls[realm] != 1 {
+			t.Fatalf("request for realm %v called its token transport %d times", realm, transportCalls[realm])
+		}
+		if transportCalls[otherRealm] != otherRealmCalls {
+			t.Fatalf("request for realm %v also invoked realm %v transport", realm, otherRealm)
+		}
+	}
+	if len(factory.selected) != len(realms) {
+		t.Fatalf("selected %d token transports for %d realm requests", len(factory.selected), len(realms))
 	}
 }

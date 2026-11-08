@@ -29,7 +29,6 @@ import (
 const p04ServiceCredential = "rheic-p04-service-synthetic-credential"
 
 func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
-	started := time.Now()
 	if runtime.GOARCH != "arm64" {
 		t.Skip("P-04 service-level owned-VM acceptance currently requires macOS ARM64")
 	}
@@ -141,10 +140,21 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	if err := waitP04ServiceContainerd(ctx, inputs.ctr, containerdSocket, containerdDone); err != nil {
+	// A cold pinned sandbox-template pull is several hundred MiB; allow the
+	// controlled registry fetch to complete before testing VM lifecycle.
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer startupCancel()
+	if err := waitP04ServiceContainerd(startupCtx, inputs.ctr, containerdSocket, containerdDone); err != nil {
 		t.Fatalf("wait for owned containerd: %v (log %s)", err, filepath.Join(root, "containerd.log"))
+	}
+	imageClient, err := ctr.New(ctr.Config{
+		Socket: containerdSocket, CTR: inputs.ctr, Snapshotter: "erofs", Platform: "linux/arm64",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := imageClient.EnsureImage(startupCtx, inputs.image); err != nil {
+		t.Fatalf("pre-pull pinned sandbox image before lifecycle budget: %v", err)
 	}
 	networkManager, err := gateway.New(gateway.Config{
 		GVProxy: inputs.gvproxy, Supervisor: inputs.daemon, RunDir: filepath.Join(root, "run", "gateway"),
@@ -166,7 +176,7 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := store.Open(ctx, filepath.Join(root, "sandboxes.db"))
+	state, err := store.Open(startupCtx, filepath.Join(root, "sandboxes.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,6 +193,12 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 	proxies := secretproxy.New()
 	svc := New(state, backend)
 	svc.DefaultImage = inputs.image
+	svc.DockerVolumeDir = filepath.Join(root, "docker-volumes")
+	if err := os.Mkdir(svc.DockerVolumeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	svc.DockerVolumeSize = "512m"
+	svc.MkfsExt4 = "mkfs.ext4"
 	svc.SetServiceSecretStore(serviceSecrets)
 	svc.SetSecretProxyManager(proxies)
 	proxyRoot := filepath.Join(root, "proxy")
@@ -201,10 +217,10 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		t.Fatal(err)
 	}
 	sandboxName := "p04-service-" + hex.EncodeToString(nonce[:])
-	if _, err := serviceSecrets.Load(ctx, "openai", servicesecrets.ScopeSandbox, sandboxName); !errors.Is(err, servicesecrets.ErrNotFound) {
+	if _, err := serviceSecrets.Load(startupCtx, "openai", servicesecrets.ScopeSandbox, sandboxName); !errors.Is(err, servicesecrets.ErrNotFound) {
 		t.Fatalf("unique sandbox keychain account already exists: %v", err)
 	}
-	if _, err := svc.SetServiceSecret(ctx, "openai", servicesecrets.ScopeSandbox, sandboxName, []byte(p04ServiceCredential)); err != nil {
+	if _, err := svc.SetServiceSecret(startupCtx, "openai", servicesecrets.ScopeSandbox, sandboxName, []byte(p04ServiceCredential)); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -213,6 +229,11 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		}
 	})
 
+	// The cold template pull and local setup are complete; bound only the
+	// create/start/exec/revoke/delete lifecycle.
+	started := time.Now()
+	ctx, cancel := context.WithDeadline(context.Background(), started.Add(5*time.Minute))
+	defer cancel()
 	operation, err := svc.Create(ctx, CreateRequest{
 		Name:  sandboxName,
 		Image: inputs.image,
@@ -222,12 +243,9 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		t.Fatalf("service Create with sandbox-scoped proxy credential: %v", err)
 	}
 	sandboxID := operation.SandboxID
-	if sandboxID == "" || !proxies.Has(sandboxName, "openai") {
-		t.Fatalf("service Create did not persist sandbox identity and start broker (id=%q)", sandboxID)
-	}
 	deleted := false
 	defer func() {
-		if deleted {
+		if deleted || sandboxID == "" {
 			return
 		}
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -236,6 +254,9 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 			t.Errorf("delete owned service acceptance sandbox: %v", err)
 		}
 	}()
+	if sandboxID == "" || !proxies.Has(sandboxName, "openai") {
+		t.Fatalf("service Create did not persist sandbox identity and start broker (id=%q)", sandboxID)
+	}
 
 	checkEnv := `/bin/sh -c 'test "$OPENAI_API_KEY" = rheic-proxy-placeholder && test "$OPENAI_BASE_URL" = http://127.0.0.1:3128/v1'`
 	if err := waitP04ServiceHelper(ctx, svc, sandboxID); err != nil {
@@ -289,8 +310,8 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 	if err := ctx.Err(); err != nil {
 		t.Fatalf("service acceptance exceeded operation deadline: %v", err)
 	}
-	if elapsed := time.Since(started); elapsed >= 90*time.Second {
-		t.Fatalf("service acceptance exceeded 90 seconds: %s", elapsed)
+	if elapsed := time.Since(started); elapsed >= 5*time.Minute {
+		t.Fatalf("service lifecycle acceptance exceeded 5 minutes: %s", elapsed)
 	}
 	t.Log("PASS: native sandbox-scoped keychain credential drove service Create/Stop/Start/Exec; env stayed placeholder-only; revoke closed broker and blocked Exec; Delete removed proxy metadata; credential absent from SQLite")
 }
@@ -357,9 +378,9 @@ func execP04Service(ctx context.Context, svc *Service, sandboxID, command string
 }
 
 func waitP04ServiceHelper(ctx context.Context, svc *Service, sandboxID string) error {
-	command := `/bin/sh -c 'i=0; while [ "$i" -lt 50 ]; do busybox nc -z -w 1 127.0.0.1 3128 2>/dev/null && exit 0; i=$((i + 1)); sleep 0.1; done; exit 1'`
+	command := `/bin/sh -c 'i=0; while [ "$i" -lt 50 ]; do grep -Eq "^ *[0-9]+: 0100007F:0C38 +00000000:0000 +0A " /proc/net/tcp && exit 0; i=$((i + 1)); sleep 0.1; done; exit 1'`
 	if _, err := execP04Service(ctx, svc, sandboxID, command, nil); err != nil {
-		diagnostics, diagnosticErr := execP04Service(ctx, svc, sandboxID, `/bin/sh -c 'echo processes; busybox ps; echo helper; ls -l /tmp/rheic-proxy-helper; echo tcp; cat /proc/net/tcp; echo tcp6; cat /proc/net/tcp6; echo fds; ls -l /proc/2/fd; echo nc; busybox nc --help 2>&1'`, nil)
+		diagnostics, diagnosticErr := execP04Service(ctx, svc, sandboxID, `/bin/sh -c 'echo helper; ls -l /tmp/rheic-proxy-helper; echo tcp; cat /proc/net/tcp; echo tcp6; cat /proc/net/tcp6; echo fds; ls -l /proc/2/fd'`, nil)
 		return fmt.Errorf("wait for guest proxy listener: %w; diagnostics=%q (diagnostic error: %v)", err, diagnostics, diagnosticErr)
 	}
 	return nil

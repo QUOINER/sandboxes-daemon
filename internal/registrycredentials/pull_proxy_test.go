@@ -657,15 +657,18 @@ func TestConfiguredRegistryConnectAndRealmAllowlist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	authority.AllowHosts("registry.private.test", "auth.private.test", "cdn.private.test")
+	authority.AllowHosts("registry.private.test", "auth.private.test", "auth-alt.private.test", "cdn.private.test")
 	proxy := &PullProxy{
-		authority:     "registry.private.test",
-		realms:        []registryauth.Realm{{Host: "auth.private.test", Path: "/token"}},
+		authority: "registry.private.test",
+		realms: []registryauth.Realm{
+			{Host: "auth.private.test", Path: "/token"},
+			{Host: "auth-alt.private.test", Path: "/oauth/token"},
+		},
 		redirectHosts: map[string]struct{}{"cdn.private.test": {}},
 		tlsAuthority:  authority,
 		tunnelSlots:   make(chan struct{}, 8),
 	}
-	for _, host := range []string{"registry.private.test", "auth.private.test", "cdn.private.test"} {
+	for _, host := range []string{"registry.private.test", "auth.private.test", "auth-alt.private.test", "cdn.private.test"} {
 		if !proxy.allowedConnectHost(host) {
 			t.Fatalf("configured host %q was rejected", host)
 		}
@@ -675,6 +678,12 @@ func TestConfiguredRegistryConnectAndRealmAllowlist(t *testing.T) {
 	}
 	if realm, ok := proxy.authRealm("AUTH.private.test."); !ok || realm.Path != "/token" {
 		t.Fatalf("realm lookup = %+v, %v", realm, ok)
+	}
+	if realm, ok := proxy.realmForPath("auth-alt.private.test", "/oauth/token"); !ok || realm.Path != "/oauth/token" {
+		t.Fatalf("second realm lookup = %+v, %v", realm, ok)
+	}
+	if _, ok := proxy.realmForPath("auth-alt.private.test", "/token"); ok {
+		t.Fatal("second realm accepted the first realm's token path")
 	}
 	if _, err := authority.Leaf("registry.private.test", time.Now()); err != nil {
 		t.Fatalf("configured host leaf: %v", err)
