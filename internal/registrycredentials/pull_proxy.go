@@ -41,6 +41,9 @@ type PullProxy struct {
 	uploads           map[string]uploadSession
 	blobRedirects     map[string]blobRedirectSession
 	redirectHosts     map[string]struct{}
+	challenges        map[string]realmGrant
+	challengeMu       sync.Mutex
+	privateRegistry   bool
 }
 
 type tokenGrant struct {
@@ -64,6 +67,22 @@ type blobRedirectSession struct {
 	usesLeft  int
 	expiresAt time.Time
 }
+
+// realmGrant binds a repository to the token realm advertised by the trusted
+// upstream registry. The guest never needs to reach that realm: the broker
+// exposes a synthetic token endpoint on the registry authority.
+type realmGrant struct {
+	realm     registryauth.Realm
+	expiresAt time.Time
+}
+
+const maxCachedRealms = 256
+
+// brokerTokenPath is the guest-visible token endpoint on the configured
+// registry authority. It is a fixed protocol path, not a credential.
+const brokerTokenPath = "/__rheic/registry-token" //nolint:gosec // fixed protocol path, not a credential.
+
+var forwardedPullHeaders = []string{"Accept", "Range", "If-None-Match", "If-Modified-Since"}
 
 // PullProxyTransportFactory creates host-only HTTPS transports for the
 // configured registry and a realm already accepted by the trusted allowlist.
@@ -90,6 +109,10 @@ type PullProxyConfig struct {
 	Limiter           *PullLimiter
 	MaxBytes          int64
 	TLSAuthority      *ProxyAuthority
+	// PrivateRegistry selects the configured-private-registry flow: the real
+	// Bearer realm stays host-side and allowlisted redirects are followed by
+	// the broker. Docker Hub keeps its established guest-visible flow.
+	PrivateRegistry bool
 	// RedirectAuthorities are the exact hostnames allowed to serve registry
 	// blob redirects. Empty uses the Docker Hub CDN default only for Docker Hub.
 	RedirectAuthorities []string
@@ -126,7 +149,8 @@ func NewPullProxy(store *Store, cfg PullProxyConfig) (*PullProxy, error) {
 		tokenTransport: cfg.TokenTransport, transportFactory: cfg.TransportFactory, limiter: cfg.Limiter,
 		maxBytes: cfg.MaxBytes, inflight: make(chan struct{}, 4), tlsAuthority: cfg.TLSAuthority,
 		tunnelSlots: make(chan struct{}, 8), tokens: make(map[string]tokenGrant), uploads: make(map[string]uploadSession),
-		blobRedirects: make(map[string]blobRedirectSession), redirectHosts: redirectHosts}, nil
+		blobRedirects: make(map[string]blobRedirectSession), redirectHosts: redirectHosts, challenges: make(map[string]realmGrant),
+		privateRegistry: cfg.PrivateRegistry}, nil
 }
 
 func configuredRedirectHosts(authority string, authorities []string) (map[string]struct{}, error) {
@@ -430,7 +454,7 @@ func (p *PullProxy) registryRequest(ctx context.Context, client *http.Client, in
 	if err != nil {
 		return nil, fmt.Errorf("build registry request: %w", err)
 	}
-	for _, key := range []string{"Accept", "Range", "If-None-Match", "If-Modified-Since"} {
+	for _, key := range forwardedPullHeaders {
 		for _, value := range incoming.Header.Values(key) {
 			req.Header.Add(key, value)
 		}

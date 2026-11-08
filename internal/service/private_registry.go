@@ -301,7 +301,7 @@ func (s *Service) buildPrivateRegistryProxy(ctx context.Context, sb sandbox.Sand
 			service: s, sandboxID: sb.ID, host: s.privateRegistryHost,
 			realms: s.privateRegistryRealms, redirects: s.privateRegistryRedirects, roots: s.privateRegistryRoots,
 		},
-		Limiter: s.registryPullLimiter, MaxBytes: 16 << 30, TLSAuthority: ca,
+		Limiter: s.registryPullLimiter, MaxBytes: 16 << 30, TLSAuthority: ca, PrivateRegistry: true,
 	})
 	if err != nil {
 		return secretproxy.RouteConfig{}, "", fmt.Errorf("configure private registry broker: %w", err)
