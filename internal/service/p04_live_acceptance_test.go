@@ -196,6 +196,11 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 	proxies := secretproxy.New()
 	svc := New(state, backend)
 	svc.DefaultImage = inputs.image
+	svc.DockerVolumeDir = filepath.Join(root, "docker-volumes")
+	if err := os.Mkdir(svc.DockerVolumeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	svc.DockerVolumeSize = "512m"
 	svc.SetServiceSecretStore(serviceSecrets)
 	svc.SetSecretProxyManager(proxies)
 	proxyRoot := filepath.Join(root, "proxy")
