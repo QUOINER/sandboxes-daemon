@@ -1,3 +1,5 @@
+//go:build !windows
+
 package main
 
 import (
@@ -12,7 +14,6 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
-	goruntime "runtime"
 	"testing"
 	"time"
 
@@ -30,7 +31,7 @@ func TestGenerateAndSignPolicyOffline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if goruntime.GOOS != "windows" && privateInfo.Mode().Perm() != 0o600 {
+	if privateInfo.Mode().Perm() != 0o600 {
 		t.Fatalf("private key permissions=%#o, want 0600", privateInfo.Mode().Perm())
 	}
 	privateKey, err := os.ReadFile(privatePath)
@@ -115,12 +116,10 @@ func TestLoadTLSCertificateRequiresPrivateKeyPermissions(t *testing.T) {
 	if _, err := loadTLSCertificate(certificatePath, keyPath); err != nil {
 		t.Fatalf("secure certificate pair rejected: %v", err)
 	}
-	if goruntime.GOOS != "windows" {
-		if err := os.Chmod(keyPath, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := loadTLSCertificate(certificatePath, keyPath); err == nil {
-			t.Fatal("TLS private key with group/world permissions was accepted")
-		}
+	if err := os.Chmod(keyPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadTLSCertificate(certificatePath, keyPath); err == nil {
+		t.Fatal("TLS private key with group/world permissions was accepted")
 	}
 }
