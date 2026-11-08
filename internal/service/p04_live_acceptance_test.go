@@ -198,6 +198,7 @@ func TestP04ServiceCreateStartExecRevokeAgainstOwnedVM(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc.DockerVolumeSize = "512m"
+	svc.MkfsExt4 = "mkfs.ext4"
 	svc.SetServiceSecretStore(serviceSecrets)
 	svc.SetSecretProxyManager(proxies)
 	proxyRoot := filepath.Join(root, "proxy")
