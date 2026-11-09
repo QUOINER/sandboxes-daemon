@@ -753,6 +753,9 @@ func validateStoredRemoteServer(s Server) error {
 	if s.Command != "" || s.URL == "" || s.ExecutableSHA256 != "" {
 		return errors.New("invalid remote MCP registry entry")
 	}
+	if _, _, err := validateRemoteURL(s.URL, func(string) bool { return true }); err != nil {
+		return errors.New("invalid remote MCP registry entry")
+	}
 	if _, err := copiedRemoteHeaders(s.Headers, s.SecretHeaders); err != nil {
 		return errors.New("invalid remote MCP registry entry")
 	}

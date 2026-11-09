@@ -5,6 +5,7 @@
 - Reject all static remote MCP headers and require host-vault placeholders for every header value.
 - Migrate schema-v2 registry rows and managed backups to schema v3, removing static values before serving RPC.
 - Update the sandboxes-api module dependency to v0.0.24.
+- Bind vault header injection to the approved HTTPS host and port; validate stored remote URL syntax before serving.
 
 ## v0.0.49 — 2026-11-08
 - Bind M7 release and image publication approval to the exact reviewed commit.

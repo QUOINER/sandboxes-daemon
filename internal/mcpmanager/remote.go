@@ -359,17 +359,30 @@ func remoteServerHost(rawURL string) (string, error) {
 	return parsed.Hostname(), nil
 }
 
+func remoteServerOrigin(rawURL string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Hostname() == "" {
+		return "", errors.New("invalid remote MCP server URL")
+	}
+	port := parsed.Port()
+	if port == "" {
+		port = "443"
+	}
+	return strings.ToLower(parsed.Hostname()) + ":" + port, nil
+}
+
 // headerTransport injects host-vault-backed registered headers.
 type headerTransport struct {
 	base          http.RoundTripper
 	secretHeaders map[string]string
 	server        string
 	host          string
+	origin        string
 	resolve       RemoteSecretResolver
 }
 
 func (t headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL == nil || !strings.EqualFold(req.URL.Scheme, "https") || !strings.EqualFold(req.URL.Hostname(), t.host) {
+	if req.URL == nil || !strings.EqualFold(req.URL.Scheme, "https") || !strings.EqualFold(req.URL.Hostname(), t.host) || requestOrigin(req.URL) != t.origin {
 		return nil, errors.New("remote MCP request escaped its approved origin")
 	}
 	cloned := req.Clone(req.Context())
@@ -379,6 +392,14 @@ func (t headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 	return t.base.RoundTrip(cloned)
+}
+
+func requestOrigin(endpoint *url.URL) string {
+	port := endpoint.Port()
+	if port == "" {
+		port = "443"
+	}
+	return strings.ToLower(endpoint.Hostname()) + ":" + port
 }
 
 func (t headerTransport) applyHeader(ctx context.Context, req *http.Request, key, value string) error {
@@ -428,6 +449,10 @@ func (m *Manager) startRemoteSession(ctx context.Context, server Server) (*manag
 	if err != nil {
 		return nil, errors.New("remote MCP server configuration is invalid")
 	}
+	serverOrigin, err := remoteServerOrigin(server.URL)
+	if err != nil {
+		return nil, errors.New("remote MCP server configuration is invalid")
+	}
 	if tlsConfig == nil {
 		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	} else {
@@ -447,7 +472,7 @@ func (m *Manager) startRemoteSession(ctx context.Context, server Server) (*manag
 	}
 	var roundTripper http.RoundTripper = transport
 	if len(server.Headers)+len(server.SecretHeaders) > 0 {
-		roundTripper = headerTransport{base: transport, secretHeaders: server.SecretHeaders, server: server.Name, host: serverHost, resolve: secretResolver}
+		roundTripper = headerTransport{base: transport, secretHeaders: server.SecretHeaders, server: server.Name, host: serverHost, origin: serverOrigin, resolve: secretResolver}
 	}
 	client := &http.Client{Transport: roundTripper, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	stream := &mcp.StreamableClientTransport{

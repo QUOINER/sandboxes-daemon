@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -83,6 +84,35 @@ func TestPrepareRemoteServerFailsClosed(t *testing.T) {
 	if server.SecretHeaders["X-Team"] != "${team}" {
 		t.Fatalf("secret headers = %+v", server.SecretHeaders)
 	}
+}
+
+func TestHeaderTransportBindsSecretsToApprovedPort(t *testing.T) {
+	transport := headerTransport{base: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody}, nil
+	}), host: "mcp.example.test", origin: "mcp.example.test:443"}
+	for _, rawURL := range []string{"https://mcp.example.test/mcp", "https://mcp.example.test:443/mcp"} {
+		endpoint, err := url.Parse(rawURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := transport.RoundTrip(&http.Request{URL: endpoint, Header: make(http.Header)}); err != nil {
+			t.Fatalf("approved origin %q rejected: %v", rawURL, err)
+		}
+	}
+	endpoint, err := url.Parse("https://mcp.example.test:444/mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = transport.RoundTrip(&http.Request{URL: endpoint, Header: make(http.Header)})
+	if err == nil || !strings.Contains(err.Error(), "escaped its approved origin") {
+		t.Fatalf("alternate-port request error = %v", err)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }
 
 type approvingProvider struct {
