@@ -68,7 +68,6 @@ jobs:
     needs: m7_approval
     runs-on: ubuntu-24.04
     permissions:
-      actions: write
       contents: write
     env:
       VERSION: ${{ inputs.version }}
@@ -102,7 +101,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/dispatches" -f "ref=$TAG"
-          if [[ "$GITHUB_REPOSITORY" == rheic/sandboxes-daemon || "$GITHUB_REPOSITORY" == rheic/sandboxes-cli ]]; then
-            gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/dispatches" \
-              -f "ref=$tag"
-          fi
+

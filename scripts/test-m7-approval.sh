@@ -50,10 +50,13 @@ grep -Fq 'GH_TOKEN: ${{ github.token }}' <<<"$create_tag_job"
 grep -Fq '      actions: write' <<<"$create_tag_job"
 grep -Fq '[[ "$GITHUB_REF" == "refs/heads/main" ]]' <<<"$create_tag_job"
 grep -Fq '[[ "$GITHUB_WORKFLOW_SHA" == "$GITHUB_SHA" ]]' <<<"$create_tag_job"
+grep -Fq '[[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]' <<<"$create_tag_job"
 grep -Fq 'ref=refs/tags/$tag' <<<"$create_tag_job"
 grep -Fq 'object=$GITHUB_SHA' <<<"$create_tag_job"
-grep -Fq 'actions/workflows/release.yml/dispatches' <<<"$create_tag_job"
+grep -Fq 'sha=$tag_object' <<<"$create_tag_job"
 grep -Fq 'GH_TOKEN: ${{ github.token }}' <<<"$create_tag_job"
+! grep -Fq 'actions/checkout' <<<"$create_tag_job"
+! grep -Fq 'scripts/' <<<"$create_tag_job"
 [[ "$(grep -Fc 'contents: write' "$workflow")" -eq 1 ]]
 if grep -Eq -- '--force|--force-with-lease' <<<"$create_tag_job"; then
   printf 'release tag workflow must never force-update refs\n' >&2
