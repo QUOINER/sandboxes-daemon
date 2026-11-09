@@ -7,3 +7,4 @@
 - Include the normalized remote destination and value-free header scope (name, `static` or `host-vault` class, and vault placeholder identifiers) in trusted MCP registration and call approvals. Header values and resolved secrets are never exposed to the approval provider; pending calls are invalidated if the destination or header configuration changes during approval.
 - Align API, gateway and runtime dependencies with the latest released modules, including the IPv6 RA refresh fix in runtime v0.0.29.
 - Update host keyring and SQLite dependencies to their latest compatible releases.
+- Update golang.org/x/sys from v0.49.0 to v0.50.0.
