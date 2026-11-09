@@ -23,6 +23,7 @@ func prepareDaemonStateDirectory(path string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.New("daemon state path must be a directory, not a symlink")
 	}
+	//nolint:gosec // This is a directory verified by Lstat above; 0700 keeps daemon state private.
 	if err := os.Chmod(path, 0o700); err != nil {
 		return fmt.Errorf("restrict daemon state directory permissions: %w", err)
 	}
