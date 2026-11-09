@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -40,6 +41,10 @@ func (m *Manager) SetRemoteAllowlist(hosts []string) {
 func (m *Manager) remoteHostAllowed(host string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.remoteHostAllowedLocked(host)
+}
+
+func (m *Manager) remoteHostAllowedLocked(host string) bool {
 	if len(m.remoteHosts) == 0 {
 		return false
 	}
@@ -183,6 +188,66 @@ func validateRemoteURL(rawURL string, allowed func(string) bool) (host, cleanURL
 		clean.Host = strings.ToLower(clean.Host)
 	}
 	return strings.ToLower(host), clean.String(), nil
+}
+
+// approvalScope returns value-free approval metadata for a server. Remote
+// destinations are normalized to lowercase host plus an explicit port. Header
+// values and resolved secrets never enter the result.
+func approvalScope(server Server) (string, []ApprovalHeader, error) {
+	if server.Transport != transportRemote {
+		return "", nil, nil
+	}
+	destination, err := normalizeRemoteApprovalURL(server.URL)
+	if err != nil {
+		return "", nil, errors.New("MCP server URL is invalid")
+	}
+	headers := make([]ApprovalHeader, 0, len(server.Headers)+len(server.SecretHeaders))
+	for name := range server.Headers {
+		headers = append(headers, ApprovalHeader{Name: name, ValueClass: ApprovalHeaderStatic})
+	}
+	for name, template := range server.SecretHeaders {
+		refs, err := parseMCPHeaderReferences(template)
+		if err != nil || len(refs) == 0 {
+			return "", nil, errors.New("MCP server header configuration is invalid")
+		}
+		headers = append(headers, ApprovalHeader{
+			Name:       name,
+			ValueClass: ApprovalHeaderHostVault,
+			References: uniqueSorted(refs),
+		})
+	}
+	slices.SortFunc(headers, func(left, right ApprovalHeader) int {
+		return strings.Compare(strings.ToLower(left.Name), strings.ToLower(right.Name))
+	})
+	return destination, headers, nil
+}
+
+func normalizeRemoteApprovalURL(rawURL string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.User != nil || parsed.Hostname() == "" {
+		return "", errors.New("invalid remote MCP server URL")
+	}
+	clean := *parsed
+	clean.Scheme = "https"
+	port := clean.Port()
+	if port == "" {
+		port = "443"
+	}
+	clean.Host = net.JoinHostPort(strings.ToLower(clean.Hostname()), port)
+	return clean.String(), nil
+}
+
+func uniqueSorted(values []string) []string {
+	unique := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		unique[value] = struct{}{}
+	}
+	result := make([]string, 0, len(unique))
+	for value := range unique {
+		result = append(result, value)
+	}
+	slices.Sort(result)
+	return result
 }
 
 // copiedRemoteHeaders validates static headers and non-secret ${name}

@@ -69,6 +69,32 @@ daemon rejects literal values; only `${placeholder}` references are persisted
 and resolved at request time. Remote hosts still require exact allowlist
 entries, and redirects are refused.
 
+Trusted registration and per-call approvals receive the normalized remote
+destination and a value-free header scope: each header name, its `static` or
+`host-vault` class, and any vault placeholder identifiers. Header values and
+resolved secrets are never passed to the approval provider. A call approval is
+invalidated if the destination or header configuration changes before
+execution.
+
+### Remote MCP upgrade migration
+
+v0.0.49 versions the persisted MCP registry and performs a one-way forward
+migration during daemon startup, before any RPC is accepted. Every remote
+server entry written by an older daemon loses its static `headers` map. The
+daemon cannot tell a benign static value from a credential saved by an older
+release, so it removes the whole legacy map rather than guessing. Server names,
+URLs, transports, stdio entries, host-vault `secret_headers` placeholder
+templates and all unrelated settings are preserved. The same legacy static
+`headers` are scrubbed in place from existing pre-upgrade
+`.pre-v<version>-*.bak` database backups beside the active database; backups are
+never deleted and unrelated backup settings or rows are untouched. If the
+sanitized registry, the schema marker or any relevant backup cannot be written,
+startup fails closed. Re-register the server to restore any static headers that
+are still needed; legacy values are not logged, displayed or recoverable. After
+migration the registry is schema v2, so benign static headers registered by
+this or later daemons are retained on subsequent startups. See
+[docs/MCP-MIGRATION.md](docs/MCP-MIGRATION.md).
+
 Service proxy references require the matching static guest helper artifact.
 Build it with `make build-proxy-helper` and pass
 `--proxy-helper ./bin/rheic-proxy-helper-linux-arm64` to `sandboxesd`. The

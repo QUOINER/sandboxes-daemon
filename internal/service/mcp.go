@@ -33,6 +33,17 @@ func (s *Service) mcpRegistry(ctx context.Context) (*mcpmanager.Manager, error) 
 	return manager, nil
 }
 
+// InitializeMCPRegistry loads the persisted MCP registry, applies the forward
+// schema migration, and scrubs legacy static headers from pre-upgrade database
+// backups before the daemon accepts RPCs. A failure aborts startup instead of
+// serving or retaining un-migrated legacy headers.
+func (s *Service) InitializeMCPRegistry(ctx context.Context) error {
+	if _, err := s.mcpRegistry(ctx); err != nil {
+		return err
+	}
+	return s.store.SanitizeBackupSetting(ctx, mcpmanager.RegistrySettingKey, mcpmanager.SanitizeRegistrySetting)
+}
+
 // SetMCPRemoteAllowlist installs the explicit host administrator policy used
 // by remote MCP. An empty list keeps remote registration disabled.
 func (s *Service) SetMCPRemoteAllowlist(hosts []string) {

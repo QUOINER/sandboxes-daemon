@@ -163,8 +163,8 @@ func TestLegacyRemoteHeadersFailClosedWithoutTrustedProvider(t *testing.T) {
 		t.Fatal("legacy remote headers reached the transport without trusted approval")
 	}
 	stored, err := state.GetSetting(ctx, "mcp_stdio_servers_v1")
-	if err != nil || !strings.Contains(stored, "legacy-synthetic") {
-		t.Fatalf("test unexpectedly changed legacy registry state: stored=%q err=%v", stored, err)
+	if err != nil || strings.Contains(stored, "legacy-synthetic") || !strings.Contains(stored, `"legacy"`) {
+		t.Fatalf("legacy static header was not migrated or record was lost: stored=%q err=%v", stored, err)
 	}
 }
 

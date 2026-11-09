@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +42,22 @@ const (
 	callTimeout           = 30 * time.Second
 	challengeRegistration = "register"
 	challengeToolCall     = "call"
+
+	registrySettingKey       = "mcp_stdio_servers_v1"
+	registrySchemaSettingKey = "mcp_registry_schema_version"
+	registrySchemaLegacy     = 1
+	registrySchemaCurrent    = 2
+
+	// ApprovalHeaderStatic marks a header whose configured value is stored as
+	// non-secret static configuration.
+	ApprovalHeaderStatic = "static"
+	// ApprovalHeaderHostVault marks a header template resolved from the host
+	// vault at request time.
+	ApprovalHeaderHostVault = "host-vault"
 )
+
+// RegistrySettingKey names the persisted MCP registry setting.
+const RegistrySettingKey = registrySettingKey
 
 var namePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
 
@@ -60,16 +76,29 @@ type ApprovalProvider interface {
 }
 
 type ApprovalRequest struct {
-	Action            string
-	ServerName        string
-	Command           string
-	URL               string
+	Action     string
+	ServerName string
+	Command    string
+	// URL is the normalized remote destination. It is empty for stdio servers.
+	URL string
+	// Headers describes remote header names and value classes without values.
+	// References contains only host-vault placeholder identifiers.
+	Headers           []ApprovalHeader
 	ArgumentCount     int
 	Directory         string
 	SandboxID         string
 	ToolName          string
 	ToolArgumentKeys  []string
 	ToolArgumentBytes int
+}
+
+// ApprovalHeader is value-free scope metadata for one remote MCP header.
+// Static headers carry no references; host-vault headers list the vault
+// placeholder identifiers that will be resolved after approval.
+type ApprovalHeader struct {
+	Name       string
+	ValueClass string
+	References []string
 }
 type Server struct {
 	Name             string   `json:"name"`
@@ -145,22 +174,9 @@ type managedSession struct {
 
 func New(ctx context.Context, state State) (*Manager, error) {
 	m := &Manager{state: state, now: time.Now, servers: make(map[string]Server), pending: make(map[string]challenge), sessions: make(map[string]*managedSession), starting: make(map[string]chan struct{})}
-	raw, err := state.GetSetting(ctx, "mcp_stdio_servers_v1")
-	if errors.Is(err, core.ErrNotFound) {
-		err = nil
-	}
+	items, err := loadRegistry(ctx, state)
 	if err != nil {
 		return nil, err
-	}
-	if len(raw) > maxRegistryBytes {
-		return nil, errors.New("MCP registry exceeds the storage limit")
-	}
-	if raw == "" {
-		return m, nil
-	}
-	var items []Server
-	if err := json.Unmarshal([]byte(raw), &items); err != nil {
-		return nil, errors.New("MCP registry state is invalid")
 	}
 	if len(items) > maxServers {
 		return nil, errors.New("MCP registry exceeds the server limit")
@@ -175,6 +191,108 @@ func New(ctx context.Context, state State) (*Manager, error) {
 		m.servers[items[i].Name] = items[i]
 	}
 	return m, nil
+}
+
+// loadRegistry applies the forward-only registry schema migration before any
+// RPC is served. Legacy remote records lose their static Headers because the
+// daemon cannot determine whether an old value is a credential. All other
+// record fields and settings are preserved. The sanitized registry is written
+// before the schema marker; failure aborts startup (fail closed).
+func loadRegistry(ctx context.Context, state State) ([]Server, error) {
+	raw, err := state.GetSetting(ctx, registrySettingKey)
+	if errors.Is(err, core.ErrNotFound) {
+		err = nil
+		raw = ""
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxRegistryBytes {
+		return nil, errors.New("MCP registry exceeds the storage limit")
+	}
+	var items []Server
+	if raw != "" {
+		if err := json.Unmarshal([]byte(raw), &items); err != nil {
+			return nil, errors.New("MCP registry state is invalid")
+		}
+	}
+	schema, err := registrySchemaVersion(ctx, state)
+	if err != nil {
+		return nil, err
+	}
+	if schema > registrySchemaCurrent {
+		return nil, errors.New("MCP registry schema is newer than this daemon supports")
+	}
+	if schema == registrySchemaCurrent {
+		return items, nil
+	}
+	if migrateLegacyRemoteHeaders(items) && raw != "" {
+		sanitized, err := json.Marshal(items)
+		if err != nil {
+			return nil, errors.New("MCP registry migration failed")
+		}
+		if err := state.SetSetting(ctx, registrySettingKey, string(sanitized)); err != nil {
+			return nil, errors.New("MCP registry migration could not be persisted")
+		}
+	}
+	if err := state.SetSetting(ctx, registrySchemaSettingKey, strconv.Itoa(registrySchemaCurrent)); err != nil {
+		return nil, errors.New("MCP registry schema could not be persisted")
+	}
+	return items, nil
+}
+
+func registrySchemaVersion(ctx context.Context, state State) (int, error) {
+	raw, err := state.GetSetting(ctx, registrySchemaSettingKey)
+	if errors.Is(err, core.ErrNotFound) {
+		return registrySchemaLegacy, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if strings.TrimSpace(raw) == "" {
+		return registrySchemaLegacy, nil
+	}
+	schemaVersion, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || schemaVersion < registrySchemaLegacy {
+		return 0, errors.New("MCP registry schema is invalid")
+	}
+	return schemaVersion, nil
+}
+
+// migrateLegacyRemoteHeaders removes every legacy static header map from
+// remote records. Header names and values are deliberately not logged.
+func migrateLegacyRemoteHeaders(items []Server) bool {
+	changed := false
+	for index := range items {
+		if items[index].Transport != transportRemote || len(items[index].Headers) == 0 {
+			continue
+		}
+		items[index].Headers = nil
+		changed = true
+	}
+	return changed
+}
+
+// SanitizeRegistrySetting removes legacy remote static Headers from a
+// serialized registry value. It is used for pre-upgrade database backups,
+// never logs or returns header names/values, and leaves already-sanitized data
+// byte-identical.
+func SanitizeRegistrySetting(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return raw, nil
+	}
+	var items []Server
+	if err := json.Unmarshal([]byte(raw), &items); err != nil {
+		return "", errors.New("MCP registry backup state is invalid")
+	}
+	if !migrateLegacyRemoteHeaders(items) {
+		return raw, nil
+	}
+	sanitized, err := json.Marshal(items)
+	if err != nil {
+		return "", errors.New("MCP registry backup migration failed")
+	}
+	return string(sanitized), nil
 }
 
 func (m *Manager) Register(ctx context.Context, name, command string, args []string, dir string) (string, error) {
@@ -214,7 +332,7 @@ func (m *Manager) registerPrepared(ctx context.Context, server Server) (string, 
 	if err != nil {
 		return "", err
 	}
-	m.pending[id] = challenge{kind: challengeRegistration, expires: m.now().Add(challengeTTL), server: server}
+	m.pending[id] = challenge{kind: challengeRegistration, expires: m.now().Add(challengeTTL), server: cloneServer(server)}
 	return id, nil
 }
 func (m *Manager) ApproveRegistration(ctx context.Context, id string) (*Summary, error) {
@@ -239,7 +357,11 @@ func (m *Manager) ApproveRegistration(ctx context.Context, id string) (*Summary,
 	if approver == nil {
 		return nil, errors.New("trusted MCP host approval provider is unavailable")
 	}
-	if err := approver.Approve(ctx, ApprovalRequest{Action: "register", ServerName: p.server.Name, Command: p.server.Command, URL: p.server.URL, ArgumentCount: len(p.server.Arguments), Directory: p.server.Directory}); err != nil {
+	destination, headers, err := approvalScope(p.server)
+	if err != nil {
+		return nil, err
+	}
+	if err := approver.Approve(ctx, ApprovalRequest{Action: "register", ServerName: p.server.Name, Command: p.server.Command, URL: destination, Headers: headers, ArgumentCount: len(p.server.Arguments), Directory: p.server.Directory}); err != nil {
 		return nil, errors.New("MCP registration was denied or trusted approval failed")
 	}
 	if err := m.verifyServer(p.server); err != nil {
@@ -256,7 +378,7 @@ func (m *Manager) ApproveRegistration(ctx context.Context, id string) (*Summary,
 	if len(m.servers) >= maxServers {
 		return nil, errors.New("MCP registry is at capacity")
 	}
-	m.servers[p.server.Name] = p.server
+	m.servers[p.server.Name] = cloneServer(p.server)
 	if err := m.persist(ctx); err != nil {
 		delete(m.servers, p.server.Name)
 		return nil, err
@@ -329,7 +451,7 @@ func (m *Manager) RequestCall(sandbox, server, tool string, raw json.RawMessage)
 	if err != nil {
 		return "", err
 	}
-	m.pending[id] = challenge{kind: challengeToolCall, expires: m.now().Add(challengeTTL), server: cfg, sandbox: sandbox, tool: tool, arguments: append(json.RawMessage(nil), raw...)}
+	m.pending[id] = challenge{kind: challengeToolCall, expires: m.now().Add(challengeTTL), server: cloneServer(cfg), sandbox: sandbox, tool: tool, arguments: append(json.RawMessage(nil), raw...)}
 	return id, nil
 }
 func (m *Manager) ApproveCall(ctx context.Context, id string, validateSandbox func(context.Context, string) error) (json.RawMessage, error) {
@@ -361,22 +483,47 @@ func (m *Manager) ApproveCall(ctx context.Context, id string, validateSandbox fu
 	if approver == nil {
 		return nil, errors.New("trusted MCP host approval provider is unavailable")
 	}
-	argumentKeys, err := jsonObjectKeys(p.arguments)
-	if err != nil {
-		return nil, errors.New("MCP tool arguments are invalid")
-	}
-	if err := approver.Approve(ctx, ApprovalRequest{
-		Action: "call", ServerName: p.server.Name, Command: p.server.Command,
-		ArgumentCount: len(p.server.Arguments), Directory: p.server.Directory,
-		SandboxID: p.sandbox, ToolName: p.tool, ToolArgumentKeys: argumentKeys,
-		ToolArgumentBytes: len(p.arguments),
-	}); err != nil {
-		return nil, errors.New("MCP tool call was denied or trusted approval failed")
+	if err := m.approveCallScope(ctx, p, approver); err != nil {
+		return nil, err
 	}
 	if err := validateSandbox(ctx, p.sandbox); err != nil {
 		return nil, errors.New("sandbox is no longer available for MCP")
 	}
 	return m.execute(ctx, p.server, p.tool, p.arguments)
+}
+
+// approveCallScope presents the exact call scope to the trusted provider and
+// revalidates it after the provider returns. The check binds approval to the
+// destination and header configuration captured at challenge creation.
+func (m *Manager) approveCallScope(ctx context.Context, p challenge, approver ApprovalProvider) error {
+	argumentKeys, err := jsonObjectKeys(p.arguments)
+	if err != nil {
+		return errors.New("MCP tool arguments are invalid")
+	}
+	destination, headers, err := approvalScope(p.server)
+	if err != nil {
+		return err
+	}
+	if err := approver.Approve(ctx, ApprovalRequest{
+		Action: "call", ServerName: p.server.Name, Command: p.server.Command,
+		URL: destination, Headers: headers,
+		ArgumentCount: len(p.server.Arguments), Directory: p.server.Directory,
+		SandboxID: p.sandbox, ToolName: p.tool, ToolArgumentKeys: argumentKeys,
+		ToolArgumentBytes: len(p.arguments),
+	}); err != nil {
+		return errors.New("MCP tool call was denied or trusted approval failed")
+	}
+	if m.serverRegistrationChanged(p.server) {
+		return errors.New("MCP server registration changed after approval")
+	}
+	return m.verifyServer(p.server)
+}
+
+func (m *Manager) serverRegistrationChanged(server Server) bool {
+	m.mu.Lock()
+	current, registered := m.servers[server.Name]
+	m.mu.Unlock()
+	return !registered || !sameServer(current, server)
 }
 
 func jsonObjectKeys(raw json.RawMessage) ([]string, error) {
@@ -422,6 +569,15 @@ func sameServer(left, right Server) bool {
 	return left.Name == right.Name && left.Transport == right.Transport && left.Command == right.Command && left.Directory == right.Directory &&
 		left.ExecutableSHA256 == right.ExecutableSHA256 && left.URL == right.URL &&
 		slices.Equal(left.Arguments, right.Arguments) && maps.Equal(left.Headers, right.Headers) && maps.Equal(left.SecretHeaders, right.SecretHeaders)
+}
+
+// cloneServer takes a deep snapshot of mutable server fields so a pending
+// challenge cannot alias the live registry through a shared map or slice.
+func cloneServer(server Server) Server {
+	server.Arguments = slices.Clone(server.Arguments)
+	server.Headers = maps.Clone(server.Headers)
+	server.SecretHeaders = maps.Clone(server.SecretHeaders)
+	return server
 }
 func (m *Manager) expireLocked() {
 	now := m.now()
@@ -550,17 +706,11 @@ func validateStoredServer(s Server) error {
 }
 
 func validateStoredRemoteServer(s Server) error {
-	if s.Command != "" || s.URL == "" || len(s.Headers)+len(s.SecretHeaders) > 16 || s.ExecutableSHA256 != "" {
+	if s.Command != "" || s.URL == "" || s.ExecutableSHA256 != "" {
 		return errors.New("invalid remote MCP registry entry")
 	}
-	for key, value := range s.SecretHeaders {
-		if strings.TrimSpace(key) == "" || strings.ContainsAny(key, "\r\n:\x00") || strings.ContainsAny(value, "\r\n\x00") {
-			return errors.New("invalid remote MCP registry entry")
-		}
-		refs, err := parseMCPHeaderReferences(value)
-		if err != nil || len(refs) == 0 {
-			return errors.New("invalid remote MCP registry entry")
-		}
+	if _, _, err := copiedRemoteHeaders(s.Headers, s.SecretHeaders); err != nil {
+		return errors.New("invalid remote MCP registry entry")
 	}
 	return nil
 }
@@ -842,7 +992,7 @@ func serverTransport(s Server) string {
 func (m *Manager) serverUsableLocked(s Server) bool {
 	if s.Transport == transportRemote {
 		host, err := remoteServerHost(s.URL)
-		return err == nil && m.remoteHostAllowed(host)
+		return err == nil && m.remoteHostAllowedLocked(host)
 	}
 	return executableAvailable(s)
 }
