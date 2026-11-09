@@ -93,7 +93,7 @@ github.com/prometheus/procfs v0.21.1 h1:GljZCt+zSTS+NZq88cyQ1LjZ+RCHp3uVuabBWA5+
 github.com/prometheus/procfs v0.21.1/go.mod h1:aB55Cww9pdSJVHk0hUf0inxWyyjPogFIjmHKYgMKmtY=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
-github.com/rheic/sandboxes-api v0.0.24 h1:hbWPHVc4z9p6PrinwVKN++WNt0hNDfhHfFfKbBkraYE=
+github.com/rheic/sandboxes-api v0.0.24 h1:WVgpQIuzqOqPwpxIdatnVEr1bJrz9Z1NY92bCE4R9As=
 github.com/rheic/sandboxes-api v0.0.24/go.mod h1:R3Hvfvl1WzUaK2f1GVJv7AdPKw5JgHFPqsiWaQYNl94=
 github.com/rheic/sandboxes-core v0.0.11 h1:TIox6cArRsdxpQORQdag4fFkRvn51+ZS774fetLjLQQ=
 github.com/rheic/sandboxes-core v0.0.11/go.mod h1:ue8m6n4U0yiuQfJ2DVSIOgalrai/LX+CsapbHLIOT+k=
