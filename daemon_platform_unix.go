@@ -13,7 +13,20 @@ import (
 )
 
 func prepareDaemonStateDirectory(path string) error {
-	return os.MkdirAll(path, 0o700)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect daemon state directory: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("daemon state path must be a directory, not a symlink")
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		return fmt.Errorf("restrict daemon state directory permissions: %w", err)
+	}
+	return nil
 }
 
 func listenDaemon(ctx context.Context, path string) (net.Listener, error) {
