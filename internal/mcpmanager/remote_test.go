@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -132,6 +133,38 @@ func TestRemoteRegistrationApprovalAndPolicyRevocation(t *testing.T) {
 	}
 	if _, err := manager.ApproveCall(ctx, callID, func(context.Context, string) error { return nil }); err == nil || !strings.Contains(err.Error(), "no longer allowed") {
 		t.Fatalf("revoked call err = %v", err)
+	}
+}
+
+func TestLegacyRemoteHeadersFailClosedWithoutTrustedProvider(t *testing.T) {
+	ctx := context.Background()
+	state := &memoryMCPState{values: map[string]string{
+		"mcp_stdio_servers_v1": `[{"name":"legacy","transport":"remote","url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer legacy-synthetic"}}]`,
+	}}
+	manager, err := New(ctx, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = manager.Close() }()
+	manager.SetRemoteAllowlist([]string{"mcp.example.com"})
+	dialed := false
+	manager.remoteDial = func(context.Context, string, string) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("unexpected remote dial")
+	}
+	callID, err := manager.RequestCall("sb-owned", "legacy", "fixture_tool", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ApproveCall(ctx, callID, func(context.Context, string) error { return nil }); err == nil || !strings.Contains(err.Error(), "trusted MCP host approval provider is unavailable") {
+		t.Fatalf("legacy remote call without trusted provider err=%v", err)
+	}
+	if dialed {
+		t.Fatal("legacy remote headers reached the transport without trusted approval")
+	}
+	stored, err := state.GetSetting(ctx, "mcp_stdio_servers_v1")
+	if err != nil || !strings.Contains(stored, "legacy-synthetic") {
+		t.Fatalf("test unexpectedly changed legacy registry state: stored=%q err=%v", stored, err)
 	}
 }
 
