@@ -217,6 +217,45 @@ func TestRemovedServerDuringApprovalCannotExecuteCall(t *testing.T) {
 	}
 }
 
+func TestRemovedRemoteServerDuringApprovalDoesNotResolveSecrets(t *testing.T) {
+	ctx := context.Background()
+	manager, err := New(ctx, &memoryState{values: map[string]string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	manager.SetRemoteAllowlist([]string{"mcp.example.test"})
+	var resolutions int
+	manager.SetRemoteSecretResolver(func(context.Context, string, string) ([]byte, error) {
+		resolutions++
+		return []byte("synthetic-secret"), nil
+	})
+	manager.SetApprovalProvider(testApprovalProvider{})
+	registrationID, err := manager.RegisterRemote(ctx, "remote-fixture", "https://mcp.example.test/mcp", nil, map[string]string{
+		"Authorization": "Bearer ${token}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ApproveRegistration(ctx, registrationID); err != nil {
+		t.Fatal(err)
+	}
+	callID, err := manager.RequestCall("sb-owned", "remote-fixture", "echo", []byte(`{"value":"synthetic"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.SetApprovalProvider(approvalCallback(func(ctx context.Context, _ ApprovalRequest) error {
+		_, err := manager.Remove(ctx, "remote-fixture")
+		return err
+	}))
+	if _, err := manager.ApproveCall(ctx, callID, func(context.Context, string) error { return nil }); err == nil || !strings.Contains(err.Error(), "registration changed") {
+		t.Fatalf("remote call after registration removal err=%v", err)
+	}
+	if resolutions != 0 {
+		t.Fatalf("removed remote server resolved %d vault values", resolutions)
+	}
+}
+
 func TestExpiredChallengeIsRejected(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses a POSIX executable fixture")
