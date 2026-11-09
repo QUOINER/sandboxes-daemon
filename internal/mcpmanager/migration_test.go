@@ -147,6 +147,27 @@ func TestNewerRegistrySchemaFailsClosed(t *testing.T) {
 	}
 }
 
+func TestValidateStoredRemoteServerRejectsMalformedEndpoint(t *testing.T) {
+	for _, endpoint := range []string{
+		"http://mcp.example.test/mcp",
+		"https://user:pass@mcp.example.test/mcp",
+		"https://mcp.example.test:8443/mcp",
+		"https://mcp.example.test/mcp?token=synthetic",
+		"https://127.0.0.1/mcp",
+	} {
+		server := Server{Name: "stored", Transport: transportRemote, URL: endpoint}
+		if err := validateStoredRemoteServer(server); err == nil {
+			t.Errorf("accepted malformed stored endpoint %q", endpoint)
+		}
+	}
+	for _, endpoint := range []string{"https://mcp.example.test/mcp", "https://mcp.example.test:443/mcp"} {
+		server := Server{Name: "stored", Transport: transportRemote, URL: endpoint}
+		if err := validateStoredRemoteServer(server); err != nil {
+			t.Errorf("rejected valid stored endpoint %q: %v", endpoint, err)
+		}
+	}
+}
+
 func TestSanitizeRegistrySettingScrubsLegacyValuesIdempotently(t *testing.T) {
 	sanitized, err := SanitizeRegistrySetting(legacyRegistryFixture)
 	if err != nil {
