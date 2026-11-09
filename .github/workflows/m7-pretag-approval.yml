@@ -40,6 +40,11 @@ jobs:
     needs: validate
     uses: ./.github/workflows/ci.yml
 
+  quality:
+    name: Run full CI on the candidate SHA
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
   m7_approval:
     name: M7 external review approval
     needs: [validate, quality]
