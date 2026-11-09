@@ -135,6 +135,45 @@ func TestRemoteRegistrationApprovalAndPolicyRevocation(t *testing.T) {
 	}
 }
 
+func TestRemotePolicyRevokedDuringApprovalDoesNotResolveSecrets(t *testing.T) {
+	ctx := context.Background()
+	manager, err := New(ctx, &memoryMCPState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	manager.SetRemoteAllowlist([]string{"mcp.example.test"})
+	var resolutions int
+	manager.SetRemoteSecretResolver(func(context.Context, string, string) ([]byte, error) {
+		resolutions++
+		return []byte("synthetic-secret"), nil
+	})
+	manager.SetApprovalProvider(testApprovalProvider{})
+	registrationID, err := manager.RegisterRemote(ctx, "remote-fixture", "https://mcp.example.test/mcp", nil, map[string]string{
+		"Authorization": "Bearer ${token}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ApproveRegistration(ctx, registrationID); err != nil {
+		t.Fatal(err)
+	}
+	callID, err := manager.RequestCall("sb-owned", "remote-fixture", "echo", []byte(`{"value":"synthetic"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.SetApprovalProvider(approvalCallback(func(context.Context, ApprovalRequest) error {
+		manager.SetRemoteAllowlist(nil)
+		return nil
+	}))
+	if _, err := manager.ApproveCall(ctx, callID, func(context.Context, string) error { return nil }); err == nil || !strings.Contains(err.Error(), "no longer allowed") {
+		t.Fatalf("remote call after policy revocation err=%v", err)
+	}
+	if resolutions != 0 {
+		t.Fatalf("revoked remote server resolved %d vault values", resolutions)
+	}
+}
+
 func TestRemoteSessionAgainstStreamableServer(t *testing.T) {
 	server := mcp.NewServer(&mcp.Implementation{Name: "fixture-remote", Version: "0.0.1"}, nil)
 	server.AddTool(&mcp.Tool{Name: "fixture_tool", Description: "fixture", InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
