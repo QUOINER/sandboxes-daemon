@@ -54,14 +54,14 @@ func TestPrepareRemoteServerFailsClosed(t *testing.T) {
 		{name: "non-default port", rawURL: "https://mcp.example.com:8443/mcp", wantErr: "port"},
 		{name: "query", rawURL: "https://mcp.example.com/mcp?x=1", wantErr: "query"},
 		{name: "fragment", rawURL: "https://mcp.example.com/mcp#x", wantErr: "query"},
-		{name: "authorization header", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer x"}, wantErr: "host-vault"},
-		{name: "literal API key in static headers", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-API-Key": "literal"}, wantErr: "host-vault"},
-		{name: "placeholder in static header", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Team": "${team}"}, wantErr: "secret_headers"},
+		{name: "authorization header", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer x"}, wantErr: "static MCP headers are disabled"},
+		{name: "custom credential under arbitrary name", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Session": "credential"}, wantErr: "static MCP headers are disabled"},
+		{name: "placeholder in static header", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Team": "${team}"}, wantErr: "static MCP headers are disabled"},
 		{name: "literal secret header", rawURL: "https://mcp.example.com/mcp", secretHeaders: map[string]string{"X-API-Key": "actual-secret"}, wantErr: "placeholder"},
-		{name: "case-insensitive duplicate headers", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Team": "one", "x-team": "two"}, wantErr: "unique"},
-		{name: "static and secret duplicate", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Team": "public"}, secretHeaders: map[string]string{"x-team": "${team}"}, wantErr: "unique"},
-		{name: "malformed placeholder", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer ${}"}, wantErr: "placeholder"},
-		{name: "crlf header value", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Test": "a\r\nb"}, wantErr: "header value"},
+		{name: "case-insensitive duplicate headers", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Team": "one", "x-team": "two"}, wantErr: "static MCP headers are disabled"},
+		{name: "static and secret duplicate", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Team": "public"}, secretHeaders: map[string]string{"x-team": "${team}"}, wantErr: "static MCP headers are disabled"},
+		{name: "malformed placeholder", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer ${}"}, wantErr: "static MCP headers are disabled"},
+		{name: "crlf header value", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Test": "a\r\nb"}, wantErr: "static MCP headers are disabled"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -73,15 +73,15 @@ func TestPrepareRemoteServerFailsClosed(t *testing.T) {
 	if _, err := prepareRemoteServer("fixture", "https://mcp.example.com/mcp", nil, nil, func(string) bool { return false }); err == nil || !strings.Contains(err.Error(), "not allowed") {
 		t.Fatalf("disallowed host err = %v", err)
 	}
-	server, err := prepareRemoteServer("fixture", "https://MCP.example.com/mcp", map[string]string{"X-Team": "docs"}, nil, allow)
+	server, err := prepareRemoteServer("fixture", "https://MCP.example.com/mcp", nil, map[string]string{"X-Team": "${team}"}, allow)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if server.Transport != transportRemote || server.URL != "https://mcp.example.com:443/mcp" {
 		t.Fatalf("server = %+v", server)
 	}
-	if server.Headers["X-Team"] != "docs" {
-		t.Fatalf("headers = %+v", server.Headers)
+	if server.SecretHeaders["X-Team"] != "${team}" {
+		t.Fatalf("secret headers = %+v", server.SecretHeaders)
 	}
 }
 
@@ -106,7 +106,7 @@ func TestRemoteRegistrationApprovalAndPolicyRevocation(t *testing.T) {
 	provider := &approvingProvider{}
 	manager.SetApprovalProvider(provider)
 
-	id, err := manager.RegisterRemote(ctx, "remote-fixture", "https://mcp.example.com/mcp", map[string]string{"X-Team": "docs"}, map[string]string{"Authorization": "Bearer ${token}", "X-API-Key": "${api_key}"})
+	id, err := manager.RegisterRemote(ctx, "remote-fixture", "https://mcp.example.com/mcp", nil, map[string]string{"X-Team": "${team}", "Authorization": "Bearer ${token}", "X-API-Key": "${api_key}"})
 	if err != nil {
 		t.Fatal(err)
 	}

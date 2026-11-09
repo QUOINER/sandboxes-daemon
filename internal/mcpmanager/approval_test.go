@@ -22,7 +22,7 @@ func TestRemoteApprovalDisclosesDestinationAndHeaderScope(t *testing.T) {
 	manager.SetApprovalProvider(provider)
 
 	id, err := manager.RegisterRemote(ctx, "remote-fixture", "https://MCP.example.com/mcp",
-		map[string]string{"X-Team": "synthetic-static-value"},
+		nil,
 		map[string]string{
 			"Authorization": "Bearer ${token}",
 			"X-API-Key":     "${api_key}",
@@ -80,7 +80,6 @@ func assertApprovalScope(t *testing.T, request ApprovalRequest) {
 		{Name: "Authorization", ValueClass: ApprovalHeaderHostVault, References: []string{"token"}},
 		{Name: "X-API-Key", ValueClass: ApprovalHeaderHostVault, References: []string{"api_key"}},
 		{Name: "X-Composite", ValueClass: ApprovalHeaderHostVault, References: []string{"suffix", "token"}},
-		{Name: "X-Team", ValueClass: ApprovalHeaderStatic},
 	}
 	if !reflect.DeepEqual(request.Headers, want) {
 		t.Fatalf("approval headers = %+v, want %+v", request.Headers, want)
@@ -99,12 +98,6 @@ func TestApprovalCallRejectsDestinationOrHeaderMutation(t *testing.T) {
 		mutate func(*Server)
 	}{
 		{name: "destination", mutate: func(server *Server) { server.URL = "https://other.example.test/mcp" }},
-		{name: "static header", mutate: func(server *Server) {
-			server.Headers = map[string]string{"X-Team": "changed-static-value"}
-		}},
-		{name: "static header in place", mutate: func(server *Server) {
-			server.Headers["X-Team"] = "changed-in-place-value"
-		}},
 		{name: "vault header", mutate: func(server *Server) {
 			server.SecretHeaders = map[string]string{"Authorization": "Bearer ${other}"}
 		}},
@@ -123,7 +116,7 @@ func TestApprovalCallRejectsDestinationOrHeaderMutation(t *testing.T) {
 			manager.SetRemoteAllowlist([]string{"mcp.example.test"})
 			manager.SetApprovalProvider(testApprovalProvider{})
 			id, err := manager.RegisterRemote(ctx, "remote-fixture", "https://mcp.example.test/mcp",
-				map[string]string{"X-Team": "docs"},
+				nil,
 				map[string]string{"Authorization": "Bearer ${token}"})
 			if err != nil {
 				t.Fatal(err)

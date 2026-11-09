@@ -46,7 +46,7 @@ const (
 	registrySettingKey       = "mcp_stdio_servers_v1"
 	registrySchemaSettingKey = "mcp_registry_schema_version"
 	registrySchemaLegacy     = 1
-	registrySchemaCurrent    = 2
+	registrySchemaCurrent    = 3
 
 	// ApprovalHeaderStatic marks a header whose configured value is stored as
 	// non-secret static configuration.
@@ -113,8 +113,8 @@ type Server struct {
 	Directory        string   `json:"directory,omitempty"`
 	ExecutableSHA256 string   `json:"executable_sha256,omitempty"`
 	URL              string   `json:"url,omitempty"`
-	// Headers are static, non-secret request headers. Secret material must
-	// come from the host vault and is never stored in the registry state.
+	// Headers is a legacy persisted field retained only for forward migration.
+	// New registrations reject static header values.
 	Headers map[string]string `json:"headers,omitempty"`
 	// SecretHeaders contains only vault placeholder templates, never values.
 	SecretHeaders map[string]string `json:"secret_headers,omitempty"`
@@ -199,10 +199,10 @@ func New(ctx context.Context, state State) (*Manager, error) {
 }
 
 // loadRegistry applies the forward-only registry schema migration before any
-// RPC is served. Legacy remote records lose their static Headers because the
-// daemon cannot determine whether an old value is a credential. All other
-// record fields and settings are preserved. The sanitized registry is written
-// before the schema marker; failure aborts startup (fail closed).
+// RPC is served. All remote records lose static Headers because the daemon
+// cannot determine whether a value is a credential. All other record fields
+// and settings are preserved. The sanitized registry is written before the
+// schema marker; failure aborts startup (fail closed).
 func loadRegistry(ctx context.Context, state State) ([]Server, error) {
 	raw, items, err := readRegistrySetting(ctx, state)
 	if err != nil {
@@ -753,7 +753,7 @@ func validateStoredRemoteServer(s Server) error {
 	if s.Command != "" || s.URL == "" || s.ExecutableSHA256 != "" {
 		return errors.New("invalid remote MCP registry entry")
 	}
-	if _, _, err := copiedRemoteHeaders(s.Headers, s.SecretHeaders); err != nil {
+	if _, err := copiedRemoteHeaders(s.Headers, s.SecretHeaders); err != nil {
 		return errors.New("invalid remote MCP registry entry")
 	}
 	return nil

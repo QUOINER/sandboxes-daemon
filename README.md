@@ -63,22 +63,21 @@ IP literals are rejected, and an empty value disables remote MCP. The file is
 strict, mode-checked and never contains secrets. Settings need a daemon restart
 to take effect; new sandboxes use the policy profile and resource defaults.
 
-Remote MCP registration stores static non-secret headers separately from
-host-vault placeholder templates. For credential-bearing header names the
-daemon rejects literal values; only `${placeholder}` references are persisted
-and resolved at request time. Remote hosts still require exact allowlist
-entries, and redirects are refused.
+All remote MCP headers must use host-vault placeholder templates. Static header
+values are rejected because custom names cannot establish whether a value is a
+credential. Only `${placeholder}` references are persisted and resolved at
+request time. Remote hosts still require exact allowlist entries, and redirects
+are refused.
 
 Trusted registration and per-call approvals receive the normalized remote
-destination and a value-free header scope: each header name, its `static` or
-`host-vault` class, and any vault placeholder identifiers. Header values and
-resolved secrets are never passed to the approval provider. A call approval is
-invalidated if the destination or header configuration changes before
-execution.
+destination and a value-free header scope: each header name and its host-vault
+placeholder identifiers. Header values and resolved secrets are never passed
+to the approval provider. A call approval is invalidated if the destination or
+header configuration changes before execution.
 
 ### Remote MCP upgrade migration
 
-v0.0.49 versions the persisted MCP registry and performs a one-way forward
+v0.0.50 versions the persisted MCP registry and performs a one-way forward
 migration during daemon startup, before any RPC is accepted. Every remote
 server entry written by an older daemon loses its static `headers` map. The
 daemon cannot tell a benign static value from a credential saved by an older
@@ -93,12 +92,12 @@ upgrade vacuums stale SQLite free pages from earlier releases, then checkpoints
 and truncates the active WAL after persisting the schema marker. Later starts
 retry the checkpoint before RPC startup. The vacuum needs temporary disk space
 proportional to database size; if migration or any backup write fails, startup
-fails closed and retries on the next start. Re-register the server to restore
-any static headers that are still needed. After an interrupted backup write,
+fails closed and retries on the next start. Re-register the server and move
+required header values into the host vault. After an interrupted backup write,
 SQLite recovery runs and startup retries sanitization before accepting RPCs.
 Legacy values are not logged, displayed or recoverable after a successful
-migration. The registry then uses schema v2, so benign static headers
-registered by this or later daemons are retained on subsequent startups. See
+migration. The registry then uses schema v3, and every future remote header
+must use a host-vault reference. See
 [docs/MCP-MIGRATION.md](docs/MCP-MIGRATION.md).
 
 Service proxy references require the matching static guest helper artifact.

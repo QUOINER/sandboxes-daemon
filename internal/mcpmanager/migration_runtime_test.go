@@ -17,7 +17,10 @@ import (
 func TestMigratedLegacyHeadersAreNotSentToRemoteEndpoint(t *testing.T) {
 	ctx := context.Background()
 	legacy := `[{"name":"legacy-runtime","transport":"remote","url":"https://mcp.example.test/mcp","headers":{"Authorization":"Bearer legacy-synthetic-token","Cookie":"session=legacy-synthetic-cookie","X-Custom":"legacy-synthetic-custom"}}]`
-	state := &memoryMCPState{values: map[string]string{registrySettingKey: legacy}}
+	state := &memoryMCPState{values: map[string]string{
+		registrySettingKey:       legacy,
+		registrySchemaSettingKey: "2",
+	}}
 	manager, err := New(ctx, state)
 	if err != nil {
 		t.Fatal(err)

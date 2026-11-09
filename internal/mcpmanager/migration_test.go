@@ -60,7 +60,7 @@ func TestLegacyRegistryMigrationStripsRemoteStaticHeaders(t *testing.T) {
 		}
 	}
 	version, err := state.GetSetting(ctx, registrySchemaSettingKey)
-	if err != nil || version != "2" {
+	if err != nil || version != "3" {
 		t.Fatalf("schema version = %q err=%v", version, err)
 	}
 
@@ -103,25 +103,26 @@ func TestLegacyRegistryMigrationFailsClosedWhenPersistenceFails(t *testing.T) {
 	}
 }
 
-func TestSchemaV2StaticHeadersSurviveLaterStartup(t *testing.T) {
+func TestSchemaV2StaticHeadersAreMigratedAndNeverAccepted(t *testing.T) {
 	ctx := context.Background()
-	state := &memoryMCPState{values: map[string]string{registrySchemaSettingKey: "2"}}
+	legacy := `[{"name":"v2-static","transport":"remote","url":"https://mcp.example.test/mcp","headers":{"X-Session":"synthetic-credential"}}]`
+	state := &memoryMCPState{values: map[string]string{registrySchemaSettingKey: "2", registrySettingKey: legacy}}
 	manager, err := New(ctx, state)
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.SetRemoteAllowlist([]string{"mcp.example.test"})
-	manager.SetApprovalProvider(testApprovalProvider{})
-	id, err := manager.RegisterRemote(ctx, "v2-static", "https://mcp.example.test/mcp", map[string]string{"X-Team": "benign-static-value"}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := manager.ApproveRegistration(ctx, id); err != nil {
-		t.Fatal(err)
-	}
+	defer func() { _ = manager.Close() }()
 	stored, err := state.GetSetting(ctx, registrySettingKey)
-	if err != nil || !strings.Contains(stored, "benign-static-value") {
-		t.Fatalf("schema-v2 static header was not persisted: stored=%q err=%v", stored, err)
+	if err != nil || strings.Contains(stored, "synthetic-credential") {
+		t.Fatalf("schema-v2 migration retained static credential: stored=%q err=%v", stored, err)
+	}
+	version, err := state.GetSetting(ctx, registrySchemaSettingKey)
+	if err != nil || version != "3" {
+		t.Fatalf("schema version = %q err=%v", version, err)
+	}
+	manager.SetRemoteAllowlist([]string{"mcp.example.test"})
+	if _, err := manager.RegisterRemote(ctx, "new-static", "https://mcp.example.test/mcp", map[string]string{"X-Session": "synthetic-credential"}, nil); err == nil {
+		t.Fatal("new static header registration was accepted")
 	}
 
 	reloaded, err := New(ctx, state)
@@ -131,16 +132,16 @@ func TestSchemaV2StaticHeadersSurviveLaterStartup(t *testing.T) {
 	defer func() { _ = reloaded.Close() }()
 	again, err := state.GetSetting(ctx, registrySettingKey)
 	if err != nil || again != stored {
-		t.Fatalf("later startup removed schema-v2 static header: before=%q after=%q err=%v", stored, again, err)
+		t.Fatalf("later startup rewrote sanitized registry: before=%q after=%q err=%v", stored, again, err)
 	}
 	if got := reloaded.List(); len(got) != 1 || got[0].Name != "v2-static" {
-		t.Fatalf("later startup lost schema-v2 record: %+v", got)
+		t.Fatalf("later startup lost migrated record: %+v", got)
 	}
 }
 
 func TestNewerRegistrySchemaFailsClosed(t *testing.T) {
 	ctx := context.Background()
-	state := &memoryMCPState{values: map[string]string{registrySchemaSettingKey: "3"}}
+	state := &memoryMCPState{values: map[string]string{registrySchemaSettingKey: "4"}}
 	if _, err := New(ctx, state); err == nil || !strings.Contains(err.Error(), "newer") {
 		t.Fatalf("newer schema err = %v", err)
 	}
