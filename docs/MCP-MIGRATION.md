@@ -11,6 +11,22 @@ alpha compatibility break.
 - The same legacy static `headers` are scrubbed in place from existing
   `.pre-v<version>-*.bak` database backups beside the active database. Backups
   are not deleted, and unrelated backup settings, rows and files are preserved.
+- SQLite full secure deletion is enabled on each backup connection before the
+  registry row is updated, so removed header bytes are overwritten in the
+  database pages instead of remaining in SQLite freeblocks.
+- The active store also enables SQLite full secure deletion for updates and
+  runs a one-time `VACUUM` during the registry schema upgrade to remove older
+  freelist pages left by previous releases. It then checkpoints/truncates the
+  WAL after persisting the schema marker; current-schema startups also retry a
+  WAL checkpoint before RPC startup in case an earlier startup was interrupted.
+- The one-time `VACUUM` may require temporary disk space roughly proportional
+  to the database size. If it or the final checkpoint cannot complete, daemon
+  startup fails closed and retries on the next start.
+- If the process or host stops during a backup transaction, SQLite may recover
+  the original row from its rollback journal on the next open. That startup
+  re-runs backup sanitization and still refuses RPC service until it completes.
+  The removal guarantee applies after a successful startup; filesystem
+  snapshots and storage-device remanence are outside this migration's scope.
 - The settings key `mcp_registry_schema_version` records the current schema
   version (`2`).
 - Server names, URLs, transports, stdio records, host-vault `secret_headers`

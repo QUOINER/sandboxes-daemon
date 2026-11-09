@@ -46,7 +46,7 @@ var ErrSchemaNewer = errors.New("database schema is newer than this daemon")
 
 // Open opens and migrates the SQLite database.
 func Open(ctx context.Context, path string) (*Store, error) {
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=secure_delete(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -172,6 +172,16 @@ func sanitizeBackupSetting(ctx context.Context, path, key string, sanitize func(
 	if err := db.PingContext(ctx); err != nil {
 		return errors.New("open pre-upgrade backup failed")
 	}
+	// Legacy header values may be longer than their sanitized replacements.
+	// SQLite can otherwise retain deleted record bytes in freeblocks, so enable
+	// full secure deletion before updating the registry row.
+	if _, err := db.ExecContext(ctx, `PRAGMA secure_delete=ON`); err != nil {
+		return errors.New("enable secure deletion for pre-upgrade backup failed")
+	}
+	var secureDelete int
+	if err := db.QueryRowContext(ctx, `PRAGMA secure_delete`).Scan(&secureDelete); err != nil || secureDelete != 1 {
+		return errors.New("secure deletion is unavailable for pre-upgrade backup")
+	}
 	var marker int
 	err = db.QueryRowContext(ctx, `SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'`).Scan(&marker)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -203,6 +213,33 @@ func sanitizeBackupSetting(ctx context.Context, path, key string, sanitize func(
 
 // Close closes the database.
 func (s *Store) Close() error { return s.db.Close() }
+
+// CheckpointTruncate flushes and removes the WAL after a sensitive setting
+// migration so older page images do not remain in WAL frames.
+func (s *Store) CheckpointTruncate(ctx context.Context) error {
+	var busy, logFrames, checkpointedFrames int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointedFrames); err != nil {
+		return fmt.Errorf("checkpoint sqlite WAL: %w", err)
+	}
+	if busy != 0 || logFrames >= 0 && checkpointedFrames < logFrames {
+		return errors.New("checkpoint sqlite WAL did not complete")
+	}
+	return nil
+}
+
+// FinalizeMCPRegistryMigration removes stale SQLite freepages that may contain
+// legacy header values deleted by older daemon versions. It is called only for
+// the one-time registry schema upgrade, before the schema marker is persisted.
+func (s *Store) FinalizeMCPRegistryMigration(ctx context.Context) error {
+	var secureDelete int
+	if err := s.db.QueryRowContext(ctx, `PRAGMA secure_delete`).Scan(&secureDelete); err != nil || secureDelete != 1 {
+		return errors.New("secure deletion is unavailable for active database")
+	}
+	if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil {
+		return fmt.Errorf("vacuum active database after MCP migration: %w", err)
+	}
+	return nil
+}
 
 // Operations returns the operation journal adapter.
 func (s *Store) Operations() *OperationStore { return s.ops }

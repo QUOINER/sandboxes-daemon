@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,6 +73,43 @@ func TestSanitizeBackupSettingScrubsOnlyTargetAndPreservesOthers(t *testing.T) {
 	after, updatedAtAgain := readBackupSetting(t, backupOne, "mcp_stdio_servers_v1")
 	if before != after || updatedAtAgain != updatedAt {
 		t.Fatalf("retry changed backup: before=%q after=%q updated=%d/%d", before, after, updatedAt, updatedAtAgain)
+	}
+}
+
+func TestSanitizeBackupSettingErasesLegacyValueBytes(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	active := filepath.Join(dir, "sandboxes.db")
+	backup := active + ".pre-v1-20240102T030405Z.bak"
+	canary := "legacy-header-secret-" + strings.Repeat("x", 256)
+	registry := `[{"name":"legacy","transport":"remote","url":"https://mcp.example.test/mcp","headers":{"X-API-Key":"` + canary + `"}}]`
+	createBackupSettingsFixture(t, backup, registry)
+
+	before, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(before), canary) {
+		t.Fatal("fixture does not contain the synthetic legacy value")
+	}
+
+	st := &Store{path: active}
+	sanitize := func(raw string) (string, error) {
+		return strings.ReplaceAll(raw, canary, ""), nil
+	}
+	if err := st.SanitizeBackupSetting(ctx, "mcp_stdio_servers_v1", sanitize); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(after), canary) {
+		t.Fatal("backup file still contains the removed legacy value bytes")
+	}
+	if _, err := os.Lstat(backup + "-journal"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("completed sanitizer left a rollback journal: %v", err)
 	}
 }
 

@@ -87,12 +87,18 @@ URLs, transports, stdio entries, host-vault `secret_headers` placeholder
 templates and all unrelated settings are preserved. The same legacy static
 `headers` are scrubbed in place from existing pre-upgrade
 `.pre-v<version>-*.bak` database backups beside the active database; backups are
-never deleted and unrelated backup settings or rows are untouched. If the
-sanitized registry, the schema marker or any relevant backup cannot be written,
-startup fails closed. Re-register the server to restore any static headers that
-are still needed; legacy values are not logged, displayed or recoverable. After
-migration the registry is schema v2, so benign static headers registered by
-this or later daemons are retained on subsequent startups. See
+never deleted and unrelated backup settings or rows are untouched. SQLite full
+secure deletion overwrites removed header bytes in database pages. The one-time
+upgrade vacuums stale SQLite free pages from earlier releases, then checkpoints
+and truncates the active WAL after persisting the schema marker. Later starts
+retry the checkpoint before RPC startup. The vacuum needs temporary disk space
+proportional to database size; if migration or any backup write fails, startup
+fails closed and retries on the next start. Re-register the server to restore
+any static headers that are still needed. After an interrupted backup write,
+SQLite recovery runs and startup retries sanitization before accepting RPCs.
+Legacy values are not logged, displayed or recoverable after a successful
+migration. The registry then uses schema v2, so benign static headers
+registered by this or later daemons are retained on subsequent startups. See
 [docs/MCP-MIGRATION.md](docs/MCP-MIGRATION.md).
 
 Service proxy references require the matching static guest helper artifact.

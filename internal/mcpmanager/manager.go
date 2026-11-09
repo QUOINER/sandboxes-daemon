@@ -68,6 +68,11 @@ type State interface {
 	SetSetting(context.Context, string, string) error
 }
 
+type registryMigrationFinalizer interface {
+	FinalizeMCPRegistryMigration(context.Context) error
+	CheckpointTruncate(context.Context) error
+}
+
 // ApprovalProvider obtains consent through a daemon-trusted host UI or OS
 // authorization service. An RPC field, challenge ID, CLI prompt, or caller
 // identity alone must never implement this interface.
@@ -199,22 +204,9 @@ func New(ctx context.Context, state State) (*Manager, error) {
 // record fields and settings are preserved. The sanitized registry is written
 // before the schema marker; failure aborts startup (fail closed).
 func loadRegistry(ctx context.Context, state State) ([]Server, error) {
-	raw, err := state.GetSetting(ctx, registrySettingKey)
-	if errors.Is(err, core.ErrNotFound) {
-		err = nil
-		raw = ""
-	}
+	raw, items, err := readRegistrySetting(ctx, state)
 	if err != nil {
 		return nil, err
-	}
-	if len(raw) > maxRegistryBytes {
-		return nil, errors.New("MCP registry exceeds the storage limit")
-	}
-	var items []Server
-	if raw != "" {
-		if err := json.Unmarshal([]byte(raw), &items); err != nil {
-			return nil, errors.New("MCP registry state is invalid")
-		}
 	}
 	schema, err := registrySchemaVersion(ctx, state)
 	if err != nil {
@@ -224,6 +216,9 @@ func loadRegistry(ctx context.Context, state State) ([]Server, error) {
 		return nil, errors.New("MCP registry schema is newer than this daemon supports")
 	}
 	if schema == registrySchemaCurrent {
+		if err := checkpointRegistryMigration(ctx, state); err != nil {
+			return nil, err
+		}
 		return items, nil
 	}
 	if migrateLegacyRemoteHeaders(items) && raw != "" {
@@ -235,10 +230,59 @@ func loadRegistry(ctx context.Context, state State) ([]Server, error) {
 			return nil, errors.New("MCP registry migration could not be persisted")
 		}
 	}
+	if err := finalizeRegistryMigration(ctx, state); err != nil {
+		return nil, err
+	}
 	if err := state.SetSetting(ctx, registrySchemaSettingKey, strconv.Itoa(registrySchemaCurrent)); err != nil {
 		return nil, errors.New("MCP registry schema could not be persisted")
 	}
+	if err := checkpointRegistryMigration(ctx, state); err != nil {
+		return nil, err
+	}
 	return items, nil
+}
+
+func readRegistrySetting(ctx context.Context, state State) (string, []Server, error) {
+	raw, err := state.GetSetting(ctx, registrySettingKey)
+	if errors.Is(err, core.ErrNotFound) {
+		err = nil
+		raw = ""
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	if len(raw) > maxRegistryBytes {
+		return "", nil, errors.New("MCP registry exceeds the storage limit")
+	}
+	var items []Server
+	if raw != "" {
+		if err := json.Unmarshal([]byte(raw), &items); err != nil {
+			return "", nil, errors.New("MCP registry state is invalid")
+		}
+	}
+	return raw, items, nil
+}
+
+func finalizeRegistryMigration(ctx context.Context, state State) error {
+	finalizer, ok := state.(registryMigrationFinalizer)
+	if !ok {
+		return nil
+	}
+	if err := finalizer.FinalizeMCPRegistryMigration(ctx); err != nil {
+		return errors.New("MCP registry migration could not securely finalize storage")
+	}
+	return nil
+}
+
+func checkpointRegistryMigration(ctx context.Context, state State) error {
+	finalizer, ok := state.(registryMigrationFinalizer)
+	if !ok {
+		return nil
+	}
+	if err := finalizer.CheckpointTruncate(ctx); err != nil {
+		return errors.New("MCP registry WAL checkpoint failed")
+	}
+	return nil
 }
 
 func registrySchemaVersion(ctx context.Context, state State) (int, error) {

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -73,6 +74,83 @@ func TestInitializeMCPRegistryScrubsBackupsAndPreservesUnrelatedData(t *testing.
 	retriedBackup, retriedUpdatedAt := readSettingsValue(t, backups[0], mcpmanager.RegistrySettingKey)
 	if retriedBackup != backupValue || retriedUpdatedAt != updatedAt {
 		t.Fatalf("retry changed backup: before=%q/%d after=%q/%d", backupValue, updatedAt, retriedBackup, retriedUpdatedAt)
+	}
+}
+
+func TestInitializeMCPRegistryErasesLegacyBytesFromDatabaseAndWAL(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sandboxes.db")
+	canary := "legacy-long-header-secret-" + strings.Repeat("x", 512)
+	registry := strings.ReplaceAll(backupMigrationRegistry, "legacy-synthetic-token", canary)
+	createLegacyMCPDatabase(t, path, registry)
+	seedStaleDeletedValue(t, path, "stale-freed-page-"+canary)
+	before, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(before), "stale-freed-page-"+canary) {
+		t.Fatalf("fixture did not retain a stale SQLite page value: err=%v", err)
+	}
+
+	st, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	if err := st.SetSetting(ctx, mcpmanager.RegistrySettingKey, registry); err != nil {
+		t.Fatal(err)
+	}
+	walBefore, err := os.ReadFile(path + "-wal")
+	if err != nil || !strings.Contains(string(walBefore), canary) {
+		t.Fatalf("fixture did not place the legacy value in the WAL: err=%v", err)
+	}
+	svc := New(st, nil)
+	if err := svc.InitializeMCPRegistry(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, candidate := range []string{path, path + "-wal", path + "-journal", path + ".pre-v0-"} {
+		if candidate == path+".pre-v0-" {
+			backups, err := filepath.Glob(candidate + "*.bak")
+			if err != nil || len(backups) != 1 {
+				t.Fatalf("backups = %v err=%v", backups, err)
+			}
+			candidate = backups[0]
+		}
+		data, err := os.ReadFile(candidate)
+		if errors.Is(err, os.ErrNotExist) && (candidate == path+"-wal" || candidate == path+"-journal") {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("read migrated database artifact %s: %v", filepath.Base(candidate), err)
+		}
+		if strings.Contains(string(data), canary) {
+			t.Fatalf("migrated database artifact %s retained old header bytes", filepath.Base(candidate))
+		}
+		if candidate == path+"-wal" && len(data) != 0 {
+			t.Fatalf("active WAL was not truncated after migration: %d bytes remain", len(data))
+		}
+	}
+}
+
+func seedStaleDeletedValue(t *testing.T, path, value string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	for _, statement := range []string{
+		`PRAGMA secure_delete=OFF`,
+		`CREATE TABLE stale_values (value TEXT NOT NULL)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO stale_values(value) VALUES (?)`, value); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DELETE FROM stale_values`); err != nil {
+		t.Fatal(err)
 	}
 }
 
