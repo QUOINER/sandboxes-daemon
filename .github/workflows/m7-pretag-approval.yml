@@ -1,0 +1,98 @@
+name: M7 pre-tag approval
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable major.minor.patch without the v prefix (for example, 1.2.3)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate release candidate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      GOTOOLCHAIN: local
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate main commit, changelog, and absent tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/test-release-notes.sh
+          scripts/test-release-candidate.sh
+          scripts/test-m7-approval.sh
+          scripts/validate-release-candidate.sh "$VERSION"
+
+  quality:
+    name: Run full CI on the candidate SHA
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  m7_approval:
+    name: M7 external review approval
+    needs: [validate, quality]
+    runs-on: ubuntu-24.04
+    environment: m7-external-security-review
+    permissions: {}
+    env:
+      M7_EXTERNAL_SECURITY_REVIEW_APPROVED_COMMIT: ${{ vars.M7_EXTERNAL_SECURITY_REVIEW_APPROVED_COMMIT }}
+    steps:
+      - name: Require explicit M7 approval
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$M7_EXTERNAL_SECURITY_REVIEW_APPROVED_COMMIT" =~ ^[0-9a-f]{40}$ || "$M7_EXTERNAL_SECURITY_REVIEW_APPROVED_COMMIT" != "$GITHUB_SHA" ]]; then
+            echo "Release blocked: M7 approval must name this exact reviewed commit in the protected environment." >&2
+            exit 1
+          fi
+
+  create_tag:
+    name: Create release tag after approved M7 gate
+    needs: m7_approval
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Recheck workflow identity and create immutable tag ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$GITHUB_WORKFLOW_SHA" == "$GITHUB_SHA" ]]
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          tag="v$VERSION"
+          tag_object=$(gh api --method POST "repos/$GITHUB_REPOSITORY/git/tags" \
+            -f "tag=$tag" -f "message=$tag" -f "object=$GITHUB_SHA" -f type=commit --jq '.sha')
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f "ref=refs/tags/$tag" -f "sha=$tag_object" >/dev/null
+
+  dispatch_release:
+    name: Dispatch tag-triggered release workflow
+    needs: create_tag
+    if: github.repository == 'rheic/sandboxes-daemon' || github.repository == 'rheic/sandboxes-cli'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    env:
+      TAG: v${{ inputs.version }}
+    steps:
+      - name: Start release workflow for the approved tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method POST "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/dispatches" -f "ref=$TAG"
