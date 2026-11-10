@@ -464,6 +464,7 @@ func TestRunWiresPolicySync(t *testing.T) {
 	socket := filepath.Join(dir, "sandboxesd.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
+	runFinished := false
 	go func() {
 		errCh <- Run(ctx, Config{
 			SocketPath: socket,
@@ -474,25 +475,40 @@ func TestRunWiresPolicySync(t *testing.T) {
 			},
 		})
 	}()
-
-	var readStore *store.Store
-	waitPolicySync(t, func() bool {
-		if readStore == nil {
-			opened, err := store.Open(context.Background(), filepath.Join(dir, "sandboxes.db"))
-			if err != nil {
-				return false
-			}
-			readStore = opened
+	t.Cleanup(func() {
+		if runFinished {
+			return
 		}
+		cancel()
+		select {
+		case <-errCh:
+		case <-time.After(3 * time.Second):
+			t.Error("daemon did not stop during test cleanup")
+		}
+	})
+
+	select {
+	case <-ts.started:
+	case <-time.After(15 * time.Second):
+		t.Fatal("daemon startup policy sync did not reach the control plane")
+	}
+	readStore, err := store.Open(context.Background(), filepath.Join(dir, "sandboxes.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := readStore.Close(); err != nil {
+			t.Errorf("close policy sync test reader: %v", err)
+		}
+	})
+	waitPolicySync(t, func() bool {
 		stored, found, err := readStore.GetPolicyBundle(context.Background(), "org-a")
 		return err == nil && found && stored.Revision == 1
 	}, "daemon startup policy sync did not persist the bundle")
-	if err := readStore.Close(); err != nil {
-		t.Fatal(err)
-	}
 	cancel()
 	select {
 	case err := <-errCh:
+		runFinished = true
 		if err != nil {
 			t.Fatal(err)
 		}
