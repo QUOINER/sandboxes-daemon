@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -46,7 +47,9 @@ var ErrSchemaNewer = errors.New("database schema is newer than this daemon")
 
 // Open opens and migrates the SQLite database.
 func Open(ctx context.Context, path string) (*Store, error) {
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=secure_delete(1)"
+	dsn := sqliteFileDSN(path, url.Values{
+		"_pragma": {"busy_timeout(5000)", "journal_mode(WAL)", "foreign_keys(1)", "secure_delete(1)"},
+	})
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -66,6 +69,14 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// sqliteFileDSN treats path as a filesystem path, not as an SQLite URI. URL
+// escaping keeps characters such as '?' and '#' in the filename from
+// becoming query or fragment syntax.
+func sqliteFileDSN(path string, query url.Values) string {
+	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path), RawQuery: query.Encode()}
+	return u.String()
 }
 
 // prepareSchema refuses newer databases and backs up older ones before any
@@ -163,7 +174,7 @@ func (s *Store) preUpgradeBackups() ([]string, error) {
 }
 
 func sanitizeBackupSetting(ctx context.Context, path, key string, sanitize func(string) (string, error)) (resultErr error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", sqliteFileDSN(path, url.Values{"_pragma": {"busy_timeout(5000)"}}))
 	if err != nil {
 		return errors.New("open pre-upgrade backup failed")
 	}

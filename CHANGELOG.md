@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.0.52 — 2026-11-11
+
+### Fixed
+
+- Open daemon and control-plane SQLite databases using escaped file URLs so URI characters in filesystem paths cannot alter the selected database or PRAGMA settings.
+
+### Security and limitations
+
+- SQLite secure deletion does not erase old APFS snapshots or storage-device remanence; same-UID filesystem races remain inside the host user's trust boundary.
+- This patch does not close full Docker Sandboxes parity or the independent M7 security review gate.
+
 ## v0.0.51 — 2026-11-11
 
 ### Changed
