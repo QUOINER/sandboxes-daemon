@@ -29,7 +29,7 @@ jobs:
     needs: m7_gate
     runs-on: ubuntu-24.04
     container:
-      image: docker.io/library/golang:1.27.3-bookworm@sha256:dc0963f32053e4bc451d24d87e3892d42d01021b61f093e98eb95c0352bb84b0
+      image: docker.io/library/golang:1.27.4-bookworm@sha256:fb7cceb528b47141eccd9b60bf3cbd27d5ef5f8cf5b7d338bec866da495b50dc
     permissions:
       contents: read
       id-token: write
@@ -49,7 +49,7 @@ jobs:
       - name: Fetch protected main for ancestry validation
         run: git fetch --no-tags origin main:refs/remotes/origin/main
       - name: Verify pinned Go toolchain
-        run: test "$(go version)" = "go version go1.27.3 linux/amd64"
+        run: test "$(go version)" = "go version go1.27.4 linux/amd64"
       - name: Validate release tag
         shell: bash
         run: |
