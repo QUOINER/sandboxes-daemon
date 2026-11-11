@@ -220,6 +220,28 @@ func TestMigrationBacksUpExistingDatabaseAndRejectsNewerSchema(t *testing.T) {
 	}
 }
 
+func TestNewSupportsURICharactersInDatabaseFilename(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "control plane ?# [alpha].db")
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Config{DBPath: dbPath, Credentials: testCredentials(t), PolicyKey: publicKey})
+	if err != nil {
+		t.Fatalf("open control-plane database at URI-like path: %v", err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatalf("database was not created at requested path: %v", err)
+	}
+	if !info.Mode().IsRegular() {
+		t.Fatalf("database path is not a regular file: %v", info.Mode())
+	}
+}
+
 func TestAuditIngestIsBoundedStructuredAndAuthenticated(t *testing.T) {
 	server, _, now := newTestServer(t)
 	batch := strings.Join([]string{

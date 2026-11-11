@@ -11,6 +11,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -84,7 +85,12 @@ func New(config Config) (*Server, error) {
 	if config.DBPath == "" || config.Credentials == nil || len(config.PolicyKey) != ed25519.PublicKeySize {
 		return nil, errors.New("database path, role-scoped credentials, and Ed25519 policy public key are required")
 	}
-	db, err := sql.Open("sqlite", config.DBPath)
+	dbPath := filepath.ToSlash(config.DBPath)
+	if len(dbPath) >= 2 && dbPath[1] == ':' {
+		dbPath = "/" + dbPath
+	}
+	dbURL := url.URL{Scheme: "file", Path: dbPath}
+	db, err := sql.Open("sqlite", dbURL.String())
 	if err != nil {
 		return nil, fmt.Errorf("open control-plane database: %w", err)
 	}
