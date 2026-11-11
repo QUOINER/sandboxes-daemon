@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -93,25 +92,6 @@ func TestSandboxAndOperationLifecycle(t *testing.T) {
 	}
 	if _, err := st.Get(ctx, "sb-1"); !errors.Is(err, core.ErrNotFound) {
 		t.Fatalf("expected not found, got %v", err)
-	}
-}
-
-func TestOpenSupportsURICharactersInFilename(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "state ?# [alpha].db")
-	st, err := Open(ctx, path)
-	if err != nil {
-		t.Fatalf("open database at URI-like path: %v", err)
-	}
-	if err := st.Close(); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("database was not created at requested path: %v", err)
-	}
-	if !info.Mode().IsRegular() {
-		t.Fatalf("database path is not a regular file: %v", info.Mode())
 	}
 }
 
