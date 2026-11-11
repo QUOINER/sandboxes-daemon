@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.0.51 — 2026-11-11
+
+### Changed
+
+- Update the runtime dependency to v0.0.30, bringing the experimental Linux ARM64 runtime build into the daemon release graph.
+
+### Security and limitations
+
+- Linux VM support remains experimental and limited to privileged rootful acceptance in a macOS-hosted Ubuntu ARM64 VM. Native Linux-host and rootless acceptance remain open.
+- This dependency update does not establish full Docker Sandboxes parity or independent M7 security review.
+
+
 ## v0.0.50 — 2026-11-09
 
 - Reject all static remote MCP headers and require host-vault placeholders for every header value.

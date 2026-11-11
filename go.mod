@@ -8,7 +8,7 @@ require (
 	github.com/rheic/sandboxes-api v0.0.24
 	github.com/rheic/sandboxes-core v0.0.11
 	github.com/rheic/sandboxes-gateway v0.0.17
-	github.com/rheic/sandboxes-runtime v0.0.29
+	github.com/rheic/sandboxes-runtime v0.0.30
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/sys v0.50.0
 	google.golang.org/grpc v1.85.0
