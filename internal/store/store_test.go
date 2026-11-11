@@ -96,7 +96,7 @@ func TestSandboxAndOperationLifecycle(t *testing.T) {
 	}
 }
 
-func TestOpenTreatsURICharactersAsFilename(t *testing.T) {
+func TestOpenSupportsURICharactersInFilename(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "state ?# [alpha].db")
 	st, err := Open(ctx, path)

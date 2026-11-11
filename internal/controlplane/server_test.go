@@ -220,7 +220,7 @@ func TestMigrationBacksUpExistingDatabaseAndRejectsNewerSchema(t *testing.T) {
 	}
 }
 
-func TestNewTreatsURICharactersAsDatabaseFilename(t *testing.T) {
+func TestNewSupportsURICharactersInDatabaseFilename(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "control plane ?# [alpha].db")
 	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

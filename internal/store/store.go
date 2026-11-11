@@ -75,7 +75,11 @@ func Open(ctx context.Context, path string) (*Store, error) {
 // escaping keeps characters such as '?' and '#' in the filename from
 // becoming query or fragment syntax.
 func sqliteFileDSN(path string, query url.Values) string {
-	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path), RawQuery: query.Encode()}
+	path = filepath.ToSlash(path)
+	if len(path) >= 2 && path[1] == ':' {
+		path = "/" + path
+	}
+	u := url.URL{Scheme: "file", Path: path, RawQuery: query.Encode()}
 	return u.String()
 }
 
