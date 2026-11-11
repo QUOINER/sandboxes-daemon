@@ -77,11 +77,14 @@ func (s *SandboxServer) MCPRegisterServer(ctx context.Context, req *localv1.MCPR
 	var id string
 	var err error
 	if req.GetUrl() != "" {
-		if req.GetCommand() != "" {
-			return nil, status.Error(codes.InvalidArgument, "set either command or url, not both")
+		if req.GetCommand() != "" || len(req.GetArguments()) > 0 || req.GetWorkingDirectory() != "" {
+			return nil, status.Error(codes.InvalidArgument, "remote MCP registration must not include stdio fields")
 		}
-		id, err = s.svc.RegisterRemoteMCPServer(ctx, req.GetName(), req.GetUrl(), req.GetHeaders())
+		id, err = s.svc.RegisterRemoteMCPServer(ctx, req.GetName(), req.GetUrl(), req.GetHeaders(), req.GetSecretHeaders())
 	} else {
+		if len(req.GetHeaders())+len(req.GetSecretHeaders()) > 0 {
+			return nil, status.Error(codes.InvalidArgument, "headers are only supported for remote MCP servers")
+		}
 		id, err = s.svc.RegisterMCPServer(ctx, req.GetName(), req.GetCommand(), req.GetArguments(), req.GetWorkingDirectory())
 	}
 	if err != nil {

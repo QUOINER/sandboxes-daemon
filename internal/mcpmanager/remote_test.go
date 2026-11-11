@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -41,10 +43,11 @@ func (s *memoryMCPState) SetSetting(ctx context.Context, key, value string) erro
 func TestPrepareRemoteServerFailsClosed(t *testing.T) {
 	allow := func(string) bool { return true }
 	cases := []struct {
-		name    string
-		rawURL  string
-		headers map[string]string
-		wantErr string
+		name          string
+		rawURL        string
+		headers       map[string]string
+		secretHeaders map[string]string
+		wantErr       string
 	}{
 		{name: "http scheme", rawURL: "http://mcp.example.com/mcp", wantErr: "https"},
 		{name: "userinfo", rawURL: "https://user:pass@mcp.example.com/mcp", wantErr: "credentials"},
@@ -52,30 +55,64 @@ func TestPrepareRemoteServerFailsClosed(t *testing.T) {
 		{name: "non-default port", rawURL: "https://mcp.example.com:8443/mcp", wantErr: "port"},
 		{name: "query", rawURL: "https://mcp.example.com/mcp?x=1", wantErr: "query"},
 		{name: "fragment", rawURL: "https://mcp.example.com/mcp#x", wantErr: "query"},
-		{name: "authorization header", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer x"}, wantErr: "host-vault"},
-		{name: "malformed placeholder", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer ${}"}, wantErr: "placeholder"},
-		{name: "crlf header value", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Test": "a\r\nb"}, wantErr: "header value"},
+		{name: "authorization header", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer x"}, wantErr: "static MCP headers are disabled"},
+		{name: "custom credential under arbitrary name", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Session": "credential"}, wantErr: "static MCP headers are disabled"},
+		{name: "placeholder in static header", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Team": "${team}"}, wantErr: "static MCP headers are disabled"},
+		{name: "literal secret header", rawURL: "https://mcp.example.com/mcp", secretHeaders: map[string]string{"X-API-Key": "actual-secret"}, wantErr: "placeholder"},
+		{name: "case-insensitive duplicate headers", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Team": "one", "x-team": "two"}, wantErr: "static MCP headers are disabled"},
+		{name: "static and secret duplicate", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Team": "public"}, secretHeaders: map[string]string{"x-team": "${team}"}, wantErr: "static MCP headers are disabled"},
+		{name: "malformed placeholder", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"Authorization": "Bearer ${}"}, wantErr: "static MCP headers are disabled"},
+		{name: "crlf header value", rawURL: "https://mcp.example.com/mcp", headers: map[string]string{"X-Test": "a\r\nb"}, wantErr: "static MCP headers are disabled"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := prepareRemoteServer("fixture", tc.rawURL, tc.headers, allow); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+			if _, err := prepareRemoteServer("fixture", tc.rawURL, tc.headers, tc.secretHeaders, allow); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("err = %v, want %q", err, tc.wantErr)
 			}
 		})
 	}
-	if _, err := prepareRemoteServer("fixture", "https://mcp.example.com/mcp", nil, func(string) bool { return false }); err == nil || !strings.Contains(err.Error(), "not allowed") {
+	if _, err := prepareRemoteServer("fixture", "https://mcp.example.com/mcp", nil, nil, func(string) bool { return false }); err == nil || !strings.Contains(err.Error(), "not allowed") {
 		t.Fatalf("disallowed host err = %v", err)
 	}
-	server, err := prepareRemoteServer("fixture", "https://MCP.example.com/mcp", map[string]string{"X-Team": "docs"}, allow)
+	server, err := prepareRemoteServer("fixture", "https://MCP.example.com/mcp", nil, map[string]string{"X-Team": "${team}"}, allow)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if server.Transport != transportRemote || server.URL != "https://mcp.example.com:443/mcp" {
 		t.Fatalf("server = %+v", server)
 	}
-	if server.Headers["X-Team"] != "docs" {
-		t.Fatalf("headers = %+v", server.Headers)
+	if server.SecretHeaders["X-Team"] != "${team}" {
+		t.Fatalf("secret headers = %+v", server.SecretHeaders)
 	}
+}
+
+func TestHeaderTransportBindsSecretsToApprovedPort(t *testing.T) {
+	transport := headerTransport{base: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: http.NoBody}, nil
+	}), host: "mcp.example.test", origin: "mcp.example.test:443"}
+	for _, rawURL := range []string{"https://mcp.example.test/mcp", "https://mcp.example.test:443/mcp"} {
+		endpoint, err := url.Parse(rawURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := transport.RoundTrip(&http.Request{URL: endpoint, Header: make(http.Header)}); err != nil {
+			t.Fatalf("approved origin %q rejected: %v", rawURL, err)
+		}
+	}
+	endpoint, err := url.Parse("https://mcp.example.test:444/mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = transport.RoundTrip(&http.Request{URL: endpoint, Header: make(http.Header)})
+	if err == nil || !strings.Contains(err.Error(), "escaped its approved origin") {
+		t.Fatalf("alternate-port request error = %v", err)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }
 
 type approvingProvider struct {
@@ -99,7 +136,7 @@ func TestRemoteRegistrationApprovalAndPolicyRevocation(t *testing.T) {
 	provider := &approvingProvider{}
 	manager.SetApprovalProvider(provider)
 
-	id, err := manager.RegisterRemote(ctx, "remote-fixture", "https://mcp.example.com/mcp", map[string]string{"Authorization": "Bearer ${token}"})
+	id, err := manager.RegisterRemote(ctx, "remote-fixture", "https://mcp.example.com/mcp", nil, map[string]string{"X-Team": "${team}", "Authorization": "Bearer ${token}", "X-API-Key": "${api_key}"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +148,7 @@ func TestRemoteRegistrationApprovalAndPolicyRevocation(t *testing.T) {
 		t.Fatalf("summary = %+v", summary)
 	}
 	stored, err := state.GetSetting(ctx, "mcp_stdio_servers_v1")
-	if err != nil || strings.Contains(stored, "synthetic-remote-token") || !strings.Contains(stored, "${token}") {
+	if err != nil || strings.Contains(stored, "synthetic-remote-token") || !strings.Contains(stored, "${token}") || !strings.Contains(stored, "${api_key}") {
 		t.Fatalf("registry contains secret or lost placeholder: value=%q err=%v", stored, err)
 	}
 	if len(provider.requests) != 1 || provider.requests[0].URL != "https://mcp.example.com:443/mcp" {
@@ -129,6 +166,77 @@ func TestRemoteRegistrationApprovalAndPolicyRevocation(t *testing.T) {
 	}
 }
 
+func TestLegacyRemoteHeadersFailClosedWithoutTrustedProvider(t *testing.T) {
+	ctx := context.Background()
+	state := &memoryMCPState{values: map[string]string{
+		"mcp_stdio_servers_v1": `[{"name":"legacy","transport":"remote","url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer legacy-synthetic"}}]`,
+	}}
+	manager, err := New(ctx, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = manager.Close() }()
+	manager.SetRemoteAllowlist([]string{"mcp.example.com"})
+	dialed := false
+	manager.remoteDial = func(context.Context, string, string) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("unexpected remote dial")
+	}
+	callID, err := manager.RequestCall("sb-owned", "legacy", "fixture_tool", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ApproveCall(ctx, callID, func(context.Context, string) error { return nil }); err == nil || !strings.Contains(err.Error(), "trusted MCP host approval provider is unavailable") {
+		t.Fatalf("legacy remote call without trusted provider err=%v", err)
+	}
+	if dialed {
+		t.Fatal("legacy remote headers reached the transport without trusted approval")
+	}
+	stored, err := state.GetSetting(ctx, "mcp_stdio_servers_v1")
+	if err != nil || strings.Contains(stored, "legacy-synthetic") || !strings.Contains(stored, `"legacy"`) {
+		t.Fatalf("legacy static header was not migrated or record was lost: stored=%q err=%v", stored, err)
+	}
+}
+
+func TestRemotePolicyRevokedDuringApprovalDoesNotResolveSecrets(t *testing.T) {
+	ctx := context.Background()
+	manager, err := New(ctx, &memoryMCPState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	manager.SetRemoteAllowlist([]string{"mcp.example.test"})
+	var resolutions int
+	manager.SetRemoteSecretResolver(func(context.Context, string, string) ([]byte, error) {
+		resolutions++
+		return []byte("synthetic-secret"), nil
+	})
+	manager.SetApprovalProvider(testApprovalProvider{})
+	registrationID, err := manager.RegisterRemote(ctx, "remote-fixture", "https://mcp.example.test/mcp", nil, map[string]string{
+		"Authorization": "Bearer ${token}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ApproveRegistration(ctx, registrationID); err != nil {
+		t.Fatal(err)
+	}
+	callID, err := manager.RequestCall("sb-owned", "remote-fixture", "echo", []byte(`{"value":"synthetic"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.SetApprovalProvider(approvalCallback(func(context.Context, ApprovalRequest) error {
+		manager.SetRemoteAllowlist(nil)
+		return nil
+	}))
+	if _, err := manager.ApproveCall(ctx, callID, func(context.Context, string) error { return nil }); err == nil || !strings.Contains(err.Error(), "no longer allowed") {
+		t.Fatalf("remote call after policy revocation err=%v", err)
+	}
+	if resolutions != 0 {
+		t.Fatalf("revoked remote server resolved %d vault values", resolutions)
+	}
+}
+
 func TestRemoteSessionAgainstStreamableServer(t *testing.T) {
 	server := mcp.NewServer(&mcp.Implementation{Name: "fixture-remote", Version: "0.0.1"}, nil)
 	server.AddTool(&mcp.Tool{Name: "fixture_tool", Description: "fixture", InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -137,7 +245,7 @@ func TestRemoteSessionAgainstStreamableServer(t *testing.T) {
 	streamableHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
 	var authorizationSeen int
 	httpServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer synthetic-remote-token" {
+		if r.Header.Get("Authorization") != "Bearer ${suffix}" || r.Header.Get("X-API-Key") != "synthetic-api-key" || r.Header.Get("X-Composite") != "${suffix}/synthetic-suffix" {
 			t.Errorf("authorization = %q, want host-vault token", r.Header.Get("Authorization"))
 		} else {
 			authorizationSeen++
@@ -169,14 +277,20 @@ func TestRemoteSessionAgainstStreamableServer(t *testing.T) {
 	// Pin the test CA; production uses the system trust store.
 	manager.SetRemoteTLSConfig(&tls.Config{InsecureSkipVerify: true}) // #nosec G402 -- self-signed controlled httptest endpoint.
 
-	registered := Server{Name: "remote-fixture", Transport: transportRemote, URL: "https://mcp.example.test:443", Headers: map[string]string{"Authorization": "Bearer ${token}"}}
+	registered := Server{Name: "remote-fixture", Transport: transportRemote, URL: "https://mcp.example.test:443", SecretHeaders: map[string]string{"Authorization": "Bearer ${token}", "X-API-Key": "${api_key}", "X-Composite": "${token}/${suffix}"}}
 	var secretResolutions int
 	manager.SetRemoteSecretResolver(func(_ context.Context, serverName, placeholder string) ([]byte, error) {
-		if serverName != "remote-fixture" || placeholder != "token" {
+		if serverName != "remote-fixture" || placeholder != "token" && placeholder != "api_key" && placeholder != "suffix" {
 			t.Errorf("resolver request = %q/%q", serverName, placeholder)
 		}
 		secretResolutions++
-		return []byte("synthetic-remote-token"), nil
+		if placeholder == "api_key" {
+			return []byte("synthetic-api-key"), nil
+		}
+		if placeholder == "suffix" {
+			return []byte("synthetic-suffix"), nil
+		}
+		return []byte("${suffix}"), nil
 	})
 	session, err := manager.startRemoteSession(context.Background(), registered)
 	if err != nil {
@@ -193,7 +307,7 @@ func TestRemoteSessionAgainstStreamableServer(t *testing.T) {
 	if len(result.Content) != 1 {
 		t.Fatalf("content = %+v", result.Content)
 	}
-	if authorizationSeen == 0 || secretResolutions != authorizationSeen {
+	if authorizationSeen == 0 || secretResolutions != authorizationSeen*4 {
 		t.Fatalf("authorization requests=%d vault resolutions=%d", authorizationSeen, secretResolutions)
 	}
 }

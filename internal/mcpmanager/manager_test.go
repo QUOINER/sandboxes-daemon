@@ -26,6 +26,12 @@ func (p testApprovalProvider) Approve(context.Context, ApprovalRequest) error {
 	return nil
 }
 
+type approvalCallback func(context.Context, ApprovalRequest) error
+
+func (callback approvalCallback) Approve(ctx context.Context, request ApprovalRequest) error {
+	return callback(ctx, request)
+}
+
 func (s *memoryState) GetSetting(_ context.Context, key string) (string, error) {
 	return s.values[key], nil
 }
@@ -170,6 +176,83 @@ func TestCallRequiresOneUseApprovalAndRejectsChangedExecutable(t *testing.T) {
 	}
 	if _, err = manager.ApproveCall(ctx, callID, func(context.Context, string) error { return nil }); err == nil || !strings.Contains(err.Error(), "changed after approval") {
 		t.Fatalf("changed executable error=%v", err)
+	}
+}
+
+func TestRemovedServerDuringApprovalCannotExecuteCall(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires the POSIX MCP process fixture")
+	}
+	ctx := context.Background()
+	manager, err := New(ctx, &memoryState{values: map[string]string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	manager.SetApprovalProvider(testApprovalProvider{})
+	command, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registrationID, err := manager.Register(ctx, "fixture", command, []string{"-test.run=^TestMCPProcessFixture$"}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ApproveRegistration(ctx, registrationID); err != nil {
+		t.Fatal(err)
+	}
+	callID, err := manager.RequestCall("sb-owned", "fixture", "echo", []byte(`{"value":"synthetic"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.SetApprovalProvider(approvalCallback(func(ctx context.Context, _ ApprovalRequest) error {
+		_, err := manager.Remove(ctx, "fixture")
+		return err
+	}))
+	if _, err := manager.ApproveCall(ctx, callID, func(context.Context, string) error { return nil }); err == nil || !strings.Contains(err.Error(), "registration changed") {
+		t.Fatalf("call after concurrent server removal err=%v", err)
+	}
+	if got := manager.List(); len(got) != 0 {
+		t.Fatalf("removed MCP server remained registered: %+v", got)
+	}
+}
+
+func TestRemovedRemoteServerDuringApprovalDoesNotResolveSecrets(t *testing.T) {
+	ctx := context.Background()
+	manager, err := New(ctx, &memoryState{values: map[string]string{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	manager.SetRemoteAllowlist([]string{"mcp.example.test"})
+	var resolutions int
+	manager.SetRemoteSecretResolver(func(context.Context, string, string) ([]byte, error) {
+		resolutions++
+		return []byte("synthetic-secret"), nil
+	})
+	manager.SetApprovalProvider(testApprovalProvider{})
+	registrationID, err := manager.RegisterRemote(ctx, "remote-fixture", "https://mcp.example.test/mcp", nil, map[string]string{
+		"Authorization": "Bearer ${token}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ApproveRegistration(ctx, registrationID); err != nil {
+		t.Fatal(err)
+	}
+	callID, err := manager.RequestCall("sb-owned", "remote-fixture", "echo", []byte(`{"value":"synthetic"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.SetApprovalProvider(approvalCallback(func(ctx context.Context, _ ApprovalRequest) error {
+		_, err := manager.Remove(ctx, "remote-fixture")
+		return err
+	}))
+	if _, err := manager.ApproveCall(ctx, callID, func(context.Context, string) error { return nil }); err == nil || !strings.Contains(err.Error(), "registration changed") {
+		t.Fatalf("remote call after registration removal err=%v", err)
+	}
+	if resolutions != 0 {
+		t.Fatalf("removed remote server resolved %d vault values", resolutions)
 	}
 }
 

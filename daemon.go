@@ -139,6 +139,9 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 		return err
 	}
 	defer func() { runErr = errors.Join(runErr, credentialCleanup()) }()
+	if err := svc.InitializeMCPRegistry(ctx); err != nil {
+		return fmt.Errorf("initialize MCP registry: %w", err)
+	}
 	changed, err := svc.Reconcile(ctx)
 	if err != nil {
 		return fmt.Errorf("reconcile: %w", err)
@@ -147,11 +150,8 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 		slog.Info("reconciled interrupted state", "records", changed)
 	}
 	var policySync *policySyncRunner
-	if cfg.PolicySync != nil {
-		policySync, err = newPolicySyncRunner(*cfg.PolicySync, st)
-		if err != nil {
-			return fmt.Errorf("configure policy sync: %w", err)
-		}
+	if err := configurePolicySync(&cfg, st, &policySync); err != nil {
+		return err
 	}
 	lis, err := listenDaemon(ctx, cfg.SocketPath)
 	if err != nil {
@@ -175,6 +175,18 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	if err := grpcServer.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 		return fmt.Errorf("serve: %w", err)
 	}
+	return nil
+}
+
+func configurePolicySync(cfg *Config, st *store.Store, target **policySyncRunner) error {
+	if cfg.PolicySync == nil {
+		return nil
+	}
+	runner, err := newPolicySyncRunner(*cfg.PolicySync, st)
+	if err != nil {
+		return fmt.Errorf("configure policy sync: %w", err)
+	}
+	*target = runner
 	return nil
 }
 
