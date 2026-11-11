@@ -44,3 +44,4 @@ if "$extract" 0.0.042 "$fixture" >"$actual" 2>"$tmp_dir/error"; then
   printf 'accepted version with a leading zero\n' >&2
   exit 1
 fi
+printf 'PASS: release note extraction rejects malformed, duplicate, missing, and empty sections\n'
