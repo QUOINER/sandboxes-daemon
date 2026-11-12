@@ -30,15 +30,6 @@ func listenDaemon(_ context.Context, address string) (net.Listener, error) {
 	})
 }
 
-func ensureSocketAvailable(path string) error {
-	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("inspect daemon endpoint: %w", err)
-	}
-	return fmt.Errorf("daemon endpoint path already exists")
-}
-
 func daemonPipePath(address string) (string, string, error) {
 	sid, err := currentUserSID()
 	if err != nil {

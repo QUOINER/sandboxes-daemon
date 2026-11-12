@@ -19,14 +19,8 @@ type accountingInfo struct {
 }
 
 func startTree(cmd *exec.Cmd) (func() error, func() error, error) {
-	job, err := windows.CreateJobObject(nil, nil)
+	job, err := newKillOnCloseJob()
 	if err != nil {
-		return nil, nil, err
-	}
-	var limits windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	if _, err = windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
-		_ = windows.CloseHandle(job)
 		return nil, nil, err
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_SUSPENDED}
@@ -41,7 +35,11 @@ func startTree(cmd *exec.Cmd) (func() error, func() error, error) {
 		_ = windows.CloseHandle(job)
 		return nil, nil, cause
 	}
-	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(cmd.Process.Pid))
+	pid, err := windowsProcessID(cmd.Process.Pid)
+	if err != nil {
+		return abort(err)
+	}
+	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
 		return abort(err)
 	}
@@ -52,7 +50,7 @@ func startTree(cmd *exec.Cmd) (func() error, func() error, error) {
 	if err = windows.CloseHandle(process); err != nil {
 		return abort(err)
 	}
-	thread, err := primaryThread(uint32(cmd.Process.Pid))
+	thread, err := primaryThread(pid)
 	if err != nil {
 		return abort(err)
 	}
@@ -66,6 +64,7 @@ func startTree(cmd *exec.Cmd) (func() error, func() error, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		var info accountingInfo
+		// #nosec G103 -- x/sys/windows accepts uintptr; the synchronous API writes the basic job accounting structure.
 		if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation, uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), nil); err != nil {
 			return err
 		}
@@ -79,6 +78,20 @@ func startTree(cmd *exec.Cmd) (func() error, func() error, error) {
 	}
 	finish := func() error { return windows.CloseHandle(job) }
 	return kill, finish, nil
+}
+
+func newKillOnCloseJob() (windows.Handle, error) {
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return 0, err
+	}
+	var limits windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	// #nosec G103 -- x/sys/windows accepts uintptr; the synchronous API reads this initialized, blittable job limit structure.
+	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
+		return 0, errors.Join(err, windows.CloseHandle(job))
+	}
+	return job, nil
 }
 
 func primaryThread(pid uint32) (handle windows.Handle, err error) {
@@ -112,6 +125,14 @@ func primaryThread(pid uint32) (handle windows.Handle, err error) {
 	}
 	return windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, id)
 }
+
+func windowsProcessID(pid int) (uint32, error) {
+	if pid <= 0 || uint64(pid) > uint64(^uint32(0)) {
+		return 0, errors.New("MCP process ID is outside the Windows process ID range")
+	}
+	return uint32(pid), nil
+}
+
 func unexpectedCount(count uint32) error {
 	if count == 1 {
 		return nil
