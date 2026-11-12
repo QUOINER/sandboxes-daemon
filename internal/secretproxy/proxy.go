@@ -705,10 +705,6 @@ func (m *Manager) RevokeSecret(service, sandboxName, scope string) error {
 	return errors.Join(failures...)
 }
 
-func outboundTransport(requirePublicIP bool, dialOverride func(context.Context, string, string) (net.Conn, error)) *http.Transport {
-	return outboundTransportWithPolicy(requirePublicIP, dialOverride, nil)
-}
-
 func outboundTransportWithPolicy(requirePublicIP bool, dialOverride func(context.Context, string, string) (net.Conn, error), authorize func(context.Context, netip.Addr) (bool, error)) *http.Transport {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
@@ -731,15 +727,6 @@ func outboundTransportWithPolicy(requirePublicIP bool, dialOverride func(context
 		},
 	}
 	return transport
-}
-
-func dialPublicUnicast(
-	ctx context.Context,
-	network, address string,
-	lookup func(context.Context, string) ([]net.IPAddr, error),
-	dial func(context.Context, string, string) (net.Conn, error),
-) (net.Conn, error) {
-	return dialPublicUnicastWithPolicy(ctx, network, address, lookup, dial, nil)
 }
 
 func dialPublicUnicastWithPolicy(
@@ -790,11 +777,6 @@ func dialPublicUnicastWithPolicy(
 		return nil, errors.New("proxy upstream has no usable addresses")
 	}
 	return nil, errors.Join(failures...)
-}
-
-func isPublicUnicast(ip net.IP) bool {
-	address, ok := netip.AddrFromSlice(ip)
-	return ok && daemonnetwork.IsPublicUnicast(address)
 }
 
 func validUnixStart(ctx context.Context, sandbox, service string, secret []byte, socketPath, token string, allowEmptySecret bool) error {

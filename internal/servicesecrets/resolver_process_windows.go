@@ -27,15 +27,8 @@ type resolverJobAccountingInfo struct {
 }
 
 func startResolverProcess(command *exec.Cmd) (func() error, func() error, error) {
-	job, err := windows.CreateJobObject(nil, nil)
+	job, err := newResolverKillOnCloseJob()
 	if err != nil {
-		return nil, nil, err
-	}
-	var limits windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
-		_ = windows.CloseHandle(job)
 		return nil, nil, err
 	}
 	command.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_SUSPENDED}
@@ -50,7 +43,11 @@ func startResolverProcess(command *exec.Cmd) (func() error, func() error, error)
 		_ = command.Wait()
 		return nil, nil, startErr
 	}
-	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(command.Process.Pid))
+	pid, err := windowsProcessID(command.Process.Pid)
+	if err != nil {
+		return abort(err)
+	}
+	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
 		return abort(err)
 	}
@@ -61,7 +58,7 @@ func startResolverProcess(command *exec.Cmd) (func() error, func() error, error)
 	if err := windows.CloseHandle(process); err != nil {
 		return abort(err)
 	}
-	thread, err := suspendedPrimaryThread(uint32(command.Process.Pid))
+	thread, err := suspendedPrimaryThread(pid)
 	if err != nil {
 		return abort(err)
 	}
@@ -75,6 +72,7 @@ func startResolverProcess(command *exec.Cmd) (func() error, func() error, error)
 		terminateMu.Lock()
 		defer terminateMu.Unlock()
 		var info resolverJobAccountingInfo
+		// #nosec G103 -- x/sys/windows accepts uintptr; the synchronous API writes the basic job accounting structure.
 		if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation,
 			uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), nil); err != nil {
 			return err
@@ -93,6 +91,21 @@ func startResolverProcess(command *exec.Cmd) (func() error, func() error, error)
 	return terminate, cleanup, nil
 }
 
+func newResolverKillOnCloseJob() (windows.Handle, error) {
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return 0, err
+	}
+	var limits windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	// #nosec G103 -- x/sys/windows accepts uintptr; the synchronous API reads this initialized, blittable job limit structure.
+	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
+		return 0, errors.Join(err, windows.CloseHandle(job))
+	}
+	return job, nil
+}
+
 func waitForResolverJobExit(job windows.Handle, timeout time.Duration) error {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -100,6 +113,7 @@ func waitForResolverJobExit(job windows.Handle, timeout time.Duration) error {
 	defer ticker.Stop()
 	for {
 		var info resolverJobAccountingInfo
+		// #nosec G103 -- x/sys/windows accepts uintptr; the synchronous API writes the basic job accounting structure.
 		if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation,
 			uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), nil); err != nil {
 			return errors.New("query secret resolver job state")
@@ -115,12 +129,19 @@ func waitForResolverJobExit(job windows.Handle, timeout time.Duration) error {
 	}
 }
 
-func suspendedPrimaryThread(processID uint32) (windows.Handle, error) {
+func suspendedPrimaryThread(processID uint32) (handle windows.Handle, returnErr error) {
 	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
 	if err != nil {
 		return 0, err
 	}
-	defer windows.CloseHandle(snapshot)
+	defer func() {
+		closeErr := windows.CloseHandle(snapshot)
+		if closeErr != nil && handle != 0 {
+			closeErr = errors.Join(closeErr, windows.CloseHandle(handle))
+			handle = 0
+		}
+		returnErr = errors.Join(returnErr, closeErr)
+	}()
 	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
 	if err := windows.Thread32First(snapshot, &entry); err != nil {
 		return 0, err
@@ -149,6 +170,13 @@ func suspendedPrimaryThread(processID uint32) (windows.Handle, error) {
 		return 0, err
 	}
 	return thread, nil
+}
+
+func windowsProcessID(pid int) (uint32, error) {
+	if pid <= 0 || uint64(pid) > uint64(^uint32(0)) {
+		return 0, errors.New("secret resolver process ID is outside the Windows process ID range")
+	}
+	return uint32(pid), nil
 }
 
 func unexpectedSuspendCount(previous uint32) error {
