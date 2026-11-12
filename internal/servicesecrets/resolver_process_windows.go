@@ -134,7 +134,14 @@ func suspendedPrimaryThread(processID uint32) (handle windows.Handle, returnErr 
 	if err != nil {
 		return 0, err
 	}
-	defer func() { returnErr = errors.Join(returnErr, windows.CloseHandle(snapshot)) }()
+	defer func() {
+		closeErr := windows.CloseHandle(snapshot)
+		if closeErr != nil && handle != 0 {
+			closeErr = errors.Join(closeErr, windows.CloseHandle(handle))
+			handle = 0
+		}
+		returnErr = errors.Join(returnErr, closeErr)
+	}()
 	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
 	if err := windows.Thread32First(snapshot, &entry); err != nil {
 		return 0, err

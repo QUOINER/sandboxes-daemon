@@ -99,7 +99,14 @@ func primaryThread(pid uint32) (handle windows.Handle, err error) {
 	if err != nil {
 		return 0, err
 	}
-	defer func() { err = errors.Join(err, windows.CloseHandle(snapshot)) }()
+	defer func() {
+		closeErr := windows.CloseHandle(snapshot)
+		if closeErr != nil && handle != 0 {
+			closeErr = errors.Join(closeErr, windows.CloseHandle(handle))
+			handle = 0
+		}
+		err = errors.Join(err, closeErr)
+	}()
 	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
 	if firstErr := windows.Thread32First(snapshot, &entry); firstErr != nil {
 		return 0, firstErr
