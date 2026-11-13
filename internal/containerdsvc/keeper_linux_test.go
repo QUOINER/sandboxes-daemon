@@ -197,7 +197,7 @@ func cleanupSocketGenerations(plan Plan) error {
 		return fmt.Errorf("read managed socket directory: %w", err)
 	}
 	for _, entry := range entries {
-		if !strings.HasPrefix(entry.Name(), prefix) || !(strings.HasSuffix(entry.Name(), ".sock") || strings.HasSuffix(entry.Name(), ".sock.ttrpc")) {
+		if !strings.HasPrefix(entry.Name(), prefix) || (!strings.HasSuffix(entry.Name(), ".sock") && !strings.HasSuffix(entry.Name(), ".sock.ttrpc")) {
 			continue
 		}
 		path := filepath.Join(plan.SocketDir, entry.Name())
