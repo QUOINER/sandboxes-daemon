@@ -44,9 +44,12 @@ Runtime mode is explicit:
 # state-only default
 sandboxesd --state "$HOME/.sandboxes"
 
-# containerd/nerdbox backend
+# daemon-owned containerd/nerdbox backend
 sandboxesd --state "$HOME/.sandboxes" \
-  --containerd "$HOME/.sandboxes/containerd/containerd.sock" \
+  --containerd "/absolute/path/to/containerd" \
+  --ctr "/absolute/path/to/ctr" \
+  --runtime-dir "/absolute/path/to/runtime/bin" \
+  --runtime-assets "/absolute/path/to/runtime/assets" \
   --gvproxy "$HOME/.sandboxes/bin/gvproxy-policy-v2" \
   --dns-upstream 1.1.1.1:53 \
   --image docker.io/library/alpine:3.22
@@ -107,10 +110,29 @@ daemon accepts only a static Linux ARM64 ELF helper. If the helper is absent,
 `${proxy:service}` fails closed. Proxy-enabled sandboxes currently support one
 service per sandbox.
 
-Empty `--containerd` keeps the state-only control plane. With a runtime backend,
-create/start/stop/delete call the runtime adapter. With `--gvproxy`, the daemon
-also starts a default-deny gateway and attaches nerdbox network annotations;
-exec/PTY still remain unsupported.
+Empty `--containerd` keeps the state-only control plane. Runtime mode requires
+the exact containerd and `ctr` v2.4.2 binaries plus the explicit shim and runtime
+asset paths. The daemon owns containerd: it creates its root, state, config and
+Unix sockets beneath `<state>/containerd`, verifies any existing config against
+the generated values. On Linux a state-owned keeper preserves the private mount
+namespace across daemon restarts and supervises containerd in that namespace.
+Daemon shutdown detaches from the Linux keeper. There is no user-facing keeper
+stop command yet: an empty-task query races same-UID `ctr` clients that can
+create tasks concurrently. The keeper refuses to unlink any socket pathname
+left by a killed child, so that recovery currently fails closed and may require
+operator recovery. A dead keeper marker also fails closed rather than starting
+a new namespace over potentially live shim mounts. Restart the daemon with the
+same state and runtime paths to reattach to a live keeper. After a host reboot
+the old namespace cannot survive, so the marker is cleared only after the
+read-only mount precheck. No supported manual cleanup procedure for a dead
+same-boot keeper is provided yet. On Linux the launcher requires permission to
+create a private mount namespace and fails closed if it cannot.
+On macOS the launcher supervises containerd and terminates it when the daemon
+exits. Runtime asset digest and
+provenance verification remains a separate release gate. With a runtime
+backend, create/start/stop/delete call the runtime adapter. With `--gvproxy`,
+the daemon also starts a default-deny gateway and attaches nerdbox network
+annotations; exec/PTY still remain unsupported.
 
 `RegistryCredentialService` stores registry login entries in macOS Keychain,
 Windows Credential Manager, or Linux Secret Service. It fails closed when the

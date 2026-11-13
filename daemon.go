@@ -25,10 +25,12 @@ import (
 
 // Config is the daemon configuration.
 type Config struct {
-	SocketPath   string
-	StateDir     string
-	Backend      runtime.Backend
-	DefaultImage string
+	SocketPath      string
+	StateDir        string
+	Backend         runtime.Backend
+	BackendFactory  func(context.Context) (runtime.Backend, func() error, <-chan error, error)
+	RuntimeFailures <-chan error
+	DefaultImage    string
 	// IPv6Enabled accepts IPv6 CIDR rules only when the gateway datapath was
 	// configured with the experimental IPv6 capability. It defaults to false.
 	IPv6Enabled bool
@@ -126,7 +128,24 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	}
 	defer func() { _ = lock.Close() }()
 	defer func() { runErr = errors.Join(runErr, runCleanup(cfg.Cleanup)) }()
-	st, err := store.Open(ctx, filepath.Join(cfg.StateDir, "sandboxes.db"))
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	if err := startBackendFactory(runCtx, &cfg); err != nil {
+		return err
+	}
+	runtimeFailure := make(chan error, 1)
+	defer func() {
+		if runErr == nil {
+			return
+		}
+		select {
+		case runtimeErr := <-runtimeFailure:
+			runErr = errors.Join(runErr, fmt.Errorf("managed runtime stopped: %w", runtimeErr))
+		default:
+		}
+	}()
+	go watchRuntimeFailure(runCtx, cfg.RuntimeFailures, runtimeFailure, cancelRun)
+	st, err := store.Open(runCtx, filepath.Join(cfg.StateDir, "sandboxes.db"))
 	if err != nil {
 		return err
 	}
@@ -134,15 +153,15 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 
 	svc := service.New(st, cfg.Backend)
 	defer func() { runErr = errors.Join(runErr, svc.Close()) }()
-	credentialCleanup, err := configureService(ctx, &cfg, svc)
+	credentialCleanup, err := configureService(runCtx, &cfg, svc)
 	if err != nil {
 		return err
 	}
 	defer func() { runErr = errors.Join(runErr, credentialCleanup()) }()
-	if err := svc.InitializeMCPRegistry(ctx); err != nil {
+	if err := svc.InitializeMCPRegistry(runCtx); err != nil {
 		return fmt.Errorf("initialize MCP registry: %w", err)
 	}
-	changed, err := svc.Reconcile(ctx)
+	changed, err := svc.Reconcile(runCtx)
 	if err != nil {
 		return fmt.Errorf("reconcile: %w", err)
 	}
@@ -153,6 +172,10 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	if err := configurePolicySync(&cfg, st, &policySync); err != nil {
 		return err
 	}
+	return serveDaemon(runCtx, &cfg, svc, policySync, runtimeFailure)
+}
+
+func serveDaemon(ctx context.Context, cfg *Config, svc *service.Service, policySync *policySyncRunner, runtimeFailure <-chan error) error {
 	lis, err := listenDaemon(ctx, cfg.SocketPath)
 	if err != nil {
 		return fmt.Errorf("listen local daemon endpoint: %w", err)
@@ -172,10 +195,57 @@ func Run(ctx context.Context, cfg Config) (runErr error) {
 	go stopGRPCOnCancel(ctx, runDone, grpcServer)
 
 	slog.Info("daemon listening", "socket", cfg.SocketPath, "state", cfg.StateDir)
-	if err := grpcServer.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-		return fmt.Errorf("serve: %w", err)
+	serveErr := grpcServer.Serve(lis)
+	select {
+	case runtimeErr := <-runtimeFailure:
+		return fmt.Errorf("managed runtime stopped: %w", runtimeErr)
+	default:
+	}
+	if serveErr != nil && !errors.Is(serveErr, grpc.ErrServerStopped) {
+		return fmt.Errorf("serve: %w", serveErr)
 	}
 	return nil
+}
+
+func startBackendFactory(ctx context.Context, cfg *Config) error {
+	if cfg.BackendFactory == nil {
+		return nil
+	}
+	if cfg.Backend != nil {
+		return fmt.Errorf("backend and backend factory are mutually exclusive")
+	}
+	backend, cleanup, failures, err := cfg.BackendFactory(ctx)
+	if err != nil {
+		return fmt.Errorf("start runtime backend: %w", err)
+	}
+	cfg.Backend = backend
+	cfg.RuntimeFailures = failures
+	if cleanup != nil {
+		priorCleanup := cfg.Cleanup
+		cfg.Cleanup = func() error {
+			var priorErr error
+			if priorCleanup != nil {
+				priorErr = priorCleanup()
+			}
+			return errors.Join(priorErr, cleanup())
+		}
+	}
+	return nil
+}
+
+func watchRuntimeFailure(ctx context.Context, failures <-chan error, output chan<- error, cancel context.CancelFunc) {
+	if failures == nil {
+		return
+	}
+	select {
+	case err, ok := <-failures:
+		if !ok {
+			err = errors.New("managed runtime failure channel closed")
+		}
+		output <- err
+		cancel()
+	case <-ctx.Done():
+	}
 }
 
 func configurePolicySync(cfg *Config, st *store.Store, target **policySyncRunner) error {
