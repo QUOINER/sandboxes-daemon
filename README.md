@@ -113,8 +113,11 @@ service per sandbox.
 Empty `--containerd` keeps the state-only control plane. Runtime mode requires
 the exact containerd and `ctr` v2.4.2 binaries plus the explicit shim and runtime
 asset paths. The daemon owns containerd: it creates its root, state, config and
-Unix sockets beneath `<state>/containerd`, verifies any existing config against
-the generated values. On Linux a state-owned keeper preserves the private mount
+state beneath `<state>/containerd`, verifies any existing config against the
+generated values. Linux Unix sockets use a private per-user directory at
+`/tmp/.rsbx-<uid>` with a stable state-hash endpoint, keeping socket paths below
+the kernel's Unix-domain length limit even when the state path is long. On Linux
+a state-owned keeper preserves the private mount
 namespace across daemon restarts and supervises containerd in that namespace.
 Daemon shutdown detaches from the Linux keeper. There is no user-facing keeper
 stop command yet: an empty-task query races same-UID `ctr` clients that can

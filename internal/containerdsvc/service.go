@@ -73,6 +73,9 @@ func preparePlan(cfg Config) (Plan, error) {
 }
 
 func prepareServiceState(plan Plan) (bool, error) {
+	if err := prepareSocketDirectory(plan); err != nil {
+		return false, err
+	}
 	if persistentKeeper() {
 		if err := precheckStateMounts(plan); err != nil {
 			return false, err

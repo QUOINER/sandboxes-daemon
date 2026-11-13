@@ -23,7 +23,7 @@ type Config struct {
 	StateDir      string
 }
 
-// Plan contains the resolved commands and state-local paths for one instance.
+// Plan contains the resolved commands and runtime paths for one instance.
 type Plan struct {
 	Binary        string
 	CTR           string
@@ -32,6 +32,7 @@ type Plan struct {
 	ServiceDir    string
 	Root          string
 	State         string
+	SocketDir     string
 	Socket        string
 	ConfigFile    string
 	LogFile       string
@@ -59,11 +60,11 @@ func BuildPlan(cfg Config) (Plan, error) {
 	serviceDir := filepath.Join(cfg.StateDir, "containerd")
 	root := filepath.Join(serviceDir, "root")
 	state := filepath.Join(serviceDir, "state")
-	socket := filepath.Join(serviceDir, "containerd.sock")
+	socketDir, socket := managedSocketPaths(serviceDir)
 	plan := Plan{
 		Binary: cfg.Binary, CTR: cfg.CTR,
 		Shim:          filepath.Join(cfg.RuntimeDir, "containerd-shim-nerdbox-v1"),
-		RuntimeAssets: cfg.RuntimeAssets, ServiceDir: serviceDir, Root: root, State: state,
+		RuntimeAssets: cfg.RuntimeAssets, ServiceDir: serviceDir, Root: root, State: state, SocketDir: socketDir,
 		Socket: socket, ConfigFile: filepath.Join(serviceDir, "config.toml"),
 		LogFile:      filepath.Join(serviceDir, "containerd.log"),
 		KeeperMarker: filepath.Join(serviceDir, "keeper.pid"),

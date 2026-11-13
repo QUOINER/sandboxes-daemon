@@ -5,6 +5,8 @@ package containerdsvc
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -187,6 +189,49 @@ func waitForFileLinux(t *testing.T, path string) {
 	t.Fatalf("timed out waiting for %s", path)
 }
 
+func cleanupSocketGenerations(plan Plan) error {
+	stateID := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(plan.Socket), "h-"), ".sock")
+	prefix := "g-" + stateID + "-"
+	entries, err := os.ReadDir(plan.SocketDir)
+	if err != nil {
+		return fmt.Errorf("read managed socket directory: %w", err)
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), prefix) || !strings.HasSuffix(entry.Name(), ".sock") {
+			continue
+		}
+		path := filepath.Join(plan.SocketDir, entry.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("inspect owned socket generation: %w", err)
+		}
+		if info.Mode()&os.ModeSocket == 0 {
+			return fmt.Errorf("owned socket generation has unexpected type; refusing removal")
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove stopped socket generation: %w", err)
+		}
+	}
+	info, err := os.Lstat(plan.Socket)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect stable socket alias: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return fmt.Errorf("stable socket alias has unexpected type; refusing removal")
+	}
+	target, err := os.Readlink(plan.Socket)
+	if err != nil || filepath.Base(target) != target || !strings.HasPrefix(target, prefix) || !strings.HasSuffix(target, ".sock") {
+		return fmt.Errorf("stable socket alias target is not an owned generation; refusing removal")
+	}
+	if err := os.Remove(plan.Socket); err != nil {
+		return fmt.Errorf("remove stable socket alias: %w", err)
+	}
+	return nil
+}
+
 func unmountTestTmpfs(t *testing.T, path string) {
 	t.Helper()
 	mounts, err := mountinfo.GetMounts(mountinfo.PrefixFilter(path))
@@ -281,13 +326,13 @@ func TestPublishSocketAliasRefusesActiveAndStaleSocketPaths(t *testing.T) {
 	if err := os.Chmod(activeDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	activePath := filepath.Join(activeDir, "containerd.sock")
+	activePath := filepath.Join(activeDir, "h-0000000000000000.sock")
 	listener, err := net.Listen("unix", activePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	if err := publishSocketAlias(activePath, filepath.Join(activeDir, "c-1111111111111111.sock"), activeDir, "c-1111111111111111"); err == nil {
+	if err := publishSocketAlias(activePath, filepath.Join(activeDir, "g-0000000000000000-1111111111111111.sock"), activeDir, "g-0000000000000000-1111111111111111"); err == nil {
 		t.Fatal("active socket alias was replaced")
 	}
 	conn, err := net.Dial("unix", activePath)
@@ -300,7 +345,7 @@ func TestPublishSocketAliasRefusesActiveAndStaleSocketPaths(t *testing.T) {
 	if err := os.Chmod(staleDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	stalePath := filepath.Join(staleDir, "containerd.sock")
+	stalePath := filepath.Join(staleDir, "h-0000000000000000.sock")
 	stale, err := net.Listen("unix", stalePath)
 	if err != nil {
 		t.Fatal(err)
@@ -309,7 +354,7 @@ func TestPublishSocketAliasRefusesActiveAndStaleSocketPaths(t *testing.T) {
 	if err := stale.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := publishSocketAlias(stalePath, filepath.Join(staleDir, "c-1111111111111111.sock"), staleDir, "c-1111111111111111"); err == nil {
+	if err := publishSocketAlias(stalePath, filepath.Join(staleDir, "g-0000000000000000-1111111111111111.sock"), staleDir, "g-0000000000000000-1111111111111111"); err == nil {
 		t.Fatal("stale socket alias was replaced")
 	}
 	if _, err := os.Lstat(stalePath); err != nil {
@@ -322,18 +367,18 @@ func TestPublishSocketAliasRotatesOnlyManagedGeneration(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	oldSocket := filepath.Join(dir, "c-1111111111111111.sock")
-	newSocket := filepath.Join(dir, "c-2222222222222222.sock")
+	oldSocket := filepath.Join(dir, "g-0000000000000000-1111111111111111.sock")
+	newSocket := filepath.Join(dir, "g-0000000000000000-2222222222222222.sock")
 	for _, path := range []string{oldSocket, newSocket} {
 		if err := os.WriteFile(path, []byte("owned generation fixture"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	alias := filepath.Join(dir, "containerd.sock")
+	alias := filepath.Join(dir, "h-0000000000000000.sock")
 	if err := os.Symlink(filepath.Base(oldSocket), alias); err != nil {
 		t.Fatal(err)
 	}
-	if err := publishSocketAlias(alias, newSocket, dir, "c-2222222222222222"); err != nil {
+	if err := publishSocketAlias(alias, newSocket, dir, "g-0000000000000000-2222222222222222"); err != nil {
 		t.Fatal(err)
 	}
 	target, err := os.Readlink(alias)
@@ -356,12 +401,13 @@ func TestPublishSocketAliasRefusesUnmanagedPaths(t *testing.T) {
 		if err := os.Chmod(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		listener, err := net.Listen("unix", filepath.Join(dir, "containerd.sock"))
+		alias := filepath.Join(dir, "h-0000000000000000.sock")
+		listener, err := net.Listen("unix", alias)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer func() { _ = listener.Close() }()
-		if err := publishSocketAlias(filepath.Join(dir, "containerd.sock"), filepath.Join(dir, "c-2222222222222222.sock"), dir, "c-2222222222222222"); err == nil {
+		if err := publishSocketAlias(alias, filepath.Join(dir, "g-0000000000000000-2222222222222222.sock"), dir, "g-0000000000000000-2222222222222222"); err == nil {
 			t.Fatal("filesystem socket alias was replaced")
 		}
 	})
@@ -370,14 +416,28 @@ func TestPublishSocketAliasRefusesUnmanagedPaths(t *testing.T) {
 		if err := os.Chmod(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		alias := filepath.Join(dir, "containerd.sock")
+		alias := filepath.Join(dir, "h-0000000000000000.sock")
 		if err := os.Symlink("../foreign.sock", alias); err != nil {
 			t.Fatal(err)
 		}
-		if err := publishSocketAlias(alias, filepath.Join(dir, "c-2222222222222222.sock"), dir, "c-2222222222222222"); err == nil {
+		if err := publishSocketAlias(alias, filepath.Join(dir, "g-0000000000000000-2222222222222222.sock"), dir, "g-0000000000000000-2222222222222222"); err == nil {
 			t.Fatal("foreign symlink target was replaced")
 		}
 	})
+}
+
+func TestManagedSocketPathsFitUnixLimitForLongStatePath(t *testing.T) {
+	serviceDir := filepath.Join("/var/lib/rheic", strings.Repeat("long-state-component-", 8), "containerd")
+	socketDir, socket := managedSocketPaths(serviceDir)
+	if filepath.Dir(socket) != socketDir {
+		t.Fatalf("socket %q is outside socket directory %q", socket, socketDir)
+	}
+	if len(socket+".ttrpc") > 100 {
+		t.Fatalf("containerd TTRPC socket path exceeds Linux Unix path limit: %d bytes", len(socket+".ttrpc"))
+	}
+	if socketDir == serviceDir {
+		t.Fatal("long state path was reused for the Unix socket directory")
+	}
 }
 
 func TestKeeperCrashLoopIsBoundedAndFailsClosed(t *testing.T) {
@@ -492,7 +552,7 @@ func TestPinnedContainerdKeeperSmoke(t *testing.T) {
 		logData, _ := os.ReadFile(filepath.Join(serviceDir, "containerd-smoke.log"))
 		t.Fatalf("containerd did not recover on a new socket generation after SIGKILL; log: %s", strings.TrimSpace(string(logData)))
 	}
-	if _, err := os.Lstat(filepath.Join(serviceDir, firstTarget)); err != nil {
+	if _, err := os.Lstat(filepath.Join(plan.SocketDir, firstTarget)); err != nil {
 		t.Fatalf("previous generation socket was not retained: %v", err)
 	}
 	if err := launcher.Process.Signal(syscall.SIGTERM); err != nil {
@@ -511,6 +571,191 @@ func TestPinnedContainerdKeeperSmoke(t *testing.T) {
 	}
 	if _, err := os.Lstat(plan.KeeperMarker); !os.IsNotExist(err) {
 		t.Fatalf("keeper marker remains after stop: %v", err)
+	}
+	if err := cleanupSocketGenerations(plan); err != nil {
+		t.Fatalf("clean owned socket generations: %v", err)
+	}
+}
+
+func TestPinnedContainerdServiceGuestSurvivesDetachAndReattach(t *testing.T) {
+	values := map[string]string{}
+	for _, key := range []string{"RSBX_TEST_CONTAINERD", "RSBX_TEST_CTR", "RSBX_TEST_SHIM", "RSBX_TEST_ASSETS", "RSBX_TEST_LAUNCHER"} {
+		values[key] = os.Getenv(key)
+		if values[key] == "" {
+			t.Skipf("set %s to run managed guest detach/reattach acceptance", key)
+		}
+	}
+	for _, key := range []string{"RSBX_TEST_CONTAINERD", "RSBX_TEST_CTR", "RSBX_TEST_SHIM", "RSBX_TEST_ASSETS", "RSBX_TEST_LAUNCHER"} {
+		if !filepath.IsAbs(values[key]) {
+			t.Fatalf("%s must be absolute", key)
+		}
+	}
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runtimeDir := filepath.Join(root, "runtime")
+	if err := os.Mkdir(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	shim, err := os.ReadFile(values["RSBX_TEST_SHIM"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	shimPath := filepath.Join(runtimeDir, "containerd-shim-nerdbox-v1")
+	if err := os.WriteFile(shimPath, shim, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(runtimeDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(root, "state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		Binary: values["RSBX_TEST_CONTAINERD"], CTR: values["RSBX_TEST_CTR"],
+		RuntimeDir: runtimeDir, RuntimeAssets: values["RSBX_TEST_ASSETS"], StateDir: stateDir,
+	}
+	plan, err := BuildPlan(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopOwnedKeeper := func() error {
+		reused, keeperErr := existingKeeper(plan)
+		if keeperErr != nil {
+			return keeperErr
+		}
+		if !reused {
+			return nil
+		}
+		fields, keeperErr := keeperMarkerFields(plan.KeeperMarker)
+		if keeperErr != nil {
+			return fmt.Errorf("read owned keeper identity: %w", keeperErr)
+		}
+		if len(fields) != 4 {
+			return fmt.Errorf("owned keeper marker has %d fields, want 4", len(fields))
+		}
+		pid, keeperErr := strconv.Atoi(fields[0])
+		if keeperErr != nil {
+			return fmt.Errorf("parse owned keeper PID: %w", keeperErr)
+		}
+		if keeperErr := syscall.Kill(pid, syscall.SIGTERM); keeperErr != nil && !errors.Is(keeperErr, os.ErrProcessDone) {
+			return fmt.Errorf("stop owned keeper PID %d: %w", pid, keeperErr)
+		}
+		deadline := time.Now().Add(12 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, statErr := os.Lstat(plan.KeeperMarker); os.IsNotExist(statErr) {
+				return nil
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		return fmt.Errorf("owned keeper PID %d did not remove its marker", pid)
+	}
+	var first, second *Service
+	ownedTask := ""
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		if first != nil {
+			if closeErr := first.Close(); closeErr != nil {
+				t.Errorf("detach first acceptance service during cleanup: %v", closeErr)
+			}
+		}
+		if second != nil {
+			if closeErr := second.Close(); closeErr != nil {
+				t.Errorf("detach second acceptance service during cleanup: %v", closeErr)
+			}
+		}
+		if ownedTask != "" {
+			cleanupEnv := environment(runtimeDir, values["RSBX_TEST_ASSETS"], plan.ServiceDir)
+			ctr := func(args ...string) (string, error) {
+				base := []string{"--address", plan.Socket, "--namespace", Namespace}
+				output, commandErr := runCommand(cleanupCtx, cfg.CTR, append(base, args...), cleanupEnv)
+				return strings.TrimSpace(string(output)), commandErr
+			}
+			_, _ = ctr("tasks", "kill", "--signal", "SIGKILL", ownedTask)
+			_, _ = ctr("tasks", "rm", ownedTask)
+			_, _ = ctr("containers", "rm", ownedTask)
+			for _, inventory := range [][]string{{"tasks", "ls"}, {"containers", "ls"}} {
+				output, inventoryErr := ctr(inventory...)
+				if inventoryErr != nil {
+					t.Errorf("verify owned acceptance %s cleanup: %v", inventory[0], inventoryErr)
+				} else if strings.Contains(output, ownedTask) {
+					t.Errorf("owned acceptance ID %q remains in %s inventory: %s", ownedTask, inventory[0], output)
+				}
+			}
+		}
+		if cleanupErr := stopOwnedKeeper(); cleanupErr != nil {
+			t.Errorf("stop uniquely owned acceptance keeper: %v", cleanupErr)
+		} else if cleanupErr := cleanupSocketGenerations(plan); cleanupErr != nil {
+			t.Errorf("clean uniquely owned socket generations: %v", cleanupErr)
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	first, err = Start(ctx, cfg, values["RSBX_TEST_LAUNCHER"])
+	if err != nil {
+		containerdLog, _ := os.ReadFile(plan.LogFile)
+		if len(containerdLog) > 4096 {
+			containerdLog = containerdLog[len(containerdLog)-4096:]
+		}
+		keeperMarker, _ := os.ReadFile(plan.KeeperMarker)
+		t.Fatalf("start managed containerd service: %v; containerd log=%q keeper marker=%q", err, containerdLog, keeperMarker)
+	}
+	env := environment(runtimeDir, values["RSBX_TEST_ASSETS"], plan.ServiceDir)
+	runCtr := func(args ...string) (string, error) {
+		output, commandErr := runCommand(ctx, cfg.CTR, append([]string{"--address", plan.Socket, "--namespace", Namespace}, args...), env)
+		if commandErr != nil {
+			return string(output), fmt.Errorf("ctr %v: %w", args, commandErr)
+		}
+		return strings.TrimSpace(string(output)), nil
+	}
+	image := os.Getenv("RSBX_TEST_GUEST_IMAGE")
+	if image == "" {
+		image = "docker.io/library/alpine@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f"
+	}
+	if _, err := runCtr("images", "pull", "--platform", "linux/arm64", image); err != nil {
+		t.Fatalf("pull pinned synthetic acceptance image: %v", err)
+	}
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		t.Fatal(err)
+	}
+	task := "rheic-managed-reattach-" + hex.EncodeToString(nonce[:])
+	ownedTask = task
+	if _, err := runCtr("run", "--runtime", "io.containerd.nerdbox.v1", "--snapshotter", "overlayfs", "--detach", image, task, "/bin/sh", "-c", "exec sleep 600"); err != nil {
+		t.Fatalf("start owned nerdbox guest task: %v", err)
+	}
+	marker, err := runCtr("tasks", "exec", "--exec-id", "before-detach", task, "/bin/sh", "-c", "echo RHEIC_GUEST_BEFORE_DETACH")
+	if err != nil || marker != "RHEIC_GUEST_BEFORE_DETACH" {
+		t.Fatalf("guest exec before detach: output=%q err=%v", marker, err)
+	}
+	firstIdentity, err := keeperMarkerFields(plan.KeeperMarker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("detach first daemon service: %v", err)
+	}
+	second, err = Start(ctx, cfg, values["RSBX_TEST_LAUNCHER"])
+	if err != nil {
+		t.Fatalf("reattach managed containerd service: %v", err)
+	}
+	secondIdentity, err := keeperMarkerFields(plan.KeeperMarker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstIdentity) != 4 || len(secondIdentity) != 4 || firstIdentity[0] != secondIdentity[0] || firstIdentity[1] != secondIdentity[1] {
+		t.Fatalf("keeper identity changed across daemon detach/reattach: before=%v after=%v", firstIdentity, secondIdentity)
+	}
+	status, err := runCtr("tasks", "ls")
+	if err != nil || !strings.Contains(status, task+" ") || !strings.Contains(status, "RUNNING") {
+		t.Fatalf("guest task did not remain running after reattach: output=%q err=%v", status, err)
+	}
+	marker, err = runCtr("tasks", "exec", "--exec-id", "after-reattach", task, "/bin/sh", "-c", "echo RHEIC_GUEST_AFTER_REATTACH")
+	if err != nil || marker != "RHEIC_GUEST_AFTER_REATTACH" {
+		t.Fatalf("guest exec after reattach: output=%q err=%v", marker, err)
 	}
 }
 

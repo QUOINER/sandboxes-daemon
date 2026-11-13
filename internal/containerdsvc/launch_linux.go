@@ -4,6 +4,7 @@ package containerdsvc
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -77,6 +78,9 @@ func parseLauncherArgs(args []string) (Plan, []string, error) {
 }
 
 func prepareKeeper(plan Plan) (Plan, *os.File, error) {
+	if err := prepareSocketDirectory(plan); err != nil {
+		return Plan{}, nil, fmt.Errorf("prepare managed containerd socket directory: %w", err)
+	}
 	if err := makeRootPrivate(); err != nil {
 		return Plan{}, nil, fmt.Errorf("make mount namespace recursively private: %w", err)
 	}
@@ -144,9 +148,10 @@ func prepareContainerdGeneration(plan Plan, commandArgs []string) ([]string, err
 		if _, err := rand.Read(nonce[:]); err != nil {
 			return nil, fmt.Errorf("generate containerd socket generation: %w", err)
 		}
-		name := "c-" + hex.EncodeToString(nonce[:])
+		stateID := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(plan.Socket), "h-"), ".sock")
+		name := "g-" + stateID + "-" + hex.EncodeToString(nonce[:])
 		generation := plan
-		generation.Socket = filepath.Join(plan.ServiceDir, name+".sock")
+		generation.Socket = filepath.Join(plan.SocketDir, name+".sock")
 		generation.ConfigFile = filepath.Join(plan.ServiceDir, name+".toml")
 		if pathExists(generation.Socket) || pathExists(generation.ConfigFile) {
 			continue
@@ -158,7 +163,7 @@ func prepareContainerdGeneration(plan Plan, commandArgs []string) ([]string, err
 		if err != nil {
 			return nil, err
 		}
-		if err := publishSocketAlias(plan.Socket, generation.Socket, plan.ServiceDir, name); err != nil {
+		if err := publishSocketAlias(plan.Socket, generation.Socket, plan.SocketDir, name); err != nil {
 			return nil, err
 		}
 		return args, nil
@@ -191,8 +196,9 @@ func publishSocketAlias(alias, socket, serviceDir, generation string) error {
 		if info.Mode()&os.ModeSymlink == 0 || !ownedByCurrentUser(info) {
 			return fmt.Errorf("containerd socket alias has unexpected type or owner; refusing replacement")
 		}
+		stateID := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(alias), "h-"), ".sock")
 		oldTarget, readErr := os.Readlink(alias)
-		if readErr != nil || filepath.Base(oldTarget) != oldTarget || !strings.HasPrefix(oldTarget, "c-") || !strings.HasSuffix(oldTarget, ".sock") {
+		if readErr != nil || filepath.Base(oldTarget) != oldTarget || !strings.HasPrefix(oldTarget, "g-"+stateID+"-") || !strings.HasSuffix(oldTarget, ".sock") {
 			return fmt.Errorf("containerd socket alias target is not a managed generation; refusing replacement")
 		}
 	} else if !os.IsNotExist(err) {
@@ -313,15 +319,38 @@ func keeperRestartAllowed(window *time.Time, failures *int, now time.Time) bool 
 }
 
 func keeperPlan(serviceDir string) Plan {
+	socketDir, socket := managedSocketPaths(serviceDir)
 	return Plan{
 		ServiceDir:   serviceDir,
 		Root:         filepath.Join(serviceDir, "root"),
 		State:        filepath.Join(serviceDir, "state"),
-		Socket:       filepath.Join(serviceDir, "containerd.sock"),
+		SocketDir:    socketDir,
+		Socket:       socket,
 		ConfigFile:   filepath.Join(serviceDir, "config.toml"),
 		LogFile:      filepath.Join(serviceDir, "containerd.log"),
 		KeeperMarker: filepath.Join(serviceDir, "keeper.pid"),
 	}
+}
+
+func managedSocketPaths(serviceDir string) (string, string) {
+	socketDir := fmt.Sprintf("/tmp/.rsbx-%d", currentUID())
+	stateHash := sha256.Sum256([]byte(serviceDir))
+	socket := filepath.Join(socketDir, "h-"+hex.EncodeToString(stateHash[:8])+".sock")
+	return socketDir, socket
+}
+
+func prepareSocketDirectory(plan Plan) error {
+	if err := ensurePrivateDir(plan.SocketDir); err != nil {
+		return fmt.Errorf("managed socket directory: %w", err)
+	}
+	mounts, err := mountinfo.GetMounts(mountinfo.PrefixFilter(plan.SocketDir))
+	if err != nil {
+		return fmt.Errorf("inspect managed socket directory mounts: %w", err)
+	}
+	if len(mounts) != 0 {
+		return fmt.Errorf("managed socket directory is a mountpoint: %q", mounts[0].Mountpoint)
+	}
+	return nil
 }
 
 func writeKeeperMarker(serviceDir string) error {

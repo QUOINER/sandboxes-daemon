@@ -41,7 +41,11 @@ func closeParentDeathReader(cmd *exec.Cmd) {
 	}
 }
 
-func persistentKeeper() bool            { return false }
+func persistentKeeper() bool { return false }
+func managedSocketPaths(serviceDir string) (string, string) {
+	return serviceDir, filepath.Join(serviceDir, "containerd.sock")
+}
+func prepareSocketDirectory(Plan) error { return nil }
 func precheckStateMounts(Plan) error    { return nil }
 func existingKeeper(Plan) (bool, error) { return false, nil }
 func RunLauncher(args []string) int {
