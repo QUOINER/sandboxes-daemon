@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Restart Linux containerd after SIGKILL using a fresh socket/config generation and an atomically published stable endpoint. Existing socket paths are preserved; unexpected endpoint types fail closed.
+- Exercise real pinned containerd recovery after SIGKILL in the opt-in Linux keeper smoke.
+
+### Security and limitations
+
+- The Linux generation smoke and owned guest task acceptance do not replace daemon-only SIGKILL reattachment, artifact provenance, platform coverage, or independent M7 review.
+
 ## v0.0.52 — 2026-11-11
 
 ### Fixed

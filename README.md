@@ -118,15 +118,18 @@ the generated values. On Linux a state-owned keeper preserves the private mount
 namespace across daemon restarts and supervises containerd in that namespace.
 Daemon shutdown detaches from the Linux keeper. There is no user-facing keeper
 stop command yet: an empty-task query races same-UID `ctr` clients that can
-create tasks concurrently. The keeper refuses to unlink any socket pathname
-left by a killed child, so that recovery currently fails closed and may require
-operator recovery. A dead keeper marker also fails closed rather than starting
-a new namespace over potentially live shim mounts. Restart the daemon with the
-same state and runtime paths to reattach to a live keeper. After a host reboot
-the old namespace cannot survive, so the marker is cleared only after the
-read-only mount precheck. No supported manual cleanup procedure for a dead
-same-boot keeper is provided yet. On Linux the launcher requires permission to
-create a private mount namespace and fails closed if it cannot.
+create tasks concurrently. Each Linux containerd child receives a fresh
+socket/config generation. The stable `containerd.sock` endpoint is an atomic
+symlink to the active generation, and prior socket paths are left untouched;
+the keeper can therefore restart after a child SIGKILL without unlinking a
+possibly substituted path. An unexpected file or symlink at the stable endpoint
+fails closed. A dead keeper marker also fails closed rather than starting a new
+namespace over potentially live shim mounts. Restart the daemon with the same
+state and runtime paths to reattach to a live keeper. After a host reboot the
+old namespace cannot survive, so the marker is cleared only after the read-only
+mount precheck. No supported manual cleanup procedure for a dead same-boot
+keeper is provided yet. On Linux the launcher requires permission to create a
+private mount namespace and fails closed if it cannot.
 On macOS the launcher supervises containerd and terminates it when the daemon
 exits. Runtime asset digest and
 provenance verification remains a separate release gate. With a runtime

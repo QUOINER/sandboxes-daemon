@@ -36,7 +36,7 @@ func TestContainerdSmokeHarness(t *testing.T) {
 	}
 	serviceDir := os.Getenv("RSBX_REAL_CONTAINERD_SERVICE")
 	binary := os.Getenv("RSBX_TEST_CONTAINERD")
-	args := []string{serviceDir, binary, "--config", filepath.Join(serviceDir, "config.toml"), "--log-level", "info"}
+	args := []string{serviceDir, binary, containerdConfigFlag, filepath.Join(serviceDir, "config.toml"), "--log-level", "info"}
 	os.Exit(RunLauncher(args))
 }
 
@@ -276,15 +276,19 @@ func TestExistingKeeperClearsPriorBootMarker(t *testing.T) {
 	}
 }
 
-func TestRemoveStaleSocketRefusesActiveAndStaleSocketPaths(t *testing.T) {
-	activePath := filepath.Join(t.TempDir(), "active.sock")
+func TestPublishSocketAliasRefusesActiveAndStaleSocketPaths(t *testing.T) {
+	activeDir := t.TempDir()
+	if err := os.Chmod(activeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	activePath := filepath.Join(activeDir, "containerd.sock")
 	listener, err := net.Listen("unix", activePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	if err := removeStaleSocket(activePath); err == nil {
-		t.Fatal("active socket was not refused")
+	if err := publishSocketAlias(activePath, filepath.Join(activeDir, "c-1111111111111111.sock"), activeDir, "c-1111111111111111"); err == nil {
+		t.Fatal("active socket alias was replaced")
 	}
 	conn, err := net.Dial("unix", activePath)
 	if err != nil {
@@ -292,7 +296,11 @@ func TestRemoveStaleSocketRefusesActiveAndStaleSocketPaths(t *testing.T) {
 	}
 	_ = conn.Close()
 
-	stalePath := filepath.Join(t.TempDir(), "stale.sock")
+	staleDir := t.TempDir()
+	if err := os.Chmod(staleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stalePath := filepath.Join(staleDir, "containerd.sock")
 	stale, err := net.Listen("unix", stalePath)
 	if err != nil {
 		t.Fatal(err)
@@ -301,12 +309,75 @@ func TestRemoveStaleSocketRefusesActiveAndStaleSocketPaths(t *testing.T) {
 	if err := stale.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := removeStaleSocket(stalePath); err == nil {
-		t.Fatal("stale socket pathname was unlinked")
+	if err := publishSocketAlias(stalePath, filepath.Join(staleDir, "c-1111111111111111.sock"), staleDir, "c-1111111111111111"); err == nil {
+		t.Fatal("stale socket alias was replaced")
 	}
 	if _, err := os.Lstat(stalePath); err != nil {
 		t.Fatalf("stale socket path was modified: %v", err)
 	}
+}
+
+func TestPublishSocketAliasRotatesOnlyManagedGeneration(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldSocket := filepath.Join(dir, "c-1111111111111111.sock")
+	newSocket := filepath.Join(dir, "c-2222222222222222.sock")
+	for _, path := range []string{oldSocket, newSocket} {
+		if err := os.WriteFile(path, []byte("owned generation fixture"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	alias := filepath.Join(dir, "containerd.sock")
+	if err := os.Symlink(filepath.Base(oldSocket), alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishSocketAlias(alias, newSocket, dir, "c-2222222222222222"); err != nil {
+		t.Fatal(err)
+	}
+	target, err := os.Readlink(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != filepath.Base(newSocket) {
+		t.Fatalf("active socket alias = %q, want %q", target, filepath.Base(newSocket))
+	}
+	for _, path := range []string{oldSocket, newSocket} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("generation path %q was modified: %v", path, err)
+		}
+	}
+}
+
+func TestPublishSocketAliasRefusesUnmanagedPaths(t *testing.T) {
+	t.Run("filesystem socket", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		listener, err := net.Listen("unix", filepath.Join(dir, "containerd.sock"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = listener.Close() }()
+		if err := publishSocketAlias(filepath.Join(dir, "containerd.sock"), filepath.Join(dir, "c-2222222222222222.sock"), dir, "c-2222222222222222"); err == nil {
+			t.Fatal("filesystem socket alias was replaced")
+		}
+	})
+	t.Run("foreign symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		alias := filepath.Join(dir, "containerd.sock")
+		if err := os.Symlink("../foreign.sock", alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := publishSocketAlias(alias, filepath.Join(dir, "c-2222222222222222.sock"), dir, "c-2222222222222222"); err == nil {
+			t.Fatal("foreign symlink target was replaced")
+		}
+	})
 }
 
 func TestKeeperCrashLoopIsBoundedAndFailsClosed(t *testing.T) {
@@ -391,6 +462,39 @@ func TestPinnedContainerdKeeperSmoke(t *testing.T) {
 		logData, _ := os.ReadFile(filepath.Join(serviceDir, "containerd-smoke.log"))
 		t.Fatalf("containerd readiness timed out: %v; log: %s", ctx.Err(), strings.TrimSpace(string(logData)))
 	}
+	firstTarget, err := os.Readlink(plan.Socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childPID, err := managedContainerdChildPID(launcher.Process.Pid, binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(childPID, syscall.SIGKILL); err != nil {
+		t.Fatalf("SIGKILL owned containerd child: %v", err)
+	}
+	restarted := false
+	restartDeadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(restartDeadline) {
+		activeTarget, readErr := os.Readlink(plan.Socket)
+		if readErr == nil && activeTarget != firstTarget {
+			if _, runErr := runCommand(ctx, ctr, []string{"--address", plan.Socket, "--namespace", Namespace, "version"}, env); runErr == nil {
+				restarted = true
+				break
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !restarted {
+		logData, _ := os.ReadFile(filepath.Join(serviceDir, "containerd-smoke.log"))
+		t.Fatalf("containerd did not recover on a new socket generation after SIGKILL; log: %s", strings.TrimSpace(string(logData)))
+	}
+	if _, err := os.Lstat(filepath.Join(serviceDir, firstTarget)); err != nil {
+		t.Fatalf("previous generation socket was not retained: %v", err)
+	}
 	if err := launcher.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -408,6 +512,28 @@ func TestPinnedContainerdKeeperSmoke(t *testing.T) {
 	if _, err := os.Lstat(plan.KeeperMarker); !os.IsNotExist(err) {
 		t.Fatalf("keeper marker remains after stop: %v", err)
 	}
+}
+
+func managedContainerdChildPID(keeperPID int, binary string) (int, error) {
+	childrenPath := filepath.Join("/proc", strconv.Itoa(keeperPID), "task", strconv.Itoa(keeperPID), "children")
+	data, err := os.ReadFile(childrenPath)
+	if err != nil {
+		return 0, fmt.Errorf("read keeper child list: %w", err)
+	}
+	for _, field := range strings.Fields(string(data)) {
+		pid, parseErr := strconv.Atoi(field)
+		if parseErr != nil {
+			continue
+		}
+		cmdline, readErr := os.ReadFile(filepath.Join("/proc", field, "cmdline"))
+		if readErr != nil {
+			continue
+		}
+		if strings.HasPrefix(string(cmdline), binary+"\x00") {
+			return pid, nil
+		}
+	}
+	return 0, fmt.Errorf("managed containerd child was not found under keeper PID %d", keeperPID)
 }
 
 func startTestKeeper(t *testing.T, serviceDir string, withShim, crash bool) *exec.Cmd {

@@ -9,7 +9,10 @@ import (
 	"strings"
 )
 
-const Namespace = "rheic"
+const (
+	Namespace            = "rheic"
+	containerdConfigFlag = "--config"
+)
 
 // Config identifies the exact runtime artifacts owned by the daemon.
 type Config struct {
@@ -64,7 +67,7 @@ func BuildPlan(cfg Config) (Plan, error) {
 		Socket: socket, ConfigFile: filepath.Join(serviceDir, "config.toml"),
 		LogFile:      filepath.Join(serviceDir, "containerd.log"),
 		KeeperMarker: filepath.Join(serviceDir, "keeper.pid"),
-		Args:         []string{"--config", filepath.Join(serviceDir, "config.toml"), "--log-level", "info"},
+		Args:         []string{containerdConfigFlag, filepath.Join(serviceDir, "config.toml"), "--log-level", "info"},
 		Environment:  environment(cfg.RuntimeDir, cfg.RuntimeAssets, serviceDir),
 	}
 	return plan, nil

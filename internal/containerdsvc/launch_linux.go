@@ -3,9 +3,10 @@
 package containerdsvc
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -67,7 +68,7 @@ func parseLauncherArgs(args []string) (Plan, []string, error) {
 	if len(args) < 3 || !filepathIsAbs(args[0]) || !filepathIsAbs(args[1]) {
 		return Plan{}, nil, fmt.Errorf("internal containerd launcher requires absolute service and binary paths")
 	}
-	if args[2] == "--config" && (len(args) < 4 || !filepathIsAbs(args[3])) {
+	if args[2] == containerdConfigFlag && (len(args) < 4 || !filepathIsAbs(args[3])) {
 		return Plan{}, nil, fmt.Errorf("containerd config path must be absolute")
 	}
 	plan := keeperPlan(args[0])
@@ -104,10 +105,11 @@ func superviseContainerd(plan Plan, commandArgs []string, log *os.File) int {
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(signals)
 	for {
-		if err := removeStaleSocket(plan.Socket); err != nil {
+		generationArgs, err := prepareContainerdGeneration(plan, commandArgs)
+		if err != nil {
 			return launcherError(err)
 		}
-		child := makeCommand(plan.Binary, commandArgs[1:], os.Environ())
+		child := makeCommand(plan.Binary, generationArgs[1:], os.Environ())
 		child.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 		child.Stdout, child.Stderr = log, log
 		if err := child.Start(); err != nil {
@@ -130,6 +132,81 @@ func superviseContainerd(plan Plan, commandArgs []string, log *os.File) int {
 		}
 		backoff = next
 	}
+}
+
+// prepareContainerdGeneration gives each child a never-before-used socket path.
+// Containerd v2.4.2 unlinks its configured socket before binding; the keeper
+// must therefore never restart against the prior child's path. ctr clients use
+// plan.Socket, an atomically replaced symlink to the active generation.
+func prepareContainerdGeneration(plan Plan, commandArgs []string) ([]string, error) {
+	for attempt := 0; attempt < 5; attempt++ {
+		var nonce [8]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return nil, fmt.Errorf("generate containerd socket generation: %w", err)
+		}
+		name := "c-" + hex.EncodeToString(nonce[:])
+		generation := plan
+		generation.Socket = filepath.Join(plan.ServiceDir, name+".sock")
+		generation.ConfigFile = filepath.Join(plan.ServiceDir, name+".toml")
+		if pathExists(generation.Socket) || pathExists(generation.ConfigFile) {
+			continue
+		}
+		if err := writeConfig(generation, currentUID(), currentGID()); err != nil {
+			return nil, fmt.Errorf("write containerd generation config: %w", err)
+		}
+		args, err := replaceConfigArgument(commandArgs, generation.ConfigFile)
+		if err != nil {
+			return nil, err
+		}
+		if err := publishSocketAlias(plan.Socket, generation.Socket, plan.ServiceDir, name); err != nil {
+			return nil, err
+		}
+		return args, nil
+	}
+	return nil, fmt.Errorf("could not allocate a unique containerd socket generation")
+}
+
+func pathExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil || !os.IsNotExist(err)
+}
+
+func replaceConfigArgument(args []string, config string) ([]string, error) {
+	updated := append([]string(nil), args...)
+	for i := 1; i+1 < len(updated); i++ {
+		if updated[i] == containerdConfigFlag {
+			updated[i+1] = config
+			return updated, nil
+		}
+	}
+	return nil, fmt.Errorf("managed containerd command has no --config argument")
+}
+
+func publishSocketAlias(alias, socket, serviceDir, generation string) error {
+	if filepath.Dir(alias) != serviceDir || filepath.Dir(socket) != serviceDir {
+		return fmt.Errorf("containerd socket alias escaped the private service directory")
+	}
+	info, err := os.Lstat(alias)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink == 0 || !ownedByCurrentUser(info) {
+			return fmt.Errorf("containerd socket alias has unexpected type or owner; refusing replacement")
+		}
+		oldTarget, readErr := os.Readlink(alias)
+		if readErr != nil || filepath.Base(oldTarget) != oldTarget || !strings.HasPrefix(oldTarget, "c-") || !strings.HasSuffix(oldTarget, ".sock") {
+			return fmt.Errorf("containerd socket alias target is not a managed generation; refusing replacement")
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect containerd socket alias: %w", err)
+	}
+	temporary := filepath.Join(serviceDir, ".socket-alias-"+generation)
+	if err := os.Symlink(filepath.Base(socket), temporary); err != nil {
+		return fmt.Errorf("create containerd socket alias: %w", err)
+	}
+	if err := os.Rename(temporary, alias); err != nil {
+		_ = os.Remove(temporary)
+		return fmt.Errorf("publish containerd socket alias: %w", err)
+	}
+	return nil
 }
 
 func handleContainerdExit(child *exec.Cmd, window *time.Time, restarts *int, backoff time.Duration, signals <-chan os.Signal, marker string) (bool, time.Duration, error) {
@@ -163,20 +240,38 @@ func waitContainerd(child *exec.Cmd, signals <-chan os.Signal, marker string) (b
 	done := make(chan error, 1)
 	go func() { done <- child.Wait() }()
 	select {
-	case <-done:
+	case waitErr := <-done:
+		if waitErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "containerd keeper: child exited: %v\n", waitErr)
+		}
 		return false, nil
 	case <-signals:
 		_ = child.Process.Signal(syscall.SIGTERM)
 		timer := time.NewTimer(10 * time.Second)
 		select {
-		case <-done:
+		case waitErr := <-done:
 			timer.Stop()
+			if waitErr != nil && !processExitedBySignal(waitErr) {
+				return true, errors.Join(fmt.Errorf("containerd shutdown returned an unexpected error: %w", waitErr), removeKeeperMarker(marker))
+			}
 		case <-timer.C:
 			_ = child.Process.Kill()
-			<-done
+			waitErr := <-done
+			if waitErr != nil && !processExitedBySignal(waitErr) {
+				return true, errors.Join(fmt.Errorf("containerd kill returned an unexpected error: %w", waitErr), removeKeeperMarker(marker))
+			}
 		}
 		return true, removeKeeperMarker(marker)
 	}
+}
+
+func processExitedBySignal(err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	return ok && status.Signaled()
 }
 
 func waitRestart(backoff time.Duration, signals <-chan os.Signal, marker string) (bool, error) {
@@ -338,25 +433,6 @@ func processStartTime(pid int) (uint64, error) {
 		return 0, fmt.Errorf("truncated process stat")
 	}
 	return strconv.ParseUint(fields[19], 10, 64)
-}
-
-func removeStaleSocket(path string) error {
-	info, err := os.Lstat(path) // #nosec G703 -- socket path is fixed under the validated private service directory.
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSocket == 0 || info.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(info) {
-		return fmt.Errorf("containerd socket path has unexpected type or owner; refusing to modify it")
-	}
-	conn, dialErr := net.DialTimeout("unix", path, 100*time.Millisecond) // #nosec G704 -- fixed local Unix socket; no network protocol or remote host is accepted.
-	if dialErr == nil {
-		_ = conn.Close()
-		return fmt.Errorf("containerd socket is accepting connections; refusing to replace it")
-	}
-	return fmt.Errorf("containerd socket path remains after child exit; refusing raceable unlink: %w", dialErr)
 }
 
 func checkNoMountsUnder(path string) error {
