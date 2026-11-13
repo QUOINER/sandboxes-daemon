@@ -197,7 +197,7 @@ func cleanupSocketGenerations(plan Plan) error {
 		return fmt.Errorf("read managed socket directory: %w", err)
 	}
 	for _, entry := range entries {
-		if !strings.HasPrefix(entry.Name(), prefix) || !strings.HasSuffix(entry.Name(), ".sock") {
+		if !strings.HasPrefix(entry.Name(), prefix) || !(strings.HasSuffix(entry.Name(), ".sock") || strings.HasSuffix(entry.Name(), ".sock.ttrpc")) {
 			continue
 		}
 		path := filepath.Join(plan.SocketDir, entry.Name())
@@ -230,6 +230,36 @@ func cleanupSocketGenerations(plan Plan) error {
 		return fmt.Errorf("remove stable socket alias: %w", err)
 	}
 	return nil
+}
+
+func TestCleanupSocketGenerationsRemovesGRPCAndTTRPCNodes(t *testing.T) {
+	plan := keeperPlan(filepath.Join(t.TempDir(), "containerd"))
+	if err := ensurePrivateDir(plan.SocketDir); err != nil {
+		t.Fatal(err)
+	}
+	stateID := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(plan.Socket), "h-"), ".sock")
+	grpcPath := filepath.Join(plan.SocketDir, "g-"+stateID+"-deadbeef.sock")
+	ttrpcPath := grpcPath + ".ttrpc"
+	for _, path := range []string{grpcPath, ttrpcPath} {
+		listener, err := net.Listen("unix", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Base(grpcPath), plan.Socket); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupSocketGenerations(plan); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{grpcPath, ttrpcPath, plan.Socket} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Errorf("owned socket path %q remains after cleanup: %v", path, err)
+		}
+	}
 }
 
 func unmountTestTmpfs(t *testing.T, path string) {
@@ -735,6 +765,48 @@ func TestPinnedContainerdServiceGuestSurvivesDetachAndReattach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	keeperPID, err := strconv.Atoi(firstIdentity[0])
+	if err != nil {
+		t.Fatalf("owned keeper marker has an invalid PID %q: %v", firstIdentity[0], err)
+	}
+	containerdPID, err := managedContainerdChildPID(keeperPID, cfg.Binary)
+	if err != nil {
+		t.Fatalf("locate the uniquely owned managed containerd child: %v", err)
+	}
+	if err := syscall.Kill(containerdPID, syscall.SIGKILL); err != nil {
+		t.Fatalf("SIGKILL only the owned managed containerd child PID %d: %v", containerdPID, err)
+	}
+	restartCtx, restartCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer restartCancel()
+	recovered := false
+	for restartCtx.Err() == nil {
+		restartedPID, findErr := managedContainerdChildPID(keeperPID, cfg.Binary)
+		if findErr == nil && restartedPID != containerdPID {
+			probeCtx, probeCancel := context.WithTimeout(restartCtx, 2*time.Second)
+			_, readyErr := runCommand(probeCtx, cfg.CTR, []string{"--address", plan.Socket, "--namespace", Namespace, "version"}, env)
+			probeCancel()
+			if readyErr == nil {
+				recovered = true
+				break
+			}
+		}
+		time.Sleep(probeInterval)
+	}
+	if !recovered {
+		containerdLog, _ := os.ReadFile(plan.LogFile)
+		if len(containerdLog) > 4096 {
+			containerdLog = containerdLog[len(containerdLog)-4096:]
+		}
+		t.Fatalf("keeper did not restart the SIGKILLed managed containerd child PID %d on a new child with ctr readiness within 30s: %v; containerd log: %s", containerdPID, restartCtx.Err(), strings.TrimSpace(string(containerdLog)))
+	}
+	status, err := runCtr("tasks", "ls")
+	if err != nil || !strings.Contains(status, task+" ") || !strings.Contains(status, "RUNNING") {
+		t.Fatalf("owned guest task did not remain running after managed containerd SIGKILL and keeper restart: output=%q err=%v", status, err)
+	}
+	marker, err = runCtr("tasks", "exec", "--exec-id", "after-containerd-kill", task, "/bin/sh", "-c", "echo RHEIC_GUEST_AFTER_CONTAINERD_KILL")
+	if err != nil || marker != "RHEIC_GUEST_AFTER_CONTAINERD_KILL" {
+		t.Fatalf("guest exec after managed containerd restart: output=%q err=%v", marker, err)
+	}
 	if err := first.Close(); err != nil {
 		t.Fatalf("detach first daemon service: %v", err)
 	}
@@ -749,7 +821,7 @@ func TestPinnedContainerdServiceGuestSurvivesDetachAndReattach(t *testing.T) {
 	if len(firstIdentity) != 4 || len(secondIdentity) != 4 || firstIdentity[0] != secondIdentity[0] || firstIdentity[1] != secondIdentity[1] {
 		t.Fatalf("keeper identity changed across daemon detach/reattach: before=%v after=%v", firstIdentity, secondIdentity)
 	}
-	status, err := runCtr("tasks", "ls")
+	status, err = runCtr("tasks", "ls")
 	if err != nil || !strings.Contains(status, task+" ") || !strings.Contains(status, "RUNNING") {
 		t.Fatalf("guest task did not remain running after reattach: output=%q err=%v", status, err)
 	}
