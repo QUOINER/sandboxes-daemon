@@ -687,6 +687,41 @@ func TestPinnedContainerdServiceGuestSurvivesDetachAndReattach(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
+		if ownedTask != "" {
+			cleanupEnv := environment(runtimeDir, values["RSBX_TEST_ASSETS"], plan.ServiceDir)
+			ctr := func(args ...string) (string, error) {
+				base := []string{"--address", plan.Socket, "--namespace", Namespace}
+				output, commandErr := runCommand(cleanupCtx, cfg.CTR, append(base, args...), cleanupEnv)
+				return strings.TrimSpace(string(output)), commandErr
+			}
+			taskList, listErr := ctr("tasks", "ls")
+			if listErr != nil {
+				t.Errorf("list tasks before acceptance cleanup: %v", listErr)
+			} else if status, found := acceptanceTaskStatus(taskList, ownedTask); found {
+				if status == "RUNNING" {
+					if output, killErr := ctr("tasks", "kill", "--signal", "SIGKILL", ownedTask); killErr != nil {
+						t.Errorf("kill owned acceptance task %q: %v: %s", ownedTask, killErr, output)
+					}
+				}
+				if waitErr := waitAcceptanceTaskStopped(cleanupCtx, ctr, ownedTask); waitErr != nil {
+					t.Errorf("wait for owned acceptance task %q to stop: %v", ownedTask, waitErr)
+				}
+				if output, removeErr := ctr("tasks", "rm", ownedTask); removeErr != nil {
+					t.Errorf("remove owned acceptance task %q: %v: %s", ownedTask, removeErr, output)
+				}
+			}
+			if output, removeErr := ctr("containers", "rm", ownedTask); removeErr != nil {
+				t.Errorf("remove owned acceptance container %q: %v: %s", ownedTask, removeErr, output)
+			}
+			for _, inventory := range [][]string{{"tasks", "ls"}, {"containers", "ls"}} {
+				output, inventoryErr := ctr(inventory...)
+				if inventoryErr != nil {
+					t.Errorf("verify owned acceptance %s cleanup: %v", inventory[0], inventoryErr)
+				} else if _, found := acceptanceTaskStatus(output, ownedTask); found {
+					t.Errorf("owned acceptance ID %q remains in %s inventory: %s", ownedTask, inventory[0], output)
+				}
+			}
+		}
 		if first != nil {
 			if closeErr := first.Close(); closeErr != nil {
 				t.Errorf("detach first acceptance service during cleanup: %v", closeErr)
@@ -695,25 +730,6 @@ func TestPinnedContainerdServiceGuestSurvivesDetachAndReattach(t *testing.T) {
 		if second != nil {
 			if closeErr := second.Close(); closeErr != nil {
 				t.Errorf("detach second acceptance service during cleanup: %v", closeErr)
-			}
-		}
-		if ownedTask != "" {
-			cleanupEnv := environment(runtimeDir, values["RSBX_TEST_ASSETS"], plan.ServiceDir)
-			ctr := func(args ...string) (string, error) {
-				base := []string{"--address", plan.Socket, "--namespace", Namespace}
-				output, commandErr := runCommand(cleanupCtx, cfg.CTR, append(base, args...), cleanupEnv)
-				return strings.TrimSpace(string(output)), commandErr
-			}
-			_, _ = ctr("tasks", "kill", "--signal", "SIGKILL", ownedTask)
-			_, _ = ctr("tasks", "rm", ownedTask)
-			_, _ = ctr("containers", "rm", ownedTask)
-			for _, inventory := range [][]string{{"tasks", "ls"}, {"containers", "ls"}} {
-				output, inventoryErr := ctr(inventory...)
-				if inventoryErr != nil {
-					t.Errorf("verify owned acceptance %s cleanup: %v", inventory[0], inventoryErr)
-				} else if strings.Contains(output, ownedTask) {
-					t.Errorf("owned acceptance ID %q remains in %s inventory: %s", ownedTask, inventory[0], output)
-				}
 			}
 		}
 		if cleanupErr := stopOwnedKeeper(); cleanupErr != nil {
@@ -851,6 +867,64 @@ func managedContainerdChildPID(keeperPID int, binary string) (int, error) {
 		}
 	}
 	return 0, fmt.Errorf("managed containerd child was not found under keeper PID %d", keeperPID)
+}
+
+func acceptanceTaskStatus(output, taskID string) (string, bool) {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != taskID {
+			continue
+		}
+		if len(fields) >= 3 {
+			return fields[2], true
+		}
+		return "", true
+	}
+	return "", false
+}
+
+func waitAcceptanceTaskStopped(ctx context.Context, ctr func(...string) (string, error), taskID string) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		output, err := ctr("tasks", "ls")
+		if err != nil {
+			return fmt.Errorf("list tasks: %w", err)
+		}
+		status, found := acceptanceTaskStatus(output, taskID)
+		if !found || status == "STOPPED" {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("task still has status %q: %w", status, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestAcceptanceTaskStatus(t *testing.T) {
+	const ownedTask = "rheic-managed-reattach-owned"
+	tests := []struct {
+		name   string
+		output string
+		want   string
+		found  bool
+	}{
+		{name: "running", output: "TASK PID STATUS\n" + ownedTask + " 220 RUNNING\n", want: "RUNNING", found: true},
+		{name: "stopped", output: "TASK PID STATUS\n" + ownedTask + " 220 STOPPED\n", want: "STOPPED", found: true},
+		{name: "status with padding", output: "TASK PID STATUS\n" + ownedTask + "\t220\tSTOPPED\n", want: "STOPPED", found: true},
+		{name: "substring is not a match", output: "TASK PID STATUS\nrheic-managed-reattach-owned-extra 221 RUNNING\n", found: false},
+		{name: "header only", output: "TASK PID STATUS\n", found: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, found := acceptanceTaskStatus(test.output, ownedTask)
+			if got != test.want || found != test.found {
+				t.Fatalf("acceptanceTaskStatus() = (%q, %t), want (%q, %t)", got, found, test.want, test.found)
+			}
+		})
+	}
 }
 
 func startTestKeeper(t *testing.T, serviceDir string, withShim, crash bool) *exec.Cmd {
