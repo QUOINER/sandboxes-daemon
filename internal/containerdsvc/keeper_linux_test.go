@@ -826,22 +826,36 @@ func cleanupOwnedAcceptanceTask(t *testing.T, ctx context.Context, cfg Config, r
 	taskList, listErr := ctr("tasks", "ls")
 	if listErr != nil {
 		t.Errorf("list tasks before acceptance cleanup: %v", listErr)
-	} else if status, found := acceptanceTaskStatus(taskList, taskID); found {
-		if status == "RUNNING" {
-			if output, killErr := ctr("tasks", "kill", "--signal", "SIGKILL", taskID); killErr != nil {
-				t.Errorf("kill owned acceptance task %q: %v: %s", taskID, killErr, output)
-			}
-		}
-		if waitErr := waitAcceptanceTaskStopped(ctx, ctr, taskID); waitErr != nil {
-			t.Errorf("wait for owned acceptance task %q to stop: %v", taskID, waitErr)
-		}
-		if output, removeErr := ctr("tasks", "rm", taskID); removeErr != nil {
-			t.Errorf("remove owned acceptance task %q: %v: %s", taskID, removeErr, output)
-		}
+	} else {
+		cleanupAcceptanceTaskEntry(t, ctx, ctr, taskList, taskID)
 	}
 	if output, removeErr := ctr("containers", "rm", taskID); removeErr != nil {
 		t.Errorf("remove owned acceptance container %q: %v: %s", taskID, removeErr, output)
 	}
+	verifyAcceptanceInventories(t, ctr, taskID)
+}
+
+func cleanupAcceptanceTaskEntry(t *testing.T, ctx context.Context, ctr func(...string) (string, error), taskList, taskID string) {
+	t.Helper()
+	status, found := acceptanceTaskStatus(taskList, taskID)
+	if !found {
+		return
+	}
+	if status == "RUNNING" {
+		if output, killErr := ctr("tasks", "kill", "--signal", "SIGKILL", taskID); killErr != nil {
+			t.Errorf("kill owned acceptance task %q: %v: %s", taskID, killErr, output)
+		}
+	}
+	if waitErr := waitAcceptanceTaskStopped(ctx, ctr, taskID); waitErr != nil {
+		t.Errorf("wait for owned acceptance task %q to stop: %v", taskID, waitErr)
+	}
+	if output, removeErr := ctr("tasks", "rm", taskID); removeErr != nil {
+		t.Errorf("remove owned acceptance task %q: %v: %s", taskID, removeErr, output)
+	}
+}
+
+func verifyAcceptanceInventories(t *testing.T, ctr func(...string) (string, error), taskID string) {
+	t.Helper()
 	for _, inventory := range [][]string{{"tasks", "ls"}, {"containers", "ls"}} {
 		output, inventoryErr := ctr(inventory...)
 		if inventoryErr != nil {
