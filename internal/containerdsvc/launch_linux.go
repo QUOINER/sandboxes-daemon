@@ -32,54 +32,9 @@ func newCommand(launcher string, plan Plan) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-func configureParentDeath(*exec.Cmd) (*os.File, error) { return nil, nil }
-func closeParentDeathReader(*exec.Cmd)                 {}
-func persistentKeeper() bool                           { return true }
-func stopKeeper(plan Plan) (bool, error) {
-	fields, err := keeperMarkerFields(plan.KeeperMarker)
-	if err != nil {
-		return false, err
-	}
-	pid, _ := strconv.Atoi(fields[0])
-	fd, err := unix.PidfdOpen(pid, 0)
-	if err != nil {
-		return false, fmt.Errorf("open keeper process handle: %w", err)
-	}
-	defer unix.Close(fd)
-	reused, err := existingKeeper(plan)
-	if err != nil || !reused {
-		if err == nil {
-			err = fmt.Errorf("keeper disappeared before shutdown")
-		}
-		return false, err
-	}
-	if err := unix.PidfdSendSignal(fd, syscall.SIGTERM, nil, 0); err != nil {
-		return false, fmt.Errorf("signal empty namespace keeper: %w", err)
-	}
-	deadline := time.Now().Add(shutdownTimeout + time.Second)
-	for time.Now().Before(deadline) {
-		alive, err := existingKeeper(plan)
-		if err != nil {
-			return false, err
-		}
-		if !alive {
-			fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-			remaining := int(time.Until(deadline).Milliseconds())
-			if remaining < 0 {
-				remaining = 0
-			}
-			if _, err := unix.Poll(fds, remaining); err != nil {
-				return false, err
-			}
-			if fds[0].Revents&unix.POLLIN != 0 {
-				return true, nil
-			}
-			return false, fmt.Errorf("keeper marker cleared before process exit")
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return false, fmt.Errorf("empty namespace keeper did not stop")
-}
+func configureParentDeath(*exec.Cmd) (*os.File, bool, error) { return nil, false, nil }
+func closeParentDeathReader(*exec.Cmd)                       {}
+func persistentKeeper() bool                                 { return true }
 
 func precheckStateMounts(plan Plan) error {
 	mounts, err := mountinfo.GetMounts(mountinfo.PrefixFilter(plan.ServiceDir))
@@ -95,30 +50,53 @@ func precheckStateMounts(plan Plan) error {
 // RunLauncher is called only by the daemon's internal launcher mode. It exits
 // on every setup error so no Go code can continue in a partially changed ns.
 func RunLauncher(args []string) int {
-	if len(args) < 3 || !filepathIsAbs(args[0]) || !filepathIsAbs(args[1]) {
-		return launcherError(fmt.Errorf("internal containerd launcher requires absolute service and binary paths"))
-	}
-	if args[2] == "--config" && (len(args) < 4 || !filepathIsAbs(args[3])) {
-		return launcherError(fmt.Errorf("containerd config path must be absolute"))
+	plan, commandArgs, err := parseLauncherArgs(args)
+	if err != nil {
+		return launcherError(err)
 	}
 	runtime.LockOSThread()
-	if err := makeRootPrivate(); err != nil {
-		return launcherError(fmt.Errorf("make mount namespace recursively private: %w", err))
-	}
-	if err := checkNoMountsUnder(args[0]); err != nil {
+	plan, log, err := prepareKeeper(plan)
+	if err != nil {
 		return launcherError(err)
+	}
+	defer func() { _ = log.Close() }()
+	return superviseContainerd(plan, commandArgs, log)
+}
+
+func parseLauncherArgs(args []string) (Plan, []string, error) {
+	if len(args) < 3 || !filepathIsAbs(args[0]) || !filepathIsAbs(args[1]) {
+		return Plan{}, nil, fmt.Errorf("internal containerd launcher requires absolute service and binary paths")
+	}
+	if args[2] == "--config" && (len(args) < 4 || !filepathIsAbs(args[3])) {
+		return Plan{}, nil, fmt.Errorf("containerd config path must be absolute")
 	}
 	plan := keeperPlan(args[0])
+	plan.Binary = args[1]
+	return plan, append([]string(nil), args[1:]...), nil
+}
+
+func prepareKeeper(plan Plan) (Plan, *os.File, error) {
+	if err := makeRootPrivate(); err != nil {
+		return Plan{}, nil, fmt.Errorf("make mount namespace recursively private: %w", err)
+	}
+	if err := checkNoMountsUnder(plan.ServiceDir); err != nil {
+		return Plan{}, nil, err
+	}
 	if err := writeConfig(plan, currentUID(), currentGID()); err != nil {
-		return launcherError(fmt.Errorf("prepare containerd state in private namespace: %w", err))
+		return Plan{}, nil, fmt.Errorf("prepare containerd state in private namespace: %w", err)
 	}
-	log, err := os.OpenFile(plan.LogFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	log, err := os.OpenFile(plan.LogFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600) // #nosec G304 -- path is a fixed child of validated private state.
 	if err != nil {
-		return launcherError(fmt.Errorf("open containerd log: %w", err))
+		return Plan{}, nil, fmt.Errorf("open containerd log: %w", err)
 	}
-	if err := writeKeeperMarker(args[0]); err != nil {
-		return launcherError(err)
+	if err := writeKeeperMarker(plan.ServiceDir); err != nil {
+		_ = log.Close()
+		return Plan{}, nil, err
 	}
+	return plan, log, nil
+}
+
+func superviseContainerd(plan Plan, commandArgs []string, log *os.File) int {
 	backoff := 100 * time.Millisecond
 	restartWindow := time.Now()
 	restarts := 0
@@ -126,65 +104,104 @@ func RunLauncher(args []string) int {
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(signals)
 	for {
-		if err := removeStaleSocket(filepath.Join(args[0], "containerd.sock")); err != nil {
+		if err := removeStaleSocket(plan.Socket); err != nil {
 			return launcherError(err)
 		}
-		child := makeCommand(args[1], args[2:], os.Environ())
+		child := makeCommand(plan.Binary, commandArgs[1:], os.Environ())
 		child.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 		child.Stdout, child.Stderr = log, log
 		if err := child.Start(); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "containerd keeper: start failed: %v\n", err)
-			if !keeperRestartAllowed(&restartWindow, &restarts, time.Now()) {
-				return launcherError(fmt.Errorf("containerd failed to start repeatedly; keeper is stopping in place"))
+			stop, next, err := handleContainerdStartFailure(err, &restartWindow, &restarts, backoff, signals, plan.KeeperMarker)
+			backoff = next
+			if err != nil {
+				return launcherError(err)
 			}
-			timer := time.NewTimer(backoff)
-			select {
-			case <-signals:
-				timer.Stop()
-				if err := os.Remove(plan.KeeperMarker); err != nil {
-					return launcherError(fmt.Errorf("remove keeper marker: %w", err))
-				}
-				return 0
-			case <-timer.C:
-			}
-		} else {
-			done := make(chan error, 1)
-			go func() { done <- child.Wait() }()
-			select {
-			case <-done:
-				if !keeperRestartAllowed(&restartWindow, &restarts, time.Now()) {
-					return launcherError(fmt.Errorf("containerd exited repeatedly; keeper is stopping in place"))
-				}
-			case <-signals:
-				_ = child.Process.Signal(syscall.SIGTERM)
-				timer := time.NewTimer(10 * time.Second)
-				select {
-				case <-done:
-					timer.Stop()
-				case <-timer.C:
-					_ = child.Process.Kill()
-					<-done
-				}
-				if err := os.Remove(plan.KeeperMarker); err != nil {
-					return launcherError(fmt.Errorf("remove keeper marker: %w", err))
-				}
+			if stop {
 				return 0
 			}
+			continue
 		}
-		timer := time.NewTimer(backoff)
-		select {
-		case <-signals:
-			timer.Stop()
-			if err := os.Remove(plan.KeeperMarker); err != nil {
-				return launcherError(fmt.Errorf("remove keeper marker: %w", err))
-			}
+		stop, next, err := handleContainerdExit(child, &restartWindow, &restarts, backoff, signals, plan.KeeperMarker)
+		if err != nil {
+			return launcherError(err)
+		}
+		if stop {
 			return 0
-		case <-timer.C:
 		}
-		if backoff < 5*time.Second {
-			backoff *= 2
-		}
+		backoff = next
 	}
+}
+
+func handleContainerdExit(child *exec.Cmd, window *time.Time, restarts *int, backoff time.Duration, signals <-chan os.Signal, marker string) (bool, time.Duration, error) {
+	stop, err := waitContainerd(child, signals, marker)
+	if err != nil || stop {
+		return stop, backoff, err
+	}
+	if !keeperRestartAllowed(window, restarts, time.Now()) {
+		return false, backoff, fmt.Errorf("containerd exited repeatedly; keeper is stopping in place")
+	}
+	stop, err = waitRestart(backoff, signals, marker)
+	if err != nil {
+		return false, backoff, err
+	}
+	return stop, nextBackoff(backoff), nil
+}
+
+func handleContainerdStartFailure(startErr error, window *time.Time, restarts *int, backoff time.Duration, signals <-chan os.Signal, marker string) (bool, time.Duration, error) {
+	_, _ = fmt.Fprintf(os.Stderr, "containerd keeper: start failed: %v\n", startErr)
+	if !keeperRestartAllowed(window, restarts, time.Now()) {
+		return false, backoff, fmt.Errorf("containerd failed to start repeatedly; keeper is stopping in place")
+	}
+	stop, err := waitRestart(backoff, signals, marker)
+	if err != nil {
+		return false, backoff, err
+	}
+	return stop, nextBackoff(backoff), nil
+}
+
+func waitContainerd(child *exec.Cmd, signals <-chan os.Signal, marker string) (bool, error) {
+	done := make(chan error, 1)
+	go func() { done <- child.Wait() }()
+	select {
+	case <-done:
+		return false, nil
+	case <-signals:
+		_ = child.Process.Signal(syscall.SIGTERM)
+		timer := time.NewTimer(10 * time.Second)
+		select {
+		case <-done:
+			timer.Stop()
+		case <-timer.C:
+			_ = child.Process.Kill()
+			<-done
+		}
+		return true, removeKeeperMarker(marker)
+	}
+}
+
+func waitRestart(backoff time.Duration, signals <-chan os.Signal, marker string) (bool, error) {
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-signals:
+		return true, removeKeeperMarker(marker)
+	case <-timer.C:
+		return false, nil
+	}
+}
+
+func removeKeeperMarker(path string) error {
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("remove keeper marker: %w", err)
+	}
+	return nil
+}
+
+func nextBackoff(backoff time.Duration) time.Duration {
+	if backoff < 5*time.Second {
+		return backoff * 2
+	}
+	return backoff
 }
 
 func makeRootPrivate() error {
@@ -222,14 +239,14 @@ func writeKeeperMarker(serviceDir string) error {
 		return fmt.Errorf("inspect keeper process identity: %w", err)
 	}
 	path := filepath.Join(serviceDir, "keeper.pid")
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- fixed marker basename under validated private service state.
 	if err != nil {
 		return fmt.Errorf("create keeper marker: %w", err)
 	}
 	bootID, bootErr := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	if bootErr != nil {
 		_ = f.Close()
-		_ = os.Remove(path)
+		_ = os.Remove(path) // #nosec G703 -- removes only the just-created marker at its fixed private-state path.
 		return fmt.Errorf("read Linux boot identity: %w", bootErr)
 	}
 	_, writeErr := fmt.Fprintf(f, "%d %d %d %s\n", os.Getpid(), ns.Ino, start, strings.TrimSpace(string(bootID)))
@@ -238,7 +255,7 @@ func writeKeeperMarker(serviceDir string) error {
 }
 
 func existingKeeper(plan Plan) (bool, error) {
-	info, err := os.Lstat(plan.KeeperMarker)
+	info, err := os.Lstat(plan.KeeperMarker) // #nosec G703 -- marker path is a fixed child of the validated private service state.
 	if os.IsNotExist(err) {
 		return false, nil
 	}
@@ -255,12 +272,16 @@ func existingKeeper(plan Plan) (bool, error) {
 	if len(fields) != 4 {
 		return false, fmt.Errorf("keeper marker is malformed; refusing a new mount namespace")
 	}
+	return verifyKeeperIdentity(fields, plan.KeeperMarker)
+}
+
+func verifyKeeperIdentity(fields []string, markerPath string) (bool, error) {
 	bootID, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	if err != nil {
 		return false, fmt.Errorf("read Linux boot identity: %w", err)
 	}
 	if fields[3] != strings.TrimSpace(string(bootID)) {
-		if err := os.Remove(plan.KeeperMarker); err != nil {
+		if err := os.Remove(markerPath); err != nil {
 			return false, fmt.Errorf("remove stale prior-boot keeper marker: %w", err)
 		}
 		return false, nil
@@ -292,7 +313,7 @@ func existingKeeper(plan Plan) (bool, error) {
 }
 
 func keeperMarkerFields(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- caller supplies the fixed private keeper marker path.
 	if err != nil {
 		return nil, fmt.Errorf("read keeper marker: %w", err)
 	}
@@ -320,7 +341,7 @@ func processStartTime(pid int) (uint64, error) {
 }
 
 func removeStaleSocket(path string) error {
-	info, err := os.Lstat(path)
+	info, err := os.Lstat(path) // #nosec G703 -- socket path is fixed under the validated private service directory.
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -330,7 +351,7 @@ func removeStaleSocket(path string) error {
 	if info.Mode()&os.ModeSocket == 0 || info.Mode()&os.ModeSymlink != 0 || !ownedByCurrentUser(info) {
 		return fmt.Errorf("containerd socket path has unexpected type or owner; refusing to modify it")
 	}
-	conn, dialErr := net.DialTimeout("unix", path, 100*time.Millisecond)
+	conn, dialErr := net.DialTimeout("unix", path, 100*time.Millisecond) // #nosec G704 -- fixed local Unix socket; no network protocol or remote host is accepted.
 	if dialErr == nil {
 		_ = conn.Close()
 		return fmt.Errorf("containerd socket is accepting connections; refusing to replace it")
@@ -354,7 +375,7 @@ func launcherError(err error) int {
 	return 1
 }
 
-func filepathIsAbs(path string) bool { return len(path) > 0 && path[0] == '/' }
+func filepathIsAbs(path string) bool { return path != "" && path[0] == '/' }
 
 func systemPath() string { return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
 

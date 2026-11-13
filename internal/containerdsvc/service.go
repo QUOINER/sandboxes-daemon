@@ -125,7 +125,7 @@ func startLauncher(launcher string, plan Plan, log *os.File) (*exec.Cmd, *os.Fil
 	if err != nil {
 		return nil, nil, err
 	}
-	guardian, err := configureParentDeath(cmd)
+	guardian, _, err := configureParentDeath(cmd)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -25,14 +25,14 @@ func newCommand(launcher string, plan Plan) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-func configureParentDeath(cmd *exec.Cmd) (*os.File, error) {
+func configureParentDeath(cmd *exec.Cmd) (*os.File, bool, error) {
 	reader, writer, err := os.Pipe()
 	if err != nil {
-		return nil, fmt.Errorf("create containerd parent-death pipe: %w", err)
+		return nil, false, fmt.Errorf("create containerd parent-death pipe: %w", err)
 	}
 	cmd.ExtraFiles = append(cmd.ExtraFiles, reader)
 	cmd.Env = append(cmd.Env, "RSBX_PARENT_DEATH_FD="+strconv.Itoa(3+len(cmd.ExtraFiles)-1))
-	return writer, nil
+	return writer, true, nil
 }
 
 func closeParentDeathReader(cmd *exec.Cmd) {

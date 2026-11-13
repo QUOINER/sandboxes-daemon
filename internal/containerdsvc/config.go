@@ -154,7 +154,7 @@ func environment(runtimeDir, assets, home string) []string {
 }
 
 func checkExecutable(name, path string) error {
-	info, err := os.Lstat(path)
+	info, err := os.Lstat(path) // #nosec G703 -- BuildPlan rejects relative/symlink paths before checking executable ownership and mode.
 	if err != nil {
 		return fmt.Errorf("stat %s: %w", name, err)
 	}

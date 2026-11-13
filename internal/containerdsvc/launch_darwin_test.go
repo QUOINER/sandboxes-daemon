@@ -19,7 +19,7 @@ func TestDarwinLauncherStopsContainerdWhenDaemonParentExits(t *testing.T) {
 	case "daemon":
 		cmd := exec.Command(os.Args[0], "-test.run=^TestDarwinLauncherStopsContainerdWhenDaemonParentExits$")
 		cmd.Env = append(os.Environ(), "RSBX_LAUNCH_TEST_MODE=launcher")
-		guardian, err := configureParentDeath(cmd)
+		guardian, _, err := configureParentDeath(cmd)
 		if err != nil {
 			t.Fatal(err)
 		}

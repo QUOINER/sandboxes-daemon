@@ -5,6 +5,7 @@ package containerdsvc
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -84,7 +85,7 @@ func TestPropagationHarness(t *testing.T) {
 	}
 	var ns syscall.Stat_t
 	_ = syscall.Stat("/proc/self/ns/mnt", &ns)
-	_ = os.WriteFile(os.Getenv("RSBX_PROPAGATION_READY"), []byte(strconv.FormatUint(uint64(ns.Ino), 10)), 0o600)
+	_ = os.WriteFile(os.Getenv("RSBX_PROPAGATION_READY"), []byte(strconv.FormatUint(ns.Ino, 10)), 0o600)
 	for {
 		if _, err := os.Stat(os.Getenv("RSBX_PROPAGATION_TRIGGER")); err == nil {
 			break
@@ -109,7 +110,7 @@ func TestPrivateNamespaceBlocksMountPropagationBothWays(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := unix.Mount("tmpfs", base, "tmpfs", 0, "size=64k"); err != nil {
-		if err == syscall.EPERM {
+		if errors.Is(err, syscall.EPERM) {
 			t.Skipf("mount capability unavailable: %v", err)
 		}
 		t.Fatal(err)
@@ -134,7 +135,7 @@ func TestPrivateNamespaceBlocksMountPropagationBothWays(t *testing.T) {
 		"RSBX_PROPAGATION_READY="+ready, "RSBX_PROPAGATION_RESULT="+result)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: unix.CLONE_NEWNS, Setsid: true}
 	if err := cmd.Start(); err != nil {
-		if err == syscall.EPERM {
+		if errors.Is(err, syscall.EPERM) {
 			t.Skipf("mount namespace creation unavailable: %v", err)
 		}
 		t.Fatal(err)
@@ -361,11 +362,15 @@ func TestPinnedContainerdKeeperSmoke(t *testing.T) {
 	}
 	defer func() {
 		_ = log.Close()
-		if _, statErr := os.Lstat(plan.KeeperMarker); statErr == nil {
-			_, _ = stopKeeper(plan)
+		_ = launcher.Process.Signal(syscall.SIGTERM)
+		done := make(chan error, 1)
+		go func() { done <- launcher.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(shutdownTimeout + 2*time.Second):
+			_ = launcher.Process.Kill()
+			<-done
 		}
-		_ = launcher.Process.Kill()
-		_ = launcher.Wait()
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -435,7 +440,7 @@ func startTestKeeper(t *testing.T, serviceDir string, withShim, crash bool) *exe
 	cmd.Stdout, cmd.Stderr = log, log
 	if err := cmd.Start(); err != nil {
 		_ = log.Close()
-		if err == syscall.EPERM || strings.Contains(err.Error(), "operation not permitted") {
+		if errors.Is(err, syscall.EPERM) || strings.Contains(err.Error(), "operation not permitted") {
 			t.Skipf("mount namespace creation is unavailable: %v", err)
 		}
 		t.Fatal(err)
