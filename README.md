@@ -32,11 +32,21 @@ go run ./cmd/sandboxesd \
   --socket "$HOME/.sandboxes/sandboxesd.sock"
 ```
 
-The daemon owns `sandboxes.db` and exposes a local gRPC socket with `0600`
-permissions. It refuses to start when the socket path already exists; stale
-paths are not removed automatically because their ownership is unverified.
-The daemon also holds a state-directory lock while running; a second cooperating
-daemon using that state directory fails to start. The lock file is retained.
+The daemon owns `sandboxes.db` and exposes a local gRPC Unix socket with `0600`
+permissions. Unix endpoints use random generation sockets in a private
+per-user directory and a stable symlink at the configured `--socket` path.
+After SIGKILL, the next start rotates only a validated Rheic generation alias;
+it never unlinks the old socket path. Active endpoints, regular files, foreign
+symlinks and stale direct sockets from pre-generation versions fail closed and
+must be resolved by the operator. Untrusted parent path symlink components are rejected (the standard macOS `/tmp` and `/var` aliases are canonicalized),
+ancestors must be owned by root or the daemon user, and writable ancestors are
+rejected unless they are root-owned sticky directories,
+and the configured socket's immediate parent must be a private, current-user-owned
+directory. Same-UID host processes are inside the trust boundary; path-based alias
+replacement/removal is not claimed to resist a malicious concurrent process with
+the daemon UID. The daemon also holds a
+state-directory lock while running; a second cooperating daemon using that
+state directory fails to start. The lock file is retained.
 
 Runtime mode is explicit:
 
