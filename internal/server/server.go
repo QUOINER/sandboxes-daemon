@@ -399,6 +399,7 @@ func (s *SandboxServer) Create(ctx context.Context, req *localv1.CreateRequest) 
 		CPUs:           req.GetCpus(),
 		MemoryMiB:      req.GetMemoryMib(),
 		Workspaces:     fromProtoWorkspaces(req.GetWorkspaces()),
+		Clone:          fromProtoCloneOptions(req.GetClone()),
 		Ports:          fromProtoPorts(req.GetPorts()),
 		Allow:          allow,
 		Deny:           deny,
@@ -640,6 +641,7 @@ func toProtoSandbox(sb sandbox.Sandbox) *localv1.Sandbox {
 		MemoryMib:          sb.MemoryMiB,
 		StoppedAtUnix:      unix(sb.StoppedAt),
 		Workspaces:         toProtoWorkspaces(sb.Workspaces),
+		CloneInfo:          toProtoCloneInfo(sandboxCloneInfo(sb.Meta.Clone)),
 		Ports:              toProtoPorts(sb.Ports),
 		Allow:              toProtoRules(policyRules(sb.Policy, true)),
 		Deny:               toProtoRules(policyRules(sb.Policy, false)),
@@ -741,6 +743,38 @@ func fromProtoWorkspaces(workspaces []*localv1.Workspace) []sandbox.Workspace {
 		out = append(out, sandbox.Workspace{Path: workspace.GetPath(), GuestPath: workspace.GetGuestPath(), ReadOnly: workspace.GetReadOnly()})
 	}
 	return out
+}
+
+func fromProtoCloneOptions(clone *localv1.CloneOptions) *sandbox.CloneOptions {
+	if clone == nil {
+		return nil
+	}
+	result := &sandbox.CloneOptions{SourceWorkspacePath: clone.GetSourceWorkspacePath()}
+	if clone.GuestWorkdir != nil {
+		workdir := clone.GetGuestWorkdir()
+		result.GuestWorkdir = &workdir
+	}
+	return result
+}
+
+func toProtoCloneInfo(clone *sandbox.CloneInfo) *localv1.CloneInfo {
+	if clone == nil {
+		return nil
+	}
+	result := &localv1.CloneInfo{GuestWorkdir: clone.GuestWorkdir, RemoteName: clone.RemoteName}
+	if clone.GitEndpoint != nil {
+		result.GitEndpoint = &localv1.GitEndpoint{
+			HostIp: clone.GitEndpoint.HostIP, Port: uint32(clone.GitEndpoint.Port), Repository: clone.GitEndpoint.Repository,
+		}
+	}
+	return result
+}
+
+func sandboxCloneInfo(clone *sandbox.CloneState) *sandbox.CloneInfo {
+	if clone == nil {
+		return nil
+	}
+	return clone.Info
 }
 
 func toProtoPorts(ports []sandbox.Port) []*localv1.Port {

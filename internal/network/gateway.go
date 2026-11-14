@@ -3,6 +3,7 @@ package network
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"time"
 
@@ -87,7 +88,18 @@ func (a *Adapter) Stop(ctx context.Context, sandbox string) error {
 	return a.manager.Stop(ctx, sandbox)
 }
 
+// SetGitDaemon exposes only the gateway's verified, sandbox-owned Git forward.
+// Managers without this optional capability fail closed.
+func (a *Adapter) SetGitDaemon(ctx context.Context, sandbox string, enabled bool) (uint16, error) {
+	forwarder, ok := a.manager.(runtime.GitDaemonForwarder)
+	if !ok {
+		return 0, errors.New("gateway manager does not support managed Git daemon forwarding")
+	}
+	return forwarder.SetGitDaemon(ctx, sandbox, enabled)
+}
+
 var _ runtime.Network = (*Adapter)(nil)
+var _ runtime.GitDaemonForwarder = (*Adapter)(nil)
 
 func toPolicyRules(rules []runtime.Rule, action policy.Action) []policy.Rule {
 	out := make([]policy.Rule, 0, len(rules))

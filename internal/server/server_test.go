@@ -48,6 +48,33 @@ func TestWorkspaceProtoRoundTripPreservesGuestPath(t *testing.T) {
 	}
 }
 
+func TestCloneProtoMappingsPreserveOptionsAndEndpoint(t *testing.T) {
+	guestWorkdir := ""
+	options := fromProtoCloneOptions(&localv1.CloneOptions{SourceWorkspacePath: "/host/repo", GuestWorkdir: &guestWorkdir})
+	if options == nil || options.SourceWorkspacePath != "/host/repo" || options.GuestWorkdir == nil || *options.GuestWorkdir != "" {
+		t.Fatalf("clone options mapping = %+v", options)
+	}
+	if fromProtoCloneOptions(nil) != nil {
+		t.Fatal("nil clone options were not preserved")
+	}
+
+	clone := &sandbox.CloneInfo{
+		GuestWorkdir: "/workspace/repo", RemoteName: "sandbox-demo",
+		GitEndpoint: &sandbox.GitEndpoint{HostIP: "127.0.0.1", Port: 49152, Repository: "repo"},
+	}
+	wire := toProtoCloneInfo(clone)
+	if wire == nil || wire.GetGuestWorkdir() != clone.GuestWorkdir || wire.GetRemoteName() != clone.RemoteName ||
+		wire.GetGitEndpoint() == nil || wire.GetGitEndpoint().GetHostIp() != clone.GitEndpoint.HostIP ||
+		wire.GetGitEndpoint().GetPort() != uint32(clone.GitEndpoint.Port) || wire.GetGitEndpoint().GetRepository() != "repo" {
+		t.Fatalf("clone info mapping = %+v", wire)
+	}
+	clone.GitEndpoint = nil
+	wire = toProtoCloneInfo(clone)
+	if wire.GetGitEndpoint() != nil {
+		t.Fatalf("stopped clone exposed a Git endpoint: %+v", wire.GetGitEndpoint())
+	}
+}
+
 func (*graceBackend) Capabilities(context.Context) (runtime.Capabilities, error) {
 	return runtime.Capabilities{}, nil
 }

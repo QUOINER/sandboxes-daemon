@@ -103,11 +103,11 @@ func TestOpenRefusesNewerSchema(t *testing.T) {
 	}
 }
 
-func TestWorkspaceGuestPathSchemaUpgradeRejectsOlderDaemon(t *testing.T) {
-	if schemaVersion != 3 {
-		t.Fatalf("schema version = %d, want 3 for workspace guest path contract", schemaVersion)
+func TestCloneSchemaUpgradeRejectsOlderDaemon(t *testing.T) {
+	if schemaVersion != 4 {
+		t.Fatalf("schema version = %d, want 4 for clone contract", schemaVersion)
 	}
-	if err := schemaVersionCompatibilityError(schemaVersion, 2); !errors.Is(err, ErrSchemaNewer) {
+	if err := schemaVersionCompatibilityError(schemaVersion, 3); !errors.Is(err, ErrSchemaNewer) {
 		t.Fatalf("older daemon compatibility error = %v, want ErrSchemaNewer", err)
 	}
 
@@ -120,7 +120,7 @@ func TestWorkspaceGuestPathSchemaUpgradeRejectsOlderDaemon(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `CREATE TABLE legacy_marker (value TEXT NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, `PRAGMA user_version = 2`); err != nil {
+	if _, err := db.ExecContext(ctx, `PRAGMA user_version = 3`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -133,9 +133,9 @@ func TestWorkspaceGuestPathSchemaUpgradeRejectsOlderDaemon(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	matches, err := filepath.Glob(path + ".pre-v2-*.bak")
+	matches, err := filepath.Glob(path + ".pre-v3-*.bak")
 	if err != nil || len(matches) != 1 {
-		t.Fatalf("version 2 backups = %v, %v", matches, err)
+		t.Fatalf("version 3 backups = %v, %v", matches, err)
 	}
 }
 

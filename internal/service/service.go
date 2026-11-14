@@ -1077,6 +1077,7 @@ type CreateRequest struct {
 	CPUs          uint32
 	MemoryMiB     uint32
 	Workspaces    []sandbox.Workspace
+	Clone         *sandbox.CloneOptions
 	Ports         []sandbox.Port
 	Allow         []sandbox.NetworkRule
 	Deny          []sandbox.NetworkRule
@@ -1099,6 +1100,20 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	workspace, workspaces, err := normalizeCreateWorkspaces(req)
 	if err != nil {
 		return operation.Operation{}, err
+	}
+	cloneOptions := req.Clone
+	if cloneOptions != nil {
+		normalized, normalizeErr := normalizeCloneOptions(cloneOptions, workspaces)
+		if normalizeErr != nil {
+			return operation.Operation{}, normalizeErr
+		}
+		cloneOptions = normalized
+	}
+	req.Clone = cloneOptions
+	if cloneOptions != nil {
+		if err := s.requireCloneCapabilities(ctx); err != nil {
+			return operation.Operation{}, err
+		}
 	}
 	release, err := s.acquireCreateGates(ctx, name, req.IdempotencyKey)
 	if err != nil {
@@ -1153,7 +1168,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		return operation.Operation{}, err
 	}
 	intent := createIntent{
-		name: name, image: image, workspace: workspace, workspaces: workspaces, ports: ports,
+		name: name, image: image, workspace: workspace, workspaces: workspaces, clone: cloneOptions, ports: ports,
 		allow: allow, deny: deny, agent: req.Agent, detached: req.Detached, cpus: cpus, memoryMiB: memoryMiB,
 		proxyService: encodeProxyServices(proxyServiceNames),
 	}
@@ -1234,6 +1249,14 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 		state = sandbox.Running
 	}
 	sb := newSandboxRecord(sbID, name, state, image, workspace, workspaces, ports, allow, deny, req.Agent, req.Detached, profile, cpus, memoryMiB, now)
+	if cloneOptions != nil {
+		sb.Meta.Clone = &sandbox.CloneState{Options: *cloneOptions}
+	}
+	if cloneOptions != nil {
+		if err := s.bootstrapClone(ctx, handle, name, cloneOptions, &sb); err != nil {
+			return operation.Operation{}, errors.Join(err, s.cleanupCreateFailure(ctx, handle, errors.New("clone bootstrap failed")), cleanupProxy())
+		}
+	}
 	if err := s.setDockerProfile(ctx, sbID, req.Privileged); err != nil {
 		return operation.Operation{}, errors.Join(s.cleanupCreateFailure(ctx, handle, err), cleanupProxy())
 	}
@@ -2674,6 +2697,7 @@ type createIntent struct {
 	image        string
 	workspace    string
 	workspaces   []sandbox.Workspace
+	clone        *sandbox.CloneOptions
 	ports        []sandbox.Port
 	allow        []sandbox.NetworkRule
 	deny         []sandbox.NetworkRule
@@ -2711,9 +2735,29 @@ func (s *Service) replayCreate(ctx context.Context, key string, intent createInt
 func matchesCreateIntent(sb sandbox.Sandbox, intent createIntent) bool {
 	return sb.Name == intent.name && sb.Image == intent.image && sb.Workspace == intent.workspace &&
 		sb.CPUs == intent.cpus && sb.MemoryMiB == intent.memoryMiB &&
-		workspacesEqual(sb.Workspaces, intent.workspaces) && portsEqual(sb.Ports, intent.ports) &&
+		workspacesEqual(sb.Workspaces, intent.workspaces) && cloneOptionsEqual(cloneOptionsFromState(sb.Meta.Clone), intent.clone) && portsEqual(sb.Ports, intent.ports) &&
 		rulesEqual(policyAllow(sb.Policy), intent.allow) && rulesEqual(policyDeny(sb.Policy), intent.deny) &&
 		sandboxAgent(sb) == intent.agent && sandboxDetached(sb) == intent.detached
+}
+
+func cloneOptionsFromState(clone *sandbox.CloneState) *sandbox.CloneOptions {
+	if clone == nil {
+		return nil
+	}
+	return &clone.Options
+}
+
+func cloneOptionsEqual(a, b *sandbox.CloneOptions) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if a.SourceWorkspacePath != b.SourceWorkspacePath {
+		return false
+	}
+	if a.GuestWorkdir == nil || b.GuestWorkdir == nil {
+		return a.GuestWorkdir == nil && b.GuestWorkdir == nil
+	}
+	return *a.GuestWorkdir == *b.GuestWorkdir
 }
 
 // Reconcile repairs state left behind by an interrupted daemon.
@@ -2787,7 +2831,7 @@ func (s *Service) Start(ctx context.Context, id string) (operation.Operation, er
 		return operation.Operation{}, err
 	}
 	if s.backend != nil {
-		if err := s.prepareSandboxForStart(ctx, sb); err != nil {
+		if err := s.prepareSandboxForStart(ctx, &sb); err != nil {
 			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
 		}
 	}
@@ -2798,11 +2842,27 @@ func (s *Service) Start(ctx context.Context, id string) (operation.Operation, er
 	return op, err
 }
 
-func (s *Service) prepareSandboxForStart(ctx context.Context, sb sandbox.Sandbox) error {
-	if err := s.stopUnknownProxySandbox(ctx, sb); err != nil {
+func (s *Service) prepareSandboxForStart(ctx context.Context, sb *sandbox.Sandbox) error {
+	if err := s.stopUnknownProxySandbox(ctx, *sb); err != nil {
 		return err
 	}
-	return s.startRuntimeSandbox(ctx, sb)
+	if err := s.startRuntimeSandbox(ctx, *sb); err != nil {
+		return err
+	}
+	if sb.Meta.Clone == nil {
+		return nil
+	}
+	if err := s.startStoredClone(ctx, sb); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+		withdrawErr := s.withdrawCloneGitForward(cleanupCtx, sb.Name)
+		stopErr := s.backend.Stop(cleanupCtx, s.backend.Handle(sb.Name), 5*time.Second)
+		if sb.Meta.Clone != nil && sb.Meta.Clone.Info != nil {
+			sb.Meta.Clone.Info.GitEndpoint = nil
+		}
+		return errors.Join(err, withdrawErr, stopErr)
+	}
+	return nil
 }
 
 func (s *Service) stopUnknownProxySandbox(ctx context.Context, sb sandbox.Sandbox) error {
@@ -3035,11 +3095,34 @@ func (s *Service) StopWithGrace(ctx context.Context, id string, grace time.Durat
 	if err := s.cancelExecSessions(ctx, id); err != nil {
 		return operation.Operation{}, err
 	}
-	if s.backend != nil {
-		if err := s.backend.Stop(ctx, s.backend.Handle(sb.Name), grace); err != nil {
-			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
-		}
+	return s.stopRuntime(ctx, &sb, grace)
+}
+
+func (s *Service) stopRuntime(ctx context.Context, sb *sandbox.Sandbox, grace time.Duration) (operation.Operation, error) {
+	if s.backend == nil {
+		return s.stopWithoutRuntime(ctx, *sb)
 	}
+	var cloneStopErr error
+	if sb.Meta.Clone != nil {
+		cloneStopErr = s.stopStoredClone(ctx, sb)
+	}
+	if err := s.backend.Stop(ctx, s.backend.Handle(sb.Name), grace); err != nil {
+		return operation.Operation{}, s.markRuntimeUnknown(ctx, *sb, errors.Join(cloneStopErr, err))
+	}
+	if sb.Meta.Clone != nil && sb.Meta.Clone.Info != nil {
+		sb.Meta.Clone.Info.GitEndpoint = nil
+	}
+	if err := s.stopProxyChannel(sb.Name, sb.ID, true); err != nil {
+		return operation.Operation{}, err
+	}
+	op, err := s.apply(ctx, *sb, operation.KindStop, sandbox.Stopped)
+	if err != nil {
+		return operation.Operation{}, s.markRuntimeUnknown(ctx, *sb, errors.Join(cloneStopErr, err))
+	}
+	return op, errors.Join(cloneStopErr, err)
+}
+
+func (s *Service) stopWithoutRuntime(ctx context.Context, sb sandbox.Sandbox) (operation.Operation, error) {
 	if err := s.stopProxyChannel(sb.Name, sb.ID, true); err != nil {
 		return operation.Operation{}, err
 	}
@@ -3051,8 +3134,6 @@ func (s *Service) StopWithGrace(ctx context.Context, id string, grace time.Durat
 }
 
 // Delete removes a sandbox.
-//
-//nolint:gocyclo,cyclop // Delete orchestrates runtime teardown, persistence and volume cleanup.
 func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.Operation, error) {
 	release, err := s.acquireLifecycle(ctx, id)
 	if err != nil {
@@ -3069,12 +3150,8 @@ func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.
 	if err := s.cancelExecSessions(ctx, id); err != nil {
 		return operation.Operation{}, err
 	}
-	if s.backend != nil {
-		if err := s.backend.Delete(ctx, s.backend.Handle(sb.Name)); err != nil {
-			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
-		}
-	}
-	if err := s.stopProxyChannel(sb.Name, sb.ID, false); err != nil {
+	cloneStopErr, err := s.teardownDelete(ctx, &sb)
+	if err != nil {
 		return operation.Operation{}, err
 	}
 	now := s.now().UTC()
@@ -3093,29 +3170,57 @@ func (s *Service) Delete(ctx context.Context, id string, force bool) (operation.
 	}
 	if err := s.store.DeleteSandboxWithOperation(ctx, id, op); err != nil {
 		if s.backend != nil {
-			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, err)
+			return operation.Operation{}, s.markRuntimeUnknown(ctx, sb, errors.Join(cloneStopErr, err))
 		}
 		return operation.Operation{}, err
 	}
-	if err := s.store.DeleteSetting(ctx, proxyServiceSettingKey(id)); err != nil {
+	if err := s.cleanupDeletedSandbox(ctx, sb); err != nil {
 		return op, err
 	}
-	if err := s.store.DeleteSetting(ctx, registryProxySettingKey(id)); err != nil {
-		return op, err
+	return op, cloneStopErr
+}
+
+func (s *Service) teardownDelete(ctx context.Context, sb *sandbox.Sandbox) (cloneStopErr, err error) {
+	if s.backend == nil {
+		return nil, s.stopProxyChannel(sb.Name, sb.ID, false)
+	}
+	cloneStopErr, runtimeUnknown, err := s.teardownDeleteRuntime(ctx, sb)
+	if err != nil && runtimeUnknown {
+		return cloneStopErr, s.markRuntimeUnknown(ctx, *sb, errors.Join(cloneStopErr, err))
+	}
+	return cloneStopErr, err
+}
+
+func (s *Service) teardownDeleteRuntime(ctx context.Context, sb *sandbox.Sandbox) (cloneStopErr error, runtimeUnknown bool, err error) {
+	if sb.Meta.Clone != nil {
+		cloneStopErr = s.stopStoredClone(ctx, sb)
+	}
+	if err := s.backend.Delete(ctx, s.backend.Handle(sb.Name)); err != nil {
+		return cloneStopErr, true, err
+	}
+	if sb.Meta.Clone != nil && sb.Meta.Clone.Info != nil {
+		sb.Meta.Clone.Info.GitEndpoint = nil
+	}
+	return cloneStopErr, false, s.stopProxyChannel(sb.Name, sb.ID, false)
+}
+
+func (s *Service) cleanupDeletedSandbox(ctx context.Context, sb sandbox.Sandbox) error {
+	if err := s.store.DeleteSetting(ctx, proxyServiceSettingKey(sb.ID)); err != nil {
+		return err
+	}
+	if err := s.store.DeleteSetting(ctx, registryProxySettingKey(sb.ID)); err != nil {
+		return err
 	}
 	if err := s.stopProxyChannel(sb.Name, sb.ID, true); err != nil {
-		return op, err
+		return err
 	}
 	if err := s.cleanupSandboxServiceSecrets(ctx, sb.Name); err != nil {
-		return op, err
+		return err
 	}
 	if err := s.cleanupSandboxRegistryCredentials(ctx, sb.Name); err != nil {
-		return op, err
+		return err
 	}
-	if err := s.removeDockerVolume(id); err != nil {
-		return op, err
-	}
-	return op, nil
+	return s.removeDockerVolume(sb.ID)
 }
 
 func (s *Service) markRuntimeUnknown(ctx context.Context, sb sandbox.Sandbox, cause error) error {
