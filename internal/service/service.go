@@ -1389,7 +1389,7 @@ func normalizeWorkspaces(req CreateRequest) ([]sandbox.Workspace, error) {
 func runtimeWorkspaces(workspaces []sandbox.Workspace) []runtime.Workspace {
 	out := make([]runtime.Workspace, 0, len(workspaces))
 	for i := range workspaces {
-		out = append(out, runtime.Workspace{Path: workspaces[i].Path, ReadOnly: workspaces[i].ReadOnly})
+		out = append(out, runtime.Workspace{Path: workspaces[i].Path, GuestPath: workspaces[i].GuestPath, ReadOnly: workspaces[i].ReadOnly})
 	}
 	return out
 }

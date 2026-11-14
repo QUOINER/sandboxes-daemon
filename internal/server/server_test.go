@@ -18,6 +18,7 @@ import (
 	"time"
 
 	localv1 "github.com/rheic/sandboxes-api/gen/go/sandboxes/local/v1"
+	"github.com/rheic/sandboxes-core/sandbox"
 	runtime "github.com/rheic/sandboxes-runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -32,6 +33,20 @@ import (
 )
 
 type graceBackend struct{ grace time.Duration }
+
+func TestWorkspaceProtoRoundTripPreservesGuestPath(t *testing.T) {
+	workspaces := []sandbox.Workspace{{Path: "/host/repo", GuestPath: "/workspace/repo", ReadOnly: true}}
+	wire := toProtoWorkspaces(workspaces)
+	got := fromProtoWorkspaces(wire)
+	if len(got) != 1 || got[0] != workspaces[0] {
+		t.Fatalf("workspace round-trip = %+v, want %+v", got, workspaces)
+	}
+
+	legacy := fromProtoWorkspaces([]*localv1.Workspace{{Path: "/host/legacy"}})
+	if len(legacy) != 1 || legacy[0].Path != "/host/legacy" || legacy[0].GuestPath != "" {
+		t.Fatalf("legacy workspace = %+v", legacy)
+	}
+}
 
 func (*graceBackend) Capabilities(context.Context) (runtime.Capabilities, error) {
 	return runtime.Capabilities{}, nil

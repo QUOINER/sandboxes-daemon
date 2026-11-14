@@ -25,7 +25,7 @@ func TestSandboxAndOperationLifecycle(t *testing.T) {
 	sb := sandbox.Sandbox{
 		ID: "sb-1", Name: "dev", State: sandbox.Stopped, Generation: 1,
 		Image: "scratch", CPUs: 4, MemoryMiB: 2048, StoppedAt: now,
-		Workspaces: []sandbox.Workspace{{Path: "/work", ReadOnly: false}, {Path: "/docs", ReadOnly: true}},
+		Workspaces: []sandbox.Workspace{{Path: "/work", ReadOnly: false}, {Path: "/docs", GuestPath: "/mnt/docs", ReadOnly: true}},
 		Ports:      []sandbox.Port{{Host: 8080, Guest: 3000, Protocol: "tcp"}},
 		Meta:       &sandbox.Meta{Agent: "shell", Detached: true, LastUsedAt: now},
 		Policy: &sandbox.NetworkPolicy{
@@ -47,7 +47,7 @@ func TestSandboxAndOperationLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.Name != "dev" || got.CPUs != 4 || got.MemoryMiB != 2048 || !got.StoppedAt.Equal(now) ||
-		len(got.Workspaces) != 2 || got.Workspaces[1].Path != "/docs" || !got.Workspaces[1].ReadOnly ||
+		len(got.Workspaces) != 2 || got.Workspaces[1].Path != "/docs" || got.Workspaces[1].GuestPath != "/mnt/docs" || !got.Workspaces[1].ReadOnly ||
 		got.Meta == nil || got.Meta.Agent != "shell" || !got.Meta.Detached || !got.Meta.LastUsedAt.Equal(now) ||
 		len(got.Ports) != 1 || got.Ports[0].Host != 8080 || got.Policy == nil ||
 		len(got.Policy.Allow) != 1 || got.Policy.Allow[0].Port != 80 || len(got.Policy.Deny) != 1 || got.Policy.Deny[0].Protocol != "udp" {

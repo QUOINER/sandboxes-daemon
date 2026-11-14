@@ -39,7 +39,7 @@ var _ operation.Store = (*OperationStore)(nil)
 
 // schemaVersion is the latest SQLite schema understood by this daemon. It is
 // stored in PRAGMA user_version and must only increase.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // ErrSchemaNewer reports a database written by a newer daemon. Opening it
 // would risk data loss, so the daemon refuses to start instead.
@@ -90,14 +90,21 @@ func (s *Store) prepareSchema(ctx context.Context, path string) error {
 	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&current); err != nil {
 		return fmt.Errorf("read schema version: %w", err)
 	}
-	switch {
-	case current > schemaVersion:
-		return fmt.Errorf("%w: database version %d, daemon supports %d; restore the backup created before the upgrade", ErrSchemaNewer, current, schemaVersion)
-	case current == schemaVersion:
+	if err := schemaVersionCompatibilityError(current, schemaVersion); err != nil {
+		return err
+	}
+	if current == schemaVersion {
 		return nil
 	}
 	if err := backupDatabase(ctx, s.db, path, current); err != nil {
 		return fmt.Errorf("backup database before migration: %w", err)
+	}
+	return nil
+}
+
+func schemaVersionCompatibilityError(current, supported int) error {
+	if current > supported {
+		return fmt.Errorf("%w: database version %d, daemon supports %d; restore the backup created before the upgrade", ErrSchemaNewer, current, supported)
 	}
 	return nil
 }

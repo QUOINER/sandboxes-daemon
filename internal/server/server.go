@@ -727,7 +727,7 @@ func operationState(v operation.State) localv1.OperationState {
 func toProtoWorkspaces(workspaces []sandbox.Workspace) []*localv1.Workspace {
 	out := make([]*localv1.Workspace, 0, len(workspaces))
 	for i := range workspaces {
-		out = append(out, &localv1.Workspace{Path: workspaces[i].Path, ReadOnly: workspaces[i].ReadOnly})
+		out = append(out, &localv1.Workspace{Path: workspaces[i].Path, GuestPath: workspaces[i].GuestPath, ReadOnly: workspaces[i].ReadOnly})
 	}
 	return out
 }
@@ -738,7 +738,7 @@ func fromProtoWorkspaces(workspaces []*localv1.Workspace) []sandbox.Workspace {
 		if workspace == nil {
 			continue
 		}
-		out = append(out, sandbox.Workspace{Path: workspace.GetPath(), ReadOnly: workspace.GetReadOnly()})
+		out = append(out, sandbox.Workspace{Path: workspace.GetPath(), GuestPath: workspace.GetGuestPath(), ReadOnly: workspace.GetReadOnly()})
 	}
 	return out
 }

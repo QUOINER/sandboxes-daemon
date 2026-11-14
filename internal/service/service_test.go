@@ -726,17 +726,17 @@ func TestCreatePassesWorkspacesAndStoresThem(t *testing.T) {
 	docs := filepath.Join(t.TempDir(), "docs")
 	hostPort := availableHostTCPPort(t)
 	op, err := svc.Create(ctx, CreateRequest{Name: "multi", Agent: "shell", Detached: true, Workspaces: []sandbox.Workspace{
-		{Path: work}, {Path: docs, ReadOnly: true},
+		{Path: work}, {Path: docs, GuestPath: "/mnt/docs", ReadOnly: true},
 	}, Ports: []sandbox.Port{{Host: hostPort, Guest: 3000}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(backend.lastConfig.Workspaces) != 2 || !backend.lastConfig.Workspaces[1].ReadOnly ||
+	if len(backend.lastConfig.Workspaces) != 2 || !backend.lastConfig.Workspaces[1].ReadOnly || backend.lastConfig.Workspaces[1].GuestPath != "/mnt/docs" ||
 		backend.lastConfig.Workspace != work || len(backend.lastConfig.Ports) != 1 || backend.lastConfig.Ports[0].Host != hostPort {
 		t.Fatalf("runtime config=%+v", backend.lastConfig)
 	}
 	sb, err := svc.Get(ctx, op.SandboxID)
-	if err != nil || len(sb.Workspaces) != 2 || sb.Workspace != work || !sb.Workspaces[1].ReadOnly ||
+	if err != nil || len(sb.Workspaces) != 2 || sb.Workspace != work || sb.Workspaces[1].GuestPath != "/mnt/docs" || !sb.Workspaces[1].ReadOnly ||
 		len(sb.Ports) != 1 || sb.Ports[0].Host != hostPort || sb.Ports[0].Guest != 3000 || sb.Meta == nil || sb.Meta.Agent != "shell" || !sb.Meta.Detached {
 		t.Fatalf("sandbox=%+v err=%v", sb, err)
 	}
