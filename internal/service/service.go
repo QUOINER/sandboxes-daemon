@@ -2685,7 +2685,7 @@ for i in $(seq 1 50); do docker info >/dev/null 2>&1 && exit 0; sleep 0.2; done
 exit 1
 `
 	if code, err := native.ExecNative(ctx, handle, runtime.ExecRequest{
-		Argv: []string{"/bin/sh", "-c", script}, User: "0:0",
+		Argv: []string{cloneShellCommand, "-c", script}, User: "0:0",
 	}); err != nil || code != 0 {
 		return fmt.Errorf("start dockerd: code=%d err=%w", code, err)
 	}
@@ -2775,6 +2775,16 @@ func (s *Service) Reconcile(ctx context.Context) (int, error) {
 			sb.State = sandbox.Unknown
 			sb.Error = "daemon restarted; runtime state is unknown"
 			sb.UpdatedAt = now
+			if err := s.store.Update(ctx, sb); err != nil {
+				return changed, err
+			}
+			changed++
+		}
+		// The host-side forward dies with the daemon, so a persisted Git
+		// endpoint is never usable after a restart; clear it instead of
+		// reporting a port that may already belong to another process.
+		if sb.Meta != nil && sb.Meta.Clone != nil && sb.Meta.Clone.Info != nil && sb.Meta.Clone.Info.GitEndpoint != nil {
+			sb.Meta.Clone.Info.GitEndpoint = nil
 			if err := s.store.Update(ctx, sb); err != nil {
 				return changed, err
 			}

@@ -62,14 +62,19 @@ func TestCloneProtoMappingsPreserveOptionsAndEndpoint(t *testing.T) {
 		GuestWorkdir: "/workspace/repo", RemoteName: "sandbox-demo",
 		GitEndpoint: &sandbox.GitEndpoint{HostIP: "127.0.0.1", Port: 49152, Repository: "repo"},
 	}
-	wire := toProtoCloneInfo(clone)
+	wire := toProtoCloneInfo(clone, sandbox.Running)
 	if wire == nil || wire.GetGuestWorkdir() != clone.GuestWorkdir || wire.GetRemoteName() != clone.RemoteName ||
 		wire.GetGitEndpoint() == nil || wire.GetGitEndpoint().GetHostIp() != clone.GitEndpoint.HostIP ||
 		wire.GetGitEndpoint().GetPort() != uint32(clone.GitEndpoint.Port) || wire.GetGitEndpoint().GetRepository() != "repo" {
 		t.Fatalf("clone info mapping = %+v", wire)
 	}
 	clone.GitEndpoint = nil
-	wire = toProtoCloneInfo(clone)
+	wire = toProtoCloneInfo(clone, sandbox.Running)
+	if wire.GetGitEndpoint() != nil {
+		t.Fatalf("clone without a live endpoint exposed one: %+v", wire.GetGitEndpoint())
+	}
+	clone.GitEndpoint = &sandbox.GitEndpoint{HostIP: "127.0.0.1", Port: 49152, Repository: "repo"}
+	wire = toProtoCloneInfo(clone, sandbox.Stopped)
 	if wire.GetGitEndpoint() != nil {
 		t.Fatalf("stopped clone exposed a Git endpoint: %+v", wire.GetGitEndpoint())
 	}

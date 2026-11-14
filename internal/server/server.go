@@ -641,7 +641,7 @@ func toProtoSandbox(sb sandbox.Sandbox) *localv1.Sandbox {
 		MemoryMib:          sb.MemoryMiB,
 		StoppedAtUnix:      unix(sb.StoppedAt),
 		Workspaces:         toProtoWorkspaces(sb.Workspaces),
-		CloneInfo:          toProtoCloneInfo(sandboxCloneInfo(sb.Meta.Clone)),
+		CloneInfo:          toProtoCloneInfo(sandboxCloneInfo(sb.Meta.Clone), sb.State),
 		Ports:              toProtoPorts(sb.Ports),
 		Allow:              toProtoRules(policyRules(sb.Policy, true)),
 		Deny:               toProtoRules(policyRules(sb.Policy, false)),
@@ -757,12 +757,15 @@ func fromProtoCloneOptions(clone *localv1.CloneOptions) *sandbox.CloneOptions {
 	return result
 }
 
-func toProtoCloneInfo(clone *sandbox.CloneInfo) *localv1.CloneInfo {
+// toProtoCloneInfo reports the live Git endpoint only for a running sandbox:
+// a stopped or unknown sandbox cannot serve the forward, and the persisted
+// port may already be reused by an unrelated process.
+func toProtoCloneInfo(clone *sandbox.CloneInfo, state sandbox.State) *localv1.CloneInfo {
 	if clone == nil {
 		return nil
 	}
 	result := &localv1.CloneInfo{GuestWorkdir: clone.GuestWorkdir, RemoteName: clone.RemoteName}
-	if clone.GitEndpoint != nil {
+	if clone.GitEndpoint != nil && state == sandbox.Running {
 		result.GitEndpoint = &localv1.GitEndpoint{
 			HostIp: clone.GitEndpoint.HostIP, Port: uint32(clone.GitEndpoint.Port), Repository: clone.GitEndpoint.Repository,
 		}

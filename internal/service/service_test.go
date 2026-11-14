@@ -328,7 +328,7 @@ func (f *fakeCloneRuntime) SetGitDaemon(_ context.Context, _ string, enabled boo
 
 func cloneGuestCommand(argv []string) []string {
 	for i, arg := range argv {
-		if arg == "git" || arg == "mkdir" || arg == "/bin/pwd" || arg == "realpath" {
+		if arg == "git" || arg == "mkdir" || arg == "/bin/pwd" || arg == "realpath" || arg == "/bin/sh" {
 			return argv[i:]
 		}
 	}
@@ -935,6 +935,8 @@ func TestCreateCloneUsesPrivateReadOnlySourceAndUploadOnlyDaemon(t *testing.T) {
 	backend := &fakeCloneRuntime{defaultGuestCWD: "/home/agent/project", forwardPorts: []uint16{49152}}
 	svc := New(st, backend)
 	source := makeCloneSourceRepository(t)
+	repository := filepath.Base(source)
+	workdir := filepath.Join(backend.defaultGuestCWD, repository)
 	op, err := svc.Create(ctx, CreateRequest{Name: "clone-demo", Workspaces: []sandbox.Workspace{{Path: source}}, Clone: &sandbox.CloneOptions{SourceWorkspacePath: source}})
 	if err != nil {
 		t.Fatal(err)
@@ -948,18 +950,20 @@ func TestCreateCloneUsesPrivateReadOnlySourceAndUploadOnlyDaemon(t *testing.T) {
 		t.Fatalf("runtime clone source mount = %+v", backend.lastConfig.Workspaces)
 	}
 	if sb.Meta.Clone == nil || sb.Meta.Clone.Options.SourceWorkspacePath != source || sb.Meta.Clone.Options.GuestWorkdir != nil || sb.Meta.Clone.Info == nil ||
-		sb.Meta.Clone.Info.GuestWorkdir != "/home/agent/project" || sb.Meta.Clone.Info.RemoteName != "sandbox-clone-demo" || sb.Meta.Clone.Info.GitEndpoint == nil ||
-		sb.Meta.Clone.Info.GitEndpoint.HostIP != cloneGitHostIP || sb.Meta.Clone.Info.GitEndpoint.Port != 49152 || sb.Meta.Clone.Info.GitEndpoint.Repository != "project" {
+		sb.Meta.Clone.Info.GuestWorkdir != workdir || sb.Meta.Clone.Info.RemoteName != "sandbox-clone-demo" || sb.Meta.Clone.Info.GitEndpoint == nil ||
+		sb.Meta.Clone.Info.GitEndpoint.HostIP != cloneGitHostIP || sb.Meta.Clone.Info.GitEndpoint.Port != 49152 || sb.Meta.Clone.Info.GitEndpoint.Repository != repository {
 		t.Fatalf("clone state = %+v", sb.Meta.Clone)
 	}
 
-	var sawClone, sawRemoteRemoval, sawHooksDisabled, sawCredentialsDisabled, sawUploadDaemon bool
+	var sawClone, sawRemoteRemoval, sawHooksDisabled, sawCredentialsDisabled, sawUploadDaemon, sawTrustConfig bool
 	for _, request := range backend.execRequests {
 		command := cloneGuestCommand(request.Argv)
 		joined := strings.Join(command, " ")
 		switch {
-		case strings.Contains(joined, "git clone"):
-			sawClone = strings.Contains(joined, "--no-hardlinks") && strings.Contains(joined, "--no-recurse-submodules") && strings.Contains(joined, "-- /run/sandbox/source /home/agent/project")
+		case strings.Contains(joined, " clone "):
+			sawClone = strings.Contains(joined, "--no-local") && strings.Contains(joined, "--no-hardlinks") &&
+				strings.Contains(joined, "--no-recurse-submodules") && strings.Contains(joined, "-- /run/sandbox/source "+workdir) &&
+				strings.Contains(strings.Join(request.Argv, " "), "GIT_CONFIG_GLOBAL=/tmp/.rheic-clone-gitconfig")
 		case strings.Contains(joined, "remote remove origin"):
 			sawRemoteRemoval = true
 		case strings.Contains(joined, "core.hooksPath /dev/null"):
@@ -968,14 +972,17 @@ func TestCreateCloneUsesPrivateReadOnlySourceAndUploadOnlyDaemon(t *testing.T) {
 			sawCredentialsDisabled = true
 		case strings.Contains(joined, "git daemon"):
 			sawUploadDaemon = strings.Contains(joined, "--strict-paths") && strings.Contains(joined, "--enable=upload-pack") &&
-				strings.Contains(joined, "--disable=receive-pack") && strings.HasSuffix(joined, " /home/agent/project") && !strings.Contains(joined, "sh -c")
+				strings.Contains(joined, "--disable=receive-pack") && strings.HasSuffix(joined, " "+filepath.Join(workdir, ".git")) && !strings.Contains(joined, "sh -c")
+		}
+		if strings.Contains(joined, "clone-trust-config") {
+			sawTrustConfig = true
 		}
 		if request.Argv[0] != "/usr/bin/env" || request.Argv[1] != "-i" {
 			t.Fatalf("clone command did not clear inherited guest environment: %v", request.Argv)
 		}
 	}
-	if !sawClone || !sawRemoteRemoval || !sawHooksDisabled || !sawCredentialsDisabled || !sawUploadDaemon {
-		t.Fatalf("clone commands missing: clone=%v remove-origin=%v hooks=%v credentials=%v daemon=%v", sawClone, sawRemoteRemoval, sawHooksDisabled, sawCredentialsDisabled, sawUploadDaemon)
+	if !sawClone || !sawRemoteRemoval || !sawHooksDisabled || !sawCredentialsDisabled || !sawUploadDaemon || !sawTrustConfig {
+		t.Fatalf("clone commands missing: clone=%v trust=%v remove-origin=%v hooks=%v credentials=%v daemon=%v", sawClone, sawTrustConfig, sawRemoteRemoval, sawHooksDisabled, sawCredentialsDisabled, sawUploadDaemon)
 	}
 }
 
@@ -1029,7 +1036,7 @@ func TestCreateCloneRejectsGuestPathSymlinkResolution(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = st.Close() }()
-	backend := &fakeCloneRuntime{defaultGuestCWD: "/workspace/project", guestRealpaths: map[string]string{"/workspace": "/mnt/host-backed"}}
+	backend := &fakeCloneRuntime{defaultGuestCWD: "/workspace", guestRealpaths: map[string]string{"/workspace": "/mnt/host-backed"}}
 	svc := New(st, backend)
 	source := makeCloneSourceRepository(t)
 	_, err = svc.Create(ctx, CreateRequest{Name: "clone-symlink", Workspaces: []sandbox.Workspace{{Path: source}}, Clone: &sandbox.CloneOptions{SourceWorkspacePath: source}})
@@ -1051,9 +1058,11 @@ func TestCloneCreateFailureUnwindsRuntimeAndForward(t *testing.T) {
 		forwardError    error
 		wantForwardCall []bool
 	}{
-		{name: "clone command", execFailMatch: "git clone"},
+		{name: "clone command", execFailMatch: " clone "},
 		{name: "missing git prerequisite", gitUnavailable: true},
 		{name: "publish", forwardError: errors.New("synthetic gateway failure"), wantForwardCall: []bool{true, false}},
+		{name: "git daemon readiness", execFailMatch: "ls-remote"},
+		{name: "non-empty destination", execFailMatch: "ls -A"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -1116,6 +1125,42 @@ func TestCloneStartStopDeleteLifecyclePersistsEndpoint(t *testing.T) {
 	}
 	if !slices.Equal(backend.forwardCalls, []bool{true, false, true, false}) {
 		t.Fatalf("clone forward lifecycle = %v", backend.forwardCalls)
+	}
+}
+
+func TestReconcileClearsStaleCloneEndpoint(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "clone-reconcile.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	backend := &fakeCloneRuntime{defaultGuestCWD: "/home/agent/project", forwardPorts: []uint16{49152}}
+	svc := New(st, backend)
+	source := makeCloneSourceRepository(t)
+	op, err := svc.Create(ctx, CreateRequest{Name: "clone-reconcile", Workspaces: []sandbox.Workspace{{Path: source}}, Clone: &sandbox.CloneOptions{SourceWorkspacePath: source}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := svc.Get(ctx, op.SandboxID)
+	if err != nil || created.Meta.Clone == nil || created.Meta.Clone.Info == nil || created.Meta.Clone.Info.GitEndpoint == nil {
+		t.Fatalf("created clone has no live endpoint: %+v, %v", created.Meta, err)
+	}
+	if _, err := svc.Reconcile(ctx); err != nil {
+		t.Fatalf("reconcile clone state: %v", err)
+	}
+	reconciled, err := svc.Get(ctx, op.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciled.State != sandbox.Unknown {
+		t.Fatalf("reconciled clone state = %s, want unknown", reconciled.State)
+	}
+	if reconciled.Meta.Clone == nil || reconciled.Meta.Clone.Info == nil || reconciled.Meta.Clone.Info.GitEndpoint != nil {
+		t.Fatalf("reconcile kept a stale Git endpoint: %+v", reconciled.Meta)
+	}
+	if reconciled.Meta.Clone.Options.SourceWorkspacePath != source {
+		t.Fatalf("reconcile dropped the clone request: %+v", reconciled.Meta.Clone.Options)
 	}
 }
 

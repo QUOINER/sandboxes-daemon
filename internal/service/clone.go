@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	posixpath "path"
 	"path/filepath"
@@ -24,10 +25,13 @@ const (
 	cloneGitGuestPort    = 9418
 	cloneGitHostIP       = "127.0.0.1"
 	cloneCommandTimeout  = 2 * time.Minute
+	cloneGitReadyTimeout = 10 * time.Second
 	cloneOutputLimit     = 4096
 	cloneGitCommand      = "git"
 	cloneGitConfig       = "config"
 	cloneGitLocalFlag    = "--local"
+	cloneGitTrustConfig  = "/tmp/.rheic-clone-gitconfig"
+	cloneShellCommand    = "/bin/sh"
 )
 
 var cloneRepositorySlug = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -218,7 +222,20 @@ func (s *Service) resolveCloneWorkdir(ctx context.Context, handle runtime.Handle
 	if err != nil {
 		return "", fmt.Errorf("discover guest working directory: %w", err)
 	}
-	return parseClonePwd(output)
+	base, err := parseClonePwd(output)
+	if err != nil {
+		return "", err
+	}
+	if base == "/" {
+		// Never clone into the image root: agents get a dedicated project
+		// directory instead of a checkout that fills the root filesystem.
+		base = "/workspace"
+	}
+	repository := posixpath.Base(filepath.ToSlash(clone.SourceWorkspacePath))
+	if !validCloneRepositorySlug(repository) {
+		return "", fmt.Errorf("%w: clone source has an unsafe repository name", core.ErrConflict)
+	}
+	return posixpath.Join(base, repository), nil
 }
 
 func parseClonePwd(output string) (string, error) {
@@ -257,12 +274,31 @@ func (s *Service) prepareCloneWorkdir(ctx context.Context, handle runtime.Handle
 	if err := s.requireClonePathResolution(ctx, handle, workdir, "-m"); err != nil {
 		return fmt.Errorf("revalidate clone destination: %w", err)
 	}
+	return s.requireEmptyCloneDestination(ctx, handle, workdir)
+}
+
+// requireEmptyCloneDestination rejects an existing clone destination that
+// already holds content, so a private clone never overwrites guest files.
+func (s *Service) requireEmptyCloneDestination(ctx context.Context, handle runtime.Handle, workdir string) error {
+	probe := `if [ -e "$1" ]; then [ -d "$1" ] && [ -z "$(ls -A -- "$1")" ]; fi`
+	if _, err := s.runCloneCommand(ctx, handle, []string{cloneShellCommand, "-c", probe, "clone-destination", workdir}, nil); err != nil {
+		return fmt.Errorf("%w: clone guest workdir must be absent or empty: %w", core.ErrConflict, err)
+	}
 	return nil
 }
 
 func (s *Service) initializeGuestClone(ctx context.Context, handle runtime.Handle, workdir string) error {
 	cloneEnv := cloneGitEnvironment()
-	if _, err := s.runCloneCommand(ctx, handle, []string{cloneGitCommand, "clone", "--no-local", "--no-hardlinks", "--no-recurse-submodules", "--", cloneSourceGuestPath, workdir}, cloneEnv); err != nil {
+	// The read-only source stays owned by the host user, while the guest user
+	// differs, so Git rejects it as a dubious-ownership repository. Only the
+	// protected (system/global) scope is honored for safe.directory, so a
+	// throwaway global config grants trust for this clone and is removed again.
+	if err := s.writeCloneTrustConfig(ctx, handle); err != nil {
+		return err
+	}
+	defer func() { _ = s.removeCloneTrustConfig(ctx, handle) }()
+	trustEnv := withCloneGlobalConfig(cloneEnv, cloneGitTrustConfig)
+	if _, err := s.runCloneCommand(ctx, handle, []string{cloneGitCommand, "clone", "--no-local", "--no-hardlinks", "--no-recurse-submodules", "--", cloneSourceGuestPath, workdir}, trustEnv); err != nil {
 		return fmt.Errorf("create private guest clone: %w", err)
 	}
 	if _, err := s.runCloneCommand(ctx, handle, []string{cloneGitCommand, "-C", workdir, "remote", "remove", "origin"}, cloneEnv); err != nil {
@@ -303,10 +339,17 @@ func validateCloneWorkdirAgainstWorkspaces(workdir string, workspaces []sandbox.
 
 func (s *Service) startCloneGitDaemon(ctx context.Context, handle runtime.Handle, name string, info *sandbox.CloneInfo) (uint16, error) {
 	workdir := info.GuestWorkdir
+	// A Git working tree is not itself a Git directory, so the daemon is
+	// pointed at exactly one exported directory: the clone's .git directory.
+	// Clients address it as <repository>/.git below the base path.
 	args := []string{cloneGitCommand, "daemon", "--detach", "--reuseaddr", "--listen=" + cloneGitGuestIP,
-		"--port=" + strconv.Itoa(cloneGitGuestPort), "--base-path=" + posixpath.Dir(workdir), "--strict-paths", "--export-all", "--enable=upload-pack", "--disable=receive-pack", workdir}
+		"--port=" + strconv.Itoa(cloneGitGuestPort), "--base-path=" + posixpath.Dir(workdir), "--strict-paths", "--export-all",
+		"--enable=upload-pack", "--disable=receive-pack", posixpath.Join(workdir, ".git")}
 	if _, err := s.runCloneCommand(ctx, handle, args, daemonGitEnvironment()); err != nil {
 		return 0, fmt.Errorf("start guest Git daemon: %w", err)
+	}
+	if err := s.waitCloneGitDaemon(ctx, handle, posixpath.Base(workdir)); err != nil {
+		return 0, err
 	}
 	forwarder := s.backend.(runtime.GitDaemonForwarder)
 	port, err := forwarder.SetGitDaemon(ctx, name, true)
@@ -317,6 +360,28 @@ func (s *Service) startCloneGitDaemon(ctx context.Context, handle runtime.Handle
 		return 0, errors.Join(errors.New("gateway returned an empty Git daemon port"), s.withdrawCloneGitForward(ctx, name))
 	}
 	return port, nil
+}
+
+// waitCloneGitDaemon confirms the guest Git daemon really serves the clone
+// before its forward is published: --detach hides bind and startup failures.
+func (s *Service) waitCloneGitDaemon(ctx context.Context, handle runtime.Handle, repository string) error {
+	url := "git://" + net.JoinHostPort(cloneGitGuestIP, strconv.Itoa(cloneGitGuestPort)) + "/" + repository + "/.git"
+	deadline := time.Now().Add(cloneGitReadyTimeout)
+	var lastErr error
+	for {
+		_, lastErr = s.runCloneCommand(ctx, handle, []string{cloneGitCommand, "ls-remote", "--quiet", url, "HEAD"}, cloneGitProbeEnvironment())
+		if lastErr == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("guest Git daemon did not serve %q: %w", repository, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 func (s *Service) withdrawCloneGitForward(ctx context.Context, name string) error {
@@ -383,9 +448,19 @@ func (s *Service) runCloneCommand(ctx context.Context, handle runtime.Handle, ar
 		Argv: args, Workdir: "", Stdout: &stdout, Stderr: &stderr,
 	})
 	if err != nil || code != 0 {
-		return "", errors.Join(fmt.Errorf("guest command failed with exit code %d", code), err, stdout.err, stderr.err)
+		return "", errors.Join(fmt.Errorf("guest command failed with exit code %d", code), err, stdout.err, stderr.err, guestCommandFailure(stderr.String()))
 	}
 	return stdout.String(), nil
+}
+
+// guestCommandFailure surfaces the bounded guest stderr so a failed clone
+// reports the underlying Git error instead of only an exit code.
+func guestCommandFailure(stderr string) error {
+	message := strings.TrimSpace(stderr)
+	if message == "" {
+		return nil
+	}
+	return fmt.Errorf("guest stderr: %s", message)
 }
 
 type limitedCloneBuffer struct {
@@ -410,6 +485,51 @@ func cloneGitEnvironment() []string {
 		"GIT_CONFIG_KEY_1=credential.helper", "GIT_CONFIG_VALUE_1=",
 		"GIT_CONFIG_KEY_2=init.templateDir", "GIT_CONFIG_VALUE_2=/dev/null",
 	}
+}
+
+// writeCloneTrustConfig writes the one throwaway global Git config that makes
+// the read-only host-owned source usable inside the guest.
+func (s *Service) writeCloneTrustConfig(ctx context.Context, handle runtime.Handle) error {
+	script := `umask 077; printf '[safe]\n\tdirectory = *\n' > "$1"`
+	if _, err := s.runCloneCommand(ctx, handle, []string{cloneShellCommand, "-c", script, "clone-trust-config", cloneGitTrustConfig}, nil); err != nil {
+		return fmt.Errorf("prepare clone Git trust config: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) removeCloneTrustConfig(ctx context.Context, handle runtime.Handle) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if _, err := s.runCloneCommand(cleanupCtx, handle, []string{"rm", "-f", "--", cloneGitTrustConfig}, nil); err != nil {
+		return fmt.Errorf("remove clone Git trust config: %w", err)
+	}
+	return nil
+}
+
+// withCloneGlobalConfig replaces GIT_CONFIG_GLOBAL in a prepared Git
+// environment so exactly one extra global config file is honored.
+func withCloneGlobalConfig(env []string, path string) []string {
+	result := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "GIT_CONFIG_GLOBAL=") {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return append(result, "GIT_CONFIG_GLOBAL="+path)
+}
+
+// cloneGitProbeEnvironment allows only the Git protocol for the in-guest
+// readiness probe; every other Git command stays confined to local files.
+func cloneGitProbeEnvironment() []string {
+	env := make([]string, 0, len(cloneGitEnvironment())+1)
+	for _, entry := range cloneGitEnvironment() {
+		if strings.HasPrefix(entry, "GIT_ALLOW_PROTOCOL=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env, "GIT_ALLOW_PROTOCOL=git")
 }
 
 func daemonGitEnvironment() []string {
