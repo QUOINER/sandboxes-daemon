@@ -20,7 +20,35 @@ const (
 	// finish before the daemon escalates against the launcher process.
 	shutdownTimeout = 12 * time.Second
 	probeInterval   = 100 * time.Millisecond
+
+	binaryVersionTimeout     = 5 * time.Second
+	binaryVersionOutputLimit = 64 << 10
 )
+
+// ErrBinaryVersionTimeout indicates that a managed runtime binary did not
+// report its version before the bounded version check deadline.
+var ErrBinaryVersionTimeout = errors.New("binary version check timed out")
+
+// ErrBinaryVersionOutputTooLarge indicates that a managed runtime binary
+// produced more output than the version check accepts.
+var ErrBinaryVersionOutputTooLarge = errors.New("binary version output exceeded limit")
+
+var errCommandOutputTooLarge = errors.New("command output exceeded limit")
+
+// VersionCheckError reports a failed managed runtime binary version check.
+type VersionCheckError struct {
+	Binary string
+	Err    error
+}
+
+func (e *VersionCheckError) Error() string {
+	return fmt.Sprintf("verify %s version: %v", e.Binary, e.Err)
+}
+
+// Unwrap exposes the underlying version check failure.
+func (e *VersionCheckError) Unwrap() error {
+	return e.Err
+}
 
 type Service struct {
 	plan     Plan
@@ -296,14 +324,26 @@ func (s *Service) waitForServiceShutdown() error {
 }
 
 func verifyBinaryVersion(binary, name string, environment []string) error {
-	output, err := runCommand(context.Background(), binary, []string{"--version"}, environment)
+	return verifyBinaryVersionWithTimeout(binary, name, environment, binaryVersionTimeout)
+}
+
+func verifyBinaryVersionWithTimeout(binary, name string, environment []string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	output, err := runCommandWithOutputLimit(ctx, binary, []string{"--version"}, environment, binaryVersionOutputLimit)
 	if err != nil {
-		return fmt.Errorf("run %s version check: %w", name, err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return &VersionCheckError{Binary: name, Err: fmt.Errorf("%w after %s: %w", ErrBinaryVersionTimeout, timeout, err)}
+		}
+		if errors.Is(err, errCommandOutputTooLarge) {
+			return &VersionCheckError{Binary: name, Err: fmt.Errorf("%w: %w", ErrBinaryVersionOutputTooLarge, err)}
+		}
+		return &VersionCheckError{Binary: name, Err: err}
 	}
 	if versionOutputMatches(string(output), name) {
 		return nil
 	}
-	return fmt.Errorf("%s binary does not report the pinned containerd v%s version", name, ExpectedVersion)
+	return &VersionCheckError{Binary: name, Err: fmt.Errorf("does not report the pinned containerd v%s version", ExpectedVersion)}
 }
 
 func makeCommand(path string, args []string, environment []string) *exec.Cmd {
@@ -314,6 +354,10 @@ func makeCommand(path string, args []string, environment []string) *exec.Cmd {
 }
 
 func runCommand(ctx context.Context, path string, args, environment []string) ([]byte, error) {
+	return runCommandWithOutputLimit(ctx, path, args, environment, 0)
+}
+
+func runCommandWithOutputLimit(ctx context.Context, path string, args, environment []string, outputLimit int) ([]byte, error) {
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -328,7 +372,12 @@ func runCommand(ctx context.Context, path string, args, environment []string) ([
 	_ = writer.Close()
 	outputDone := make(chan []byte, 1)
 	go func() {
-		data, _ := io.ReadAll(reader)
+		var data []byte
+		if outputLimit > 0 {
+			data, _ = io.ReadAll(io.LimitReader(reader, int64(outputLimit)+1))
+		} else {
+			data, _ = io.ReadAll(reader)
+		}
 		_ = reader.Close()
 		outputDone <- data
 	}()
@@ -341,12 +390,26 @@ func runCommand(ctx context.Context, path string, args, environment []string) ([
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
-		waitErr = <-waitDone
-		if waitErr == nil {
-			waitErr = ctx.Err()
-		}
+		waitErr = errors.Join(<-waitDone, ctx.Err())
+		// Stop waiting for output if descendants retain the pipe after
+		// cancellation.
+		_ = reader.Close()
 	}
-	return <-outputDone, waitErr
+	var output []byte
+	select {
+	case output = <-outputDone:
+	case <-ctx.Done():
+		// The checked process may have exited while a descendant still holds
+		// the inherited pipe open. Closing our read end keeps the version probe
+		// bounded even when EOF never arrives.
+		_ = reader.Close()
+		output = <-outputDone
+		waitErr = errors.Join(waitErr, ctx.Err())
+	}
+	if outputLimit > 0 && len(output) > outputLimit {
+		return output[:outputLimit], fmt.Errorf("%w: limit %d bytes", errCommandOutputTooLarge, outputLimit)
+	}
+	return output, waitErr
 }
 
 func versionOutputMatches(output, name string) bool {

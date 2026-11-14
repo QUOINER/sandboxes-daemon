@@ -240,6 +240,16 @@ func dockerOAuthProviders() map[string]service.OAuthProvider {
 	}
 }
 
+func managedRuntimeConfig(opts *options, socket string) runtimectr.Config {
+	return runtimectr.Config{
+		Socket:      socket,
+		Namespace:   containerdsvc.Namespace,
+		CTR:         opts.ctrPath,
+		Runtime:     filepath.Join(opts.runtimeDir, "containerd-shim-nerdbox-v1"),
+		Snapshotter: opts.snapshotter,
+	}
+}
+
 func buildBackend(ctx context.Context, opts *options, gatewayLost chan<- string) (runtime.Backend, func() error, <-chan error, error) {
 	if opts.containerdPath == "" {
 		if opts.ctrPath != "" || opts.runtimeDir != "" || opts.runtimeAssets != "" {
@@ -272,12 +282,7 @@ func buildBackend(ctx context.Context, opts *options, gatewayLost chan<- string)
 	if err != nil {
 		return nil, nil, nil, errors.Join(err, managed.Close())
 	}
-	backend, err := runtimectr.NewBackend(runtimectr.Config{
-		Socket:      managed.Socket(),
-		CTR:         opts.ctrPath,
-		Runtime:     filepath.Join(opts.runtimeDir, "containerd-shim-nerdbox-v1"),
-		Snapshotter: opts.snapshotter,
-	}, runtimectr.BackendOptions{Image: opts.image, FIFODir: fifoDir, Network: network})
+	backend, err := runtimectr.NewBackend(managedRuntimeConfig(opts, managed.Socket()), runtimectr.BackendOptions{Image: opts.image, FIFODir: fifoDir, Network: network})
 	if err != nil {
 		var closeErr error
 		if manager != nil {
