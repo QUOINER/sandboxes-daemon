@@ -761,6 +761,47 @@ func TestCreateRejectsInvalidWorkspaces(t *testing.T) {
 	}
 }
 
+func TestStateOnlyCreateValidatesGuestPathsBeforePersistence(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "state-only.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	svc := New(st, nil)
+
+	hostPath := filepath.Join(t.TempDir(), "repo")
+	op, err := svc.Create(ctx, CreateRequest{Name: "valid", Workspaces: []sandbox.Workspace{{Path: hostPath, GuestPath: "/workspace/repo"}}})
+	if err != nil {
+		t.Fatalf("state-only create with a valid guest path: %v", err)
+	}
+	sb, err := svc.Get(ctx, op.SandboxID)
+	if err != nil || len(sb.Workspaces) != 1 || sb.Workspaces[0].GuestPath != "/workspace/repo" {
+		t.Fatalf("persisted workspace = %+v, err=%v", sb.Workspaces, err)
+	}
+
+	invalid := [][]sandbox.Workspace{
+		{{Path: "/host/a", GuestPath: "relative"}},
+		{{Path: "/host/a", GuestPath: "/workspace/../repo"}},
+		{{Path: "/host/a", GuestPath: "/workspace,repo"}},
+		{{Path: "/host/a", GuestPath: "/workspace=repo"}},
+		{{Path: "/host/a", GuestPath: "/workspace\x00repo"}},
+		{{Path: "/host/a", GuestPath: "/workspace\rrepo"}},
+		{{Path: "/host/a", GuestPath: "/workspace\nrepo"}},
+		{{Path: "/host/a", GuestPath: "/workspace/shared"}, {Path: "/host/b", GuestPath: "/workspace/shared"}},
+		{{Path: "/workspace/shared"}, {Path: "/host/b", GuestPath: "/workspace/shared"}},
+	}
+	for i, workspaces := range invalid {
+		name := fmt.Sprintf("invalid-%d", i)
+		if _, err := svc.Create(ctx, CreateRequest{Name: name, Workspaces: workspaces}); !errors.Is(err, core.ErrConflict) {
+			t.Errorf("state-only create accepted invalid workspaces %+v: %v", workspaces, err)
+		}
+		if _, err := svc.GetByName(ctx, name); !errors.Is(err, core.ErrNotFound) {
+			t.Errorf("invalid state-only create %q persisted a sandbox: %v", name, err)
+		}
+	}
+}
+
 func TestCreateRejectsOccupiedHostPort(t *testing.T) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {

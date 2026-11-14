@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	posixpath "path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -1095,6 +1096,10 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	if !validSandboxName(name) {
 		return operation.Operation{}, fmt.Errorf("%w: invalid sandbox name", core.ErrConflict)
 	}
+	workspace, workspaces, err := normalizeCreateWorkspaces(req)
+	if err != nil {
+		return operation.Operation{}, err
+	}
 	release, err := s.acquireCreateGates(ctx, name, req.IdempotencyKey)
 	if err != nil {
 		return operation.Operation{}, err
@@ -1142,10 +1147,6 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (operation.Oper
 	}
 	if len(proxyServiceNames) != 0 && s.backend == nil {
 		return operation.Operation{}, fmt.Errorf("%w: service proxy requires a VM runtime", core.ErrConflict)
-	}
-	workspace, workspaces, err := normalizeCreateWorkspaces(req)
-	if err != nil {
-		return operation.Operation{}, err
 	}
 	profile, ports, allow, deny, err := s.normalizeCreatePolicy(ctx, req)
 	if err != nil {
@@ -1371,17 +1372,31 @@ func normalizeWorkspaces(req CreateRequest) ([]sandbox.Workspace, error) {
 	if len(workspaces) > 16 {
 		return nil, fmt.Errorf("%w: too many workspaces", core.ErrConflict)
 	}
-	seen := make(map[string]struct{}, len(workspaces))
+	seenHost := make(map[string]struct{}, len(workspaces))
+	seenGuest := make(map[string]struct{}, len(workspaces))
 	for i := range workspaces {
 		workspace := &workspaces[i]
 		if workspace.Path == "" || !filepath.IsAbs(workspace.Path) || strings.ContainsRune(workspace.Path, '\x00') {
 			return nil, fmt.Errorf("%w: workspace path must be absolute", core.ErrConflict)
 		}
 		workspace.Path = filepath.Clean(workspace.Path)
-		if _, exists := seen[workspace.Path]; exists {
+		if _, exists := seenHost[workspace.Path]; exists {
 			return nil, fmt.Errorf("%w: duplicate workspace", core.ErrConflict)
 		}
-		seen[workspace.Path] = struct{}{}
+		seenHost[workspace.Path] = struct{}{}
+
+		destination := workspace.GuestPath
+		if destination != "" {
+			if !posixpath.IsAbs(destination) || posixpath.Clean(destination) != destination || strings.ContainsAny(destination, ",=\x00\r\n") {
+				return nil, fmt.Errorf("%w: workspace guest path must be a clean absolute POSIX path without mount delimiters or control characters", core.ErrConflict)
+			}
+		} else {
+			destination = workspace.Path
+		}
+		if _, exists := seenGuest[destination]; exists {
+			return nil, fmt.Errorf("%w: duplicate workspace guest path", core.ErrConflict)
+		}
+		seenGuest[destination] = struct{}{}
 	}
 	return workspaces, nil
 }
