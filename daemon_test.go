@@ -8,10 +8,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	localv1 "github.com/rheic/sandboxes-api/gen/go/sandboxes/local/v1"
+	runtime "github.com/rheic/sandboxes-runtime"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -53,6 +55,105 @@ func TestRunStartsAndStops(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("daemon did not stop")
+	}
+}
+
+func TestRunStartsBackendFactoryAfterTakingStateLock(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "rsbx-factory-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	started := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	finished := make(chan error, 1)
+	go func() {
+		finished <- Run(ctx, Config{
+			SocketPath: filepath.Join(dir, "daemon.sock"), StateDir: dir,
+			BackendFactory: func(context.Context) (runtime.Backend, func() error, <-chan error, error) {
+				lock, err := lockStateDirectory(dir)
+				if err == nil {
+					_ = lock.Close()
+					return nil, nil, nil, errors.New("backend factory ran without state lock")
+				}
+				close(started)
+				return nil, nil, nil, nil
+			},
+		})
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("backend factory did not run")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "daemon.sock")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			select {
+			case err := <-finished:
+				t.Fatalf("daemon returned before starting: %v", err)
+			default:
+				t.Fatal("daemon did not start")
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not stop")
+	}
+}
+
+func TestRunStopsWhenManagedRuntimeExits(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "rsbx-runtime-exit-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	failures := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Config{
+			SocketPath: filepath.Join(dir, "daemon.sock"), StateDir: dir,
+			BackendFactory: func(context.Context) (runtime.Backend, func() error, <-chan error, error) {
+				return nil, nil, failures, nil
+			},
+		})
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "daemon.sock")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			select {
+			case err := <-done:
+				t.Fatalf("daemon returned before starting: %v", err)
+			default:
+				t.Fatal("daemon did not start")
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	failures <- errors.New("synthetic containerd exit")
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "synthetic containerd exit") {
+			t.Fatalf("expected managed runtime failure, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not stop after managed runtime exit")
 	}
 }
 

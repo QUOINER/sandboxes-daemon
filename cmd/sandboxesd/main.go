@@ -18,6 +18,7 @@ import (
 	runtimectr "github.com/rheic/sandboxes-runtime/ctr"
 
 	daemon "github.com/rheic/sandboxes-daemon"
+	"github.com/rheic/sandboxes-daemon/internal/containerdsvc"
 	daemonnetwork "github.com/rheic/sandboxes-daemon/internal/network"
 	"github.com/rheic/sandboxes-daemon/internal/oauthsession"
 	"github.com/rheic/sandboxes-daemon/internal/policysync"
@@ -31,7 +32,8 @@ type options struct {
 	stateDir              string
 	containerdPath        string
 	ctrPath               string
-	runtimeName           string
+	runtimeDir            string
+	runtimeAssets         string
 	snapshotter           string
 	image                 string
 	fifoDir               string
@@ -67,6 +69,9 @@ func main() {
 }
 
 func run() int {
+	if len(os.Args) > 1 && os.Args[1] == containerdsvc.LauncherArgument {
+		return containerdsvc.RunLauncher(os.Args[2:])
+	}
 	if len(os.Args) > 1 && os.Args[1] == gateway.SupervisorArgument {
 		if err := gateway.RunSupervisor(os.Args[2:]); err != nil {
 			_, _ = fmt.Fprintln(os.Stderr, "gateway supervisor:", err)
@@ -78,12 +83,6 @@ func run() int {
 	if opts.showVersion {
 		_, _ = fmt.Fprintln(os.Stdout, version.Version)
 		return 0
-	}
-	lost := make(chan string, 8)
-	backend, cleanup, err := buildBackend(&opts, lost)
-	if err != nil {
-		_, _ = fmt.Fprintln(os.Stderr, err)
-		return 1
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -97,16 +96,18 @@ func run() int {
 		slog.Error("load policy sync configuration", "error", syncErr)
 		return 1
 	}
-	err = daemon.Run(ctx, daemon.Config{
-		SocketPath:               opts.socketPath,
-		StateDir:                 opts.stateDir,
-		Backend:                  backend,
+	lost := make(chan string, 8)
+	err := daemon.Run(ctx, daemon.Config{
+		SocketPath: opts.socketPath,
+		StateDir:   opts.stateDir,
+		BackendFactory: func(runCtx context.Context) (runtime.Backend, func() error, <-chan error, error) {
+			return buildBackend(runCtx, &opts, lost)
+		},
 		DefaultImage:             opts.image,
 		IPv6Enabled:              ipv6RuleCapability(&opts),
 		QUICEnabled:              quicRuleCapability(&opts),
 		OrgPolicyEnforce:         opts.orgPolicyEnforce,
 		OrgPolicyOrg:             opts.orgPolicyOrg,
-		Cleanup:                  cleanup,
 		OAuthProviders:           dockerOAuthProviders(),
 		DNSUpstream:              opts.dnsUpstream,
 		DefaultPolicyProfile:     opts.defaultPolicyProfile,
@@ -139,9 +140,10 @@ func parseOptions() options {
 	defaultState := filepath.Join(home, ".sandboxes")
 	flag.StringVar(&opts.stateDir, "state", defaultState, "state directory")
 	flag.StringVar(&opts.socketPath, "socket", filepath.Join(defaultState, "sandboxesd.sock"), "local daemon endpoint")
-	flag.StringVar(&opts.containerdPath, "containerd", "", "containerd socket; empty keeps state-only mode")
-	flag.StringVar(&opts.ctrPath, "ctr", "ctr", "ctr binary path")
-	flag.StringVar(&opts.runtimeName, "runtime", "io.containerd.nerdbox.v1", "containerd runtime name")
+	flag.StringVar(&opts.containerdPath, "containerd", "", "absolute containerd binary path; empty keeps state-only mode")
+	flag.StringVar(&opts.ctrPath, "ctr", "", "absolute ctr binary path for the managed containerd service")
+	flag.StringVar(&opts.runtimeDir, "runtime-dir", "", "absolute directory containing the nerdbox shim")
+	flag.StringVar(&opts.runtimeAssets, "runtime-assets", "", "absolute directory containing the pinned libkrun runtime assets")
 	flag.StringVar(&opts.snapshotter, "snapshotter", "erofs", "containerd snapshotter")
 	flag.StringVar(&opts.image, "image", "alpine:3.22", "default image")
 	flag.StringVar(&opts.fifoDir, "fifo-dir", "", "runtime FIFO directory")
@@ -238,41 +240,68 @@ func dockerOAuthProviders() map[string]service.OAuthProvider {
 	}
 }
 
-func buildBackend(opts *options, gatewayLost chan<- string) (runtime.Backend, func() error, error) {
+func managedRuntimeConfig(opts *options, socket string) runtimectr.Config {
+	return runtimectr.Config{
+		Socket:      socket,
+		Namespace:   containerdsvc.Namespace,
+		CTR:         opts.ctrPath,
+		Runtime:     filepath.Join(opts.runtimeDir, "containerd-shim-nerdbox-v1"),
+		Snapshotter: opts.snapshotter,
+	}
+}
+
+func buildBackend(ctx context.Context, opts *options, gatewayLost chan<- string) (runtime.Backend, func() error, <-chan error, error) {
 	if opts.containerdPath == "" {
-		return nil, nil, nil
+		if opts.ctrPath != "" || opts.runtimeDir != "" || opts.runtimeAssets != "" {
+			return nil, nil, nil, fmt.Errorf("--ctr, --runtime-dir, and --runtime-assets require managed --containerd")
+		}
+		return nil, nil, nil, nil
+	}
+	launcher, err := os.Executable()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("locate daemon launcher: %w", err)
+	}
+	managed, err := containerdsvc.Start(ctx, containerdsvc.Config{
+		Binary:        opts.containerdPath,
+		CTR:           opts.ctrPath,
+		RuntimeDir:    opts.runtimeDir,
+		RuntimeAssets: opts.runtimeAssets,
+		StateDir:      opts.stateDir,
+	}, launcher)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("start managed containerd: %w", err)
 	}
 	fifoDir := opts.fifoDir
 	if fifoDir == "" {
 		fifoDir = filepath.Join(opts.stateDir, "fifo")
 	}
 	if err := os.MkdirAll(fifoDir, 0o700); err != nil {
-		return nil, nil, fmt.Errorf("create fifo dir: %w", err)
+		return nil, nil, nil, errors.Join(fmt.Errorf("create fifo dir: %w", err), managed.Close())
 	}
 	network, manager, err := buildNetwork(opts, gatewayLost)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, errors.Join(err, managed.Close())
 	}
-	backend, err := runtimectr.NewBackend(runtimectr.Config{
-		Socket:      opts.containerdPath,
-		CTR:         opts.ctrPath,
-		Runtime:     opts.runtimeName,
-		Snapshotter: opts.snapshotter,
-	}, runtimectr.BackendOptions{Image: opts.image, FIFODir: fifoDir, Network: network})
+	backend, err := runtimectr.NewBackend(managedRuntimeConfig(opts, managed.Socket()), runtimectr.BackendOptions{Image: opts.image, FIFODir: fifoDir, Network: network})
 	if err != nil {
-		return nil, nil, fmt.Errorf("create runtime backend: %w", err)
+		var closeErr error
+		if manager != nil {
+			closeErr = manager.Close(context.Background())
+		}
+		return nil, nil, nil, errors.Join(fmt.Errorf("create runtime backend: %w", err), closeErr, managed.Close())
 	}
 	cleanup := func() error {
+		var result error
 		if manager != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			if err := manager.Close(ctx); err != nil {
-				return fmt.Errorf("cleanup gateway manager: %w", err)
+				result = errors.Join(result, fmt.Errorf("cleanup gateway manager: %w", err))
 			}
 		}
-		return nil
+		return errors.Join(result, managed.Close())
 	}
-	return backend, cleanup, nil
+	return backend, cleanup, managed.Failures(), nil
 }
 
 func buildNetwork(opts *options, gatewayLost chan<- string) (runtime.Network, *gateway.Manager, error) {

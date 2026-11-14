@@ -1,6 +1,36 @@
 package main
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+
+	"github.com/rheic/sandboxes-daemon/internal/containerdsvc"
+)
+
+func TestManagedRuntimeConfigPropagatesExplicitNamespace(t *testing.T) {
+	opts := &options{
+		ctrPath:     "/opt/runtime/bin/ctr",
+		runtimeDir:  "/opt/runtime",
+		snapshotter: "erofs",
+	}
+	cfg := managedRuntimeConfig(opts, "/run/managed/containerd.sock")
+
+	if cfg.Namespace != containerdsvc.Namespace {
+		t.Fatalf("runtime namespace = %q, want %q", cfg.Namespace, containerdsvc.Namespace)
+	}
+	if cfg.Socket != "/run/managed/containerd.sock" {
+		t.Fatalf("runtime socket = %q, want managed socket", cfg.Socket)
+	}
+	if cfg.CTR != opts.ctrPath {
+		t.Fatalf("runtime ctr = %q, want %q", cfg.CTR, opts.ctrPath)
+	}
+	if want := filepath.Join(opts.runtimeDir, "containerd-shim-nerdbox-v1"); cfg.Runtime != want {
+		t.Fatalf("runtime shim = %q, want %q", cfg.Runtime, want)
+	}
+	if cfg.Snapshotter != opts.snapshotter {
+		t.Fatalf("runtime snapshotter = %q, want %q", cfg.Snapshotter, opts.snapshotter)
+	}
+}
 
 func TestIPv6RuleCapabilityRequiresFlagAndGateway(t *testing.T) {
 	for _, test := range []struct {
