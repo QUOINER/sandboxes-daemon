@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -133,6 +134,16 @@ func TestDaemonSocketGenerationRecoversAfterSIGKILL(t *testing.T) {
 	}
 }
 
+func TestValidateDaemonSocketAliasPathEnforcesUnixPathLimit(t *testing.T) {
+	maxPathBytes := len(syscall.RawSockaddrUnix{}.Path) - 1
+	if err := validateDaemonSocketAliasPath(strings.Repeat("a", maxPathBytes)); err != nil {
+		t.Fatalf("accepted maximum-length Unix socket path: %v", err)
+	}
+	if err := validateDaemonSocketAliasPath(strings.Repeat("a", maxPathBytes+1)); err == nil {
+		t.Fatal("accepted overlong Unix socket path")
+	}
+}
+
 func TestValidateDaemonSocketParentRejectsIntermediateSymlink(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "real-parent")
@@ -163,6 +174,54 @@ func TestValidateDaemonSocketParentRejectsWritableAncestorWithoutStickyBit(t *te
 	}
 	if err := validateDaemonSocketParent(private); err == nil {
 		t.Fatal("accepted a private socket directory under a writable non-sticky ancestor")
+	}
+}
+
+func TestValidateDaemonSocketACLListing(t *testing.T) {
+	tests := []struct {
+		name    string
+		listing string
+		wantErr bool
+	}{
+		{name: "no acl", listing: "drwx------ 2 user staff 64 dir\n"},
+		{name: "empty listing", listing: "", wantErr: true},
+		{name: "invalid header", listing: "unexpected output\n", wantErr: true},
+		{name: "deny mutation", listing: "drwx------@ 2 user staff 64 dir\n 0: group:everyone deny delete_child\n"},
+		{name: "allow read", listing: "drwx------@ 2 user staff 64 dir\n 0: group:everyone allow list,search,readattr\n"},
+		{name: "allow delete child", listing: "drwx------@ 2 user staff 64 dir\n 0: group:everyone allow delete_child\n", wantErr: true},
+		{name: "allow add file", listing: "drwx------@ 2 user staff 64 dir\n 0: user:other allow add_file\n", wantErr: true},
+		{name: "unknown ACL entry", listing: "drwx------@ 2 user staff 64 dir\n 0: user:other audit delete_child\n", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateDaemonSocketACLListing(test.listing)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateDaemonSocketACLListing() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateDaemonSocketRejectsDarwinACLMutation(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Darwin ACL test")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/bin/chmod", "+a", "everyone allow delete_child,add_file,add_subdirectory", dir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("filesystem does not support macOS ACL test: %v: %s", err, output)
+	}
+	defer func() {
+		cleanup := exec.Command("/bin/chmod", "-N", dir)
+		if output, err := cleanup.CombinedOutput(); err != nil {
+			t.Errorf("remove test-only ACL: %v: %s", err, output)
+		}
+	}()
+	if err := validateDaemonSocketACL(dir); err == nil {
+		t.Fatal("accepted a directory ACL that grants mutation rights")
 	}
 }
 

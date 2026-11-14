@@ -5,12 +5,12 @@
 ### Fixed
 
 - Restart Linux containerd after SIGKILL using a fresh socket/config generation and an atomically published stable endpoint. Existing socket paths are preserved; unexpected endpoint types fail closed.
-- Restart the local daemon after SIGKILL through a validated stable alias and a fresh per-user Unix socket generation; preserve legacy direct sockets and unknown endpoint paths.
+- Restart the local daemon after SIGKILL through a validated stable alias and a fresh per-user Unix socket generation; preserve legacy direct sockets and unknown endpoint paths. Reject overlong alias paths, unsafe Darwin ACL grants, and untrusted writable parent chains.
 - Exercise real pinned containerd recovery after SIGKILL in the opt-in Linux keeper smoke.
 
 ### Security and limitations
 
-- Daemon socket aliases require a private configured parent and trusted ancestor chain. Same-UID concurrent alias-path mutation remains outside the guarantee. The Linux generation smoke and owned guest task acceptance do not replace artifact provenance, platform coverage, or independent M7 review.
+- Daemon socket aliases require a private configured parent and trusted ancestor chain. Darwin ACL checks fail closed on inspection errors. Same-UID concurrent alias-path mutation remains outside the guarantee. The Linux generation smoke and owned guest task acceptance do not replace artifact provenance, platform coverage, or independent M7 review.
 
 ## v0.0.52 — 2026-11-11
 

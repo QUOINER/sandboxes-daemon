@@ -13,11 +13,82 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
+
+var daemonSocketACLMutationPermissions = map[string]struct{}{
+	"add_file": {}, "add_subdirectory": {}, "delete": {}, "delete_child": {},
+	"write": {}, "append": {}, "writeattr": {}, "writeextattr": {},
+	"writeperm": {}, "writesecurity": {}, "chown": {},
+}
+
+func validateDaemonSocketACLListing(output string) error {
+	headerSeen := false
+	for _, rawLine := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		if !headerSeen {
+			if err := validateDaemonSocketACLHeader(line); err != nil {
+				return err
+			}
+			headerSeen = true
+			continue
+		}
+		if err := validateDaemonSocketACLEntry(line); err != nil {
+			return err
+		}
+	}
+	if !headerSeen {
+		return errors.New("empty directory listing")
+	}
+	return nil
+}
+
+func validateDaemonSocketACLHeader(line string) error {
+	fields := strings.Fields(line)
+	if len(fields) == 0 || !strings.HasPrefix(fields[0], "d") {
+		return errors.New("unexpected directory listing header")
+	}
+	return nil
+}
+
+func validateDaemonSocketACLEntry(line string) error {
+	prefix, entry, hasEntry := strings.Cut(line, ":")
+	if !hasEntry {
+		return nil
+	}
+	if _, err := strconv.Atoi(prefix); err != nil {
+		return errors.New("unrecognized ACL entry prefix")
+	}
+	fields := strings.Fields(entry)
+	modeIndex := -1
+	for index, field := range fields {
+		if field == "deny" {
+			return nil
+		}
+		if field == "allow" {
+			modeIndex = index
+			break
+		}
+	}
+	if modeIndex == -1 || modeIndex == len(fields)-1 {
+		return errors.New("unrecognized or incomplete ACL entry")
+	}
+	for _, field := range fields[modeIndex+1:] {
+		for _, permission := range strings.Split(strings.Trim(field, ","), ",") {
+			if _, unsafe := daemonSocketACLMutationPermissions[strings.ToLower(permission)]; unsafe {
+				return fmt.Errorf("ACL grants mutation permission %q", permission)
+			}
+		}
+	}
+	return nil
+}
 
 func prepareDaemonStateDirectory(path string) error {
 	if err := os.MkdirAll(path, 0o700); err != nil {
@@ -115,6 +186,9 @@ func prepareDaemonSocketEndpoint(path string) (daemonSocketEndpoint, error) {
 		}
 		path = absolute
 	}
+	if err := validateDaemonSocketAliasPath(path); err != nil {
+		return daemonSocketEndpoint{}, err
+	}
 	if err := validateDaemonSocketParent(filepath.Dir(path)); err != nil {
 		return daemonSocketEndpoint{}, err
 	}
@@ -150,6 +224,14 @@ func prepareDaemonSocketEndpoint(path string) (daemonSocketEndpoint, error) {
 		return daemonSocketEndpoint{}, fmt.Errorf("inspect daemon socket generation path: %w", err)
 	}
 	return endpoint, nil
+}
+
+func validateDaemonSocketAliasPath(path string) error {
+	maxPathBytes := len(syscall.RawSockaddrUnix{}.Path) - 1
+	if len(path) > maxPathBytes {
+		return fmt.Errorf("daemon socket path is %d bytes; Unix socket pathname limit is %d bytes", len(path), maxPathBytes)
+	}
+	return nil
 }
 
 func validateDaemonSocketParent(path string) error {
@@ -200,6 +282,9 @@ func inspectDaemonSocketParentComponent(path string) (os.FileInfo, string, error
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, "", errors.New("daemon socket parent path must contain only real directories")
+	}
+	if err := validateDaemonSocketACL(path); err != nil {
+		return nil, "", err
 	}
 	return info, path, nil
 }
